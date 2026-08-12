@@ -52,16 +52,13 @@ class INCMxfp4MoEMethod(FusedMoEMethodBase):
     def __init__(self, moe) -> None:
         super().__init__(moe)
         self.group_size = 32
-        # Backend selection must stay consistent with the weight preparation in
-        # process_weights_after_loading / get_fused_moe_quant_config, which only
-        # implement three layouts: CUTLASS swizzle (true W4A4), the native XPU
-        # kernel (packed passthrough), and Marlin weight-only. XPU dispatch is
-        # deferred to the shared oracle; every other non-CUTLASS device falls
-        # back to Marlin (mirroring CompressedTensorsW4A4Mxfp4MoEMethod).
         self.use_cutlass_mxfp4 = CutlassExpertsMxfp4._supports_current_device()
         self.mxfp4_backend = Mxfp4MoeBackend.MARLIN
         self.experts_cls: type[mk.FusedMoEExperts] | None = None
-        if self.use_cutlass_mxfp4:
+        if moe.moe_backend == "b12x":
+            self.mxfp4_backend, self.experts_cls = select_mxfp4_moe_backend(moe)
+            self.use_cutlass_mxfp4 = False
+        elif self.use_cutlass_mxfp4:
             self.experts_cls = CutlassExpertsMxfp4
             logger.info_once("Using CutlassExpertsMxfp4 for AutoRound MXFP4 MoE")
         elif current_platform.is_xpu():
@@ -146,7 +143,7 @@ class INCMxfp4MoEMethod(FusedMoEMethodBase):
                 w1_scale=layer.w13_weight_scale,
                 w2_scale=layer.w2_weight_scale,
             )
-        # Weight-only (Marlin) or native XPU kernel.
+        # Native packed-layout backends or weight-only Marlin.
         return make_mxfp4_moe_quant_config(
             mxfp4_backend=self.mxfp4_backend,
             w1_scale=layer.w13_weight_scale,
@@ -216,6 +213,7 @@ class INCMxfp4MoEMethod(FusedMoEMethodBase):
                 mxfp4_backend=self.mxfp4_backend,
                 routing_tables=layer._expert_routing_tables(),
             )
+            self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def apply(
         self,

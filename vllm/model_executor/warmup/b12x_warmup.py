@@ -22,6 +22,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.b12x_block import (
 from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
     warmup_b12x_tensor_fp8_linear,
 )
+from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
@@ -58,3 +59,26 @@ def b12x_warmup(worker: "Worker", cudagraph_capture_sizes: list[int]) -> None:
                 warmed,
                 name,
             )
+
+    compilation_config = worker.vllm_config.compilation_config
+    moe_token_counts = [
+        max_tokens,
+        *cudagraph_capture_sizes,
+        *(
+            size
+            for size in (getattr(compilation_config, "compile_sizes", None) or [])
+            if isinstance(size, int)
+        ),
+    ]
+    max_num_scheduled_tokens = getattr(
+        worker.scheduler_config,
+        "max_num_scheduled_tokens",
+        None,
+    )
+    if max_num_scheduled_tokens is not None:
+        moe_token_counts.append(max_num_scheduled_tokens)
+    warmup_b12x_moe(
+        model,
+        max_tokens=max(moe_token_counts),
+        token_counts=moe_token_counts,
+    )

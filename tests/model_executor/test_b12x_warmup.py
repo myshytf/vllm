@@ -62,21 +62,26 @@ def test_b12x_linear_warmup_skips_unused_provider(
     assert warmup(torch.nn.Module(), max_tokens=128) == 0
 
 
-def test_b12x_warmup_covers_linear_serving_shapes(monkeypatch) -> None:
+def test_b12x_warmup_covers_linear_and_moe_serving_shapes(monkeypatch) -> None:
     import vllm.model_executor.warmup.b12x_warmup as warmup_mod
 
     model = torch.nn.Module()
     linear_calls: list[tuple[torch.nn.Module, dict]] = []
+    moe_calls: list[tuple[torch.nn.Module, dict]] = []
 
     def linear_warmup(model, **kwargs):
         linear_calls.append((model, kwargs))
         return 0
+
+    def moe_warmup(model, **kwargs):
+        moe_calls.append((model, kwargs))
 
     monkeypatch.setattr(warmup_mod, "warmup_b12x_block_fp8_linear", linear_warmup)
     monkeypatch.setattr(warmup_mod, "warmup_b12x_mxfp4_linear", linear_warmup)
     monkeypatch.setattr(warmup_mod, "warmup_b12x_mxfp8_linear", linear_warmup)
     monkeypatch.setattr(warmup_mod, "warmup_b12x_nvfp4_linear", linear_warmup)
     monkeypatch.setattr(warmup_mod, "warmup_b12x_tensor_fp8_linear", linear_warmup)
+    monkeypatch.setattr(warmup_mod, "warmup_b12x_moe", moe_warmup)
 
     worker = SimpleNamespace(
         get_model=lambda: model,
@@ -98,3 +103,12 @@ def test_b12x_warmup_covers_linear_serving_shapes(monkeypatch) -> None:
         "output_dtype": torch.float16,
     }
     assert linear_calls == [(model, expected_linear_kwargs)] * 5
+    assert moe_calls == [
+        (
+            model,
+            {
+                "max_tokens": 320,
+                "token_counts": [256, 8, 16, 32, 64, 320],
+            },
+        )
+    ]
