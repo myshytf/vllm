@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for v1 attention backends without GPUModelRunner dependency."""
 
+from contextlib import nullcontext
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -18,6 +20,7 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import ModelConfig, set_current_vllm_config
 from vllm.platforms import current_platform
+from vllm.utils.b12x import get_b12x_paged_attention
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
@@ -30,6 +33,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.b12x import B12XPagedAttentionBackend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.utils import (
     set_kv_cache_layout,
@@ -251,6 +255,7 @@ def run_attention_backend(
     sliding_window: int | None = None,
     kv_cache_dtype: str = "auto",
     sinks: torch.Tensor | None = None,
+    use_cuda_graph: bool = False,
 ) -> torch.Tensor:
     """Run attention computation using the specified backend's AttentionImpl."""
 
@@ -337,9 +342,28 @@ def run_attention_backend(
         impl.do_kv_cache_update(
             mock_layer, key, value, kv_cache, attn_metadata.slot_mapping
         )
-    output = impl.forward(
-        mock_layer, query, key, value, kv_cache, attn_metadata, output=output
-    )
+    if use_cuda_graph:
+        impl.forward(
+            mock_layer, query, key, value, kv_cache, attn_metadata, output=output
+        )
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            impl.forward(
+                mock_layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output=output,
+            )
+        graph.replay()
+        torch.accelerator.synchronize()
+    else:
+        output = impl.forward(
+            mock_layer, query, key, value, kv_cache, attn_metadata, output=output
+        )
 
     return output
 
@@ -358,6 +382,10 @@ def _test_backend_correctness(
     tensor_parallel_size: int = 1,
     kv_cache_dtype: str = "auto",
     use_sinks: bool = False,
+    sliding_window_override: int | None = None,
+    use_cuda_graph: bool = False,
+    num_speculative_tokens: int = 0,
+    model_dtype: torch.dtype | None = None,
 ):
     """
     Test that all backends produce similar outputs to a reference implementation
@@ -402,10 +430,20 @@ def _test_backend_correctness(
         model_name=model,
         tensor_parallel_size=1,  # Always use TP=1 to avoid multi-GPU requirements
         max_model_len=max(batch_spec.seq_lens),
+        dtype=model_dtype or "auto",
         block_size=block_size,
         num_gpu_blocks=8192,
         hf_config_override=hf_config_override,
     )
+    if AttentionBackendEnum.B12X in backend_to_test:
+        vllm_config.scheduler_config.max_num_seqs = batch_spec.batch_size
+        vllm_config.scheduler_config.max_num_batched_tokens = max(
+            sum(batch_spec.query_lens), 64
+        )
+        if num_speculative_tokens > 0:
+            vllm_config.speculative_config = SimpleNamespace(
+                num_speculative_tokens=num_speculative_tokens
+            )
     vllm_config.cache_config.cache_dtype = kv_cache_dtype
     device = torch.device(f"{DEVICE_TYPE}:0")
 
@@ -427,7 +465,11 @@ def _test_backend_correctness(
         else None
     )
     head_size = vllm_config.model_config.get_head_size()
-    sliding_window = vllm_config.model_config.get_sliding_window()
+    sliding_window = (
+        sliding_window_override
+        if sliding_window_override is not None
+        else vllm_config.model_config.get_sliding_window()
+    )
     dtype = _convert_dtype_to_torch(vllm_config.model_config.dtype)
     block_size = vllm_config.cache_config.block_size
     scale = 1.0 / (head_size**0.5)
@@ -573,9 +615,24 @@ def _test_backend_correctness(
         if backend_name == AttentionBackendEnum.FLASHINFER:
             set_kv_cache_layout("HND")
             reset_kv_cache_layout = True
+        elif backend_name == AttentionBackendEnum.B12X:
+            set_kv_cache_layout("NHD")
+            reset_kv_cache_layout = True
 
         kv_cache_for_backend = kv_cache
-        if backend_cls is not None:
+        if backend_name == AttentionBackendEnum.B12X:
+            cache_dtype = (
+                FP8_KV_CACHE_DTYPES[kv_cache_dtype]
+                if is_quantized_kv_cache(kv_cache_dtype)
+                else kv_cache.dtype
+            )
+            typed_cache = kv_cache.view(cache_dtype)
+            key_cache = typed_cache[..., :head_size].permute(0, 2, 1, 3)
+            value_cache = typed_cache[..., head_size:].permute(0, 2, 1, 3)
+            kv_cache_for_backend = torch.stack((key_cache, value_cache), dim=1)
+            if is_quantized_kv_cache(kv_cache_dtype):
+                kv_cache_for_backend = kv_cache_for_backend.view(torch.uint8)
+        elif backend_cls is not None:
             try:
                 stride_order = backend_cls.get_kv_cache_stride_order()
             except (AttributeError, NotImplementedError):
@@ -589,23 +646,30 @@ def _test_backend_correctness(
                     kv_cache.permute(*stride_order).contiguous().permute(*inv_order)
                 )
 
+        config_context = (
+            set_current_vllm_config(vllm_config)
+            if backend_name == AttentionBackendEnum.B12X
+            else nullcontext()
+        )
         try:
-            backend_output = run_attention_backend(
-                backend_name,
-                kv_cache_spec,
-                ["placeholder"],
-                vllm_config,
-                device,
-                common_attn_metadata,
-                query_vllm,
-                key_vllm,
-                value_vllm,
-                kv_cache_for_backend,
-                sliding_window=sliding_window,
-                attn_type=attn_type,
-                kv_cache_dtype=kv_cache_dtype,
-                sinks=sinks,
-            )
+            with config_context:
+                backend_output = run_attention_backend(
+                    backend_name,
+                    kv_cache_spec,
+                    ["placeholder"],
+                    vllm_config,
+                    device,
+                    common_attn_metadata,
+                    query_vllm,
+                    key_vllm,
+                    value_vllm,
+                    kv_cache_for_backend,
+                    sliding_window=sliding_window,
+                    attn_type=attn_type,
+                    kv_cache_dtype=kv_cache_dtype,
+                    sinks=sinks,
+                    use_cuda_graph=use_cuda_graph,
+                )
         finally:
             if reset_kv_cache_layout:
                 set_kv_cache_layout(None)
@@ -635,6 +699,150 @@ def _test_backend_correctness(
             atol=atol,
             msg=partial(error_msg, backend_name=backend_name),
         )
+
+
+def _require_b12x_paged_attention() -> None:
+    capability = current_platform.get_device_capability()
+    if (
+        not current_platform.is_cuda()
+        or capability is None
+        or not B12XPagedAttentionBackend.supports_compute_capability(capability)
+    ):
+        pytest.skip("B12X paged attention requires SM120 or SM121.")
+
+    paged_attention = get_b12x_paged_attention()
+    if paged_attention is None or not paged_attention.is_supported():
+        pytest.skip("B12X paged attention is not available.")
+
+
+def _b12x_causal_mask(
+    b: torch.Tensor,
+    h: torch.Tensor,
+    q_idx: torch.Tensor,
+    kv_idx: torch.Tensor,
+    *,
+    context_len: int,
+):
+    return q_idx + context_len >= kv_idx
+
+
+def _b12x_causal_sliding_window_mask(
+    b: torch.Tensor,
+    h: torch.Tensor,
+    q_idx: torch.Tensor,
+    kv_idx: torch.Tensor,
+    *,
+    context_len: int,
+    sliding_window: int,
+):
+    causal_mask = q_idx + context_len >= kv_idx
+    window_mask = q_idx + context_len - kv_idx < sliding_window
+    return causal_mask & window_mask
+
+
+@pytest.mark.parametrize(
+    "batch_spec_name",
+    ["small_decode", "small_prefill", "mixed_small", "medium_decode"],
+)
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "model_dtype"),
+    [
+        ("auto", None),
+        ("bfloat16", torch.bfloat16),
+        ("fp8_e4m3", torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("block_size", [64, 128])
+def test_b12x_causal_backend_correctness(
+    default_vllm_config,
+    workspace_init,
+    batch_spec_name: str,
+    kv_cache_dtype: str,
+    model_dtype: torch.dtype | None,
+    block_size: int,
+):
+    """B12X causal paged attention matches the shared SDPA reference."""
+    _require_b12x_paged_attention()
+
+    _test_backend_correctness(
+        BATCH_SPECS[batch_spec_name],
+        "Qwen/Qwen3-0.6B",
+        [AttentionBackendEnum.B12X],
+        _b12x_causal_mask,
+        block_size=block_size,
+        kv_cache_dtype=kv_cache_dtype,
+        model_dtype=model_dtype,
+    )
+
+
+@pytest.mark.parametrize("batch_spec_name", ["small_decode", "small_prefill"])
+def test_b12x_causal_sliding_window_and_sinks(
+    default_vllm_config,
+    workspace_init,
+    batch_spec_name: str,
+):
+    """B12X preserves causal SWA and attention-sink semantics."""
+    _require_b12x_paged_attention()
+
+    sliding_window = 16
+    mask = partial(_b12x_causal_sliding_window_mask, sliding_window=sliding_window)
+
+    _test_backend_correctness(
+        BATCH_SPECS[batch_spec_name],
+        "Qwen/Qwen3-0.6B",
+        [AttentionBackendEnum.B12X],
+        mask,
+        block_size=64,
+        atol=3e-2,
+        rtol=3e-2,
+        sliding_window_override=sliding_window,
+        use_sinks=True,
+    )
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8_e4m3"])
+def test_b12x_decode_cuda_graph_replay_with_sliding_window_and_sinks(
+    default_vllm_config,
+    workspace_init,
+    kv_cache_dtype: str,
+):
+    """B12X causal metadata and sinks remain capture-safe during replay."""
+    _require_b12x_paged_attention()
+
+    sliding_window = 16
+    mask = partial(_b12x_causal_sliding_window_mask, sliding_window=sliding_window)
+
+    _test_backend_correctness(
+        BATCH_SPECS["small_decode"],
+        "Qwen/Qwen3-0.6B",
+        [AttentionBackendEnum.B12X],
+        mask,
+        block_size=64,
+        atol=3e-2,
+        rtol=3e-2,
+        sliding_window_override=sliding_window,
+        use_sinks=True,
+        use_cuda_graph=True,
+        kv_cache_dtype=kv_cache_dtype,
+    )
+
+
+def test_b12x_speculative_verifier_cuda_graph_replay(
+    default_vllm_config,
+    workspace_init,
+):
+    """B12X replays uniform speculative verification through its graph plan."""
+    _require_b12x_paged_attention()
+
+    _test_backend_correctness(
+        BatchSpec(seq_lens=[32, 40], query_lens=[4, 4]),
+        "Qwen/Qwen3-0.6B",
+        [AttentionBackendEnum.B12X],
+        _b12x_causal_mask,
+        block_size=128,
+        num_speculative_tokens=3,
+        use_cuda_graph=True,
+    )
 
 
 @pytest.mark.parametrize(
