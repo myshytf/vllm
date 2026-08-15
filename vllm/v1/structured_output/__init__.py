@@ -32,6 +32,28 @@ else:
 logger = init_logger(__name__)
 
 
+class _TokenSequenceView(Sequence[int]):
+    """Read-only concatenation that does not copy the committed token history."""
+
+    def __init__(self, prefix: Sequence[int], suffix: Sequence[int]) -> None:
+        self.prefix = prefix
+        self.suffix = suffix
+
+    def __len__(self) -> int:
+        return len(self.prefix) + len(self.suffix)
+
+    def __getitem__(self, index: int | slice) -> int | list[int]:
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        if index < len(self.prefix):
+            return self.prefix[index]
+        return self.suffix[index - len(self.prefix)]
+
+
 class StructuredOutputManager:
     """Engine-level manager for structured output requests."""
 
@@ -380,9 +402,7 @@ class StructuredOutputManager:
                 # After unifying the `openai_gptoss` and non-`openai_gptoss` styles,
                 # it can be removed.
                 request.structured_output_request.reasoning_ended = (
-                    reasoner.is_reasoning_end_for_prompt(
-                        request.prompt_token_ids or []
-                    )
+                    reasoner.is_reasoning_end_for_prompt(request.prompt_token_ids or [])
                 )
             return request.structured_output_request.reasoning_ended
         return True
@@ -493,6 +513,91 @@ class StructuredOutputManager:
         if num_reasoning <= 0:
             return new_token_ids
         return new_token_ids[num_reasoning:]
+
+    @staticmethod
+    def _find_reasoning_end_offset(
+        reasoner: "ReasoningParser",
+        prior_token_ids: Sequence[int],
+        new_token_ids: list[int],
+    ) -> int | None:
+        """Return where a reasoning-end marker completes in a sampled block.
+
+        The first parser call keeps ordinary reasoning-only decode steps at one
+        check. When the block contains a transition, cumulative delta prefixes
+        locate single-token and multi-token markers, including markers that
+        start in ``prior_token_ids`` and finish in ``new_token_ids``.
+        """
+        complete_tokens = _TokenSequenceView(prior_token_ids, new_token_ids)
+        if not reasoner.is_reasoning_end_streaming(complete_tokens, new_token_ids):
+            return None
+
+        for offset in range(len(new_token_ids)):
+            delta_ids = new_token_ids[: offset + 1]
+            token_ids = _TokenSequenceView(prior_token_ids, delta_ids)
+            if reasoner.is_reasoning_end_streaming(token_ids, delta_ids):
+                return offset
+
+        # A parser may report only that the complete block crossed a boundary.
+        # Keeping the block in reasoning is safer than presenting an unknown
+        # suffix to the answer grammar.
+        return len(new_token_ids) - 1
+
+    def filter_speculative_grammar_tokens(
+        self,
+        request: "Request",
+        new_token_ids: list[int],
+    ) -> tuple[list[int], int]:
+        """Validate accepted speculative tokens before committing the block.
+
+        Grammar masks describe each scheduled draft position, but an accepted
+        block can also contain an unconstrained token immediately after a
+        reasoning transition or after grammar termination. This method retains
+        the grammar-valid prefix and reports the trailing tokens that require
+        resampling. ``validate_tokens`` restores the grammar state before
+        returning, so the scheduler's normal commit path remains its only
+        state-advancing operation.
+
+        Returns:
+            The tokens that are safe to commit and the rejected suffix length.
+        """
+        if self.vllm_config.speculative_config is None:
+            return new_token_ids, 0
+        if len(new_token_ids) < 2:
+            return new_token_ids, 0
+        if not request.use_structured_output:
+            return new_token_ids, 0
+
+        structured_request = request.structured_output_request
+        if structured_request is None:
+            return new_token_ids, 0
+        grammar = structured_request.grammar
+        if not isinstance(grammar, StructuredOutputGrammar):
+            return new_token_ids, 0
+
+        reasoner = self._get_reasoner(request)
+        grammar_start = 0
+        if (
+            reasoner is not None
+            and not self.enable_in_reasoning
+            and not structured_request.reasoning_ended
+        ):
+            boundary = self._find_reasoning_end_offset(
+                reasoner,
+                request.all_token_ids,
+                new_token_ids,
+            )
+            if boundary is None:
+                return new_token_ids, 0
+            grammar_start = boundary + 1
+
+        grammar_tokens = new_token_ids[grammar_start:]
+        if not grammar_tokens:
+            return new_token_ids, 0
+        valid_grammar_tokens = grammar.validate_tokens(grammar_tokens)
+        rejected = len(grammar_tokens) - len(valid_grammar_tokens)
+        if rejected == 0:
+            return new_token_ids, 0
+        return new_token_ids[:grammar_start] + valid_grammar_tokens, rejected
 
     def clear_backend(self) -> None:
         if self.backend is not None:
