@@ -4,7 +4,8 @@ import itertools
 import multiprocessing
 from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import TYPE_CHECKING
+from copy import copy
+from typing import TYPE_CHECKING, overload
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -41,6 +42,12 @@ class _TokenSequenceView(Sequence[int]):
 
     def __len__(self) -> int:
         return len(self.prefix) + len(self.suffix)
+
+    @overload
+    def __getitem__(self, index: int) -> int: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[int]: ...
 
     def __getitem__(self, index: int | slice) -> int | list[int]:
         if isinstance(index, slice):
@@ -537,13 +544,17 @@ class StructuredOutputManager:
             the sampled block remains inside reasoning.
         """
         complete_tokens = _TokenSequenceView(prior_token_ids, new_token_ids)
-        if not reasoner.is_reasoning_end_streaming(complete_tokens, new_token_ids):
+        if not copy(reasoner).is_reasoning_end_streaming(
+            complete_tokens, new_token_ids
+        ):
             return None
 
         for offset in range(len(new_token_ids)):
             delta_ids = new_token_ids[: offset + 1]
             token_ids = _TokenSequenceView(prior_token_ids, delta_ids)
-            if reasoner.is_reasoning_end_streaming(token_ids, delta_ids):
+            # Streaming parsers may retain request-local transition state.
+            # A probe must not consume that state before the normal commit path.
+            if copy(reasoner).is_reasoning_end_streaming(token_ids, delta_ids):
                 return offset
 
         # A parser may report only that the complete block crossed a boundary.

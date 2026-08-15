@@ -3,6 +3,8 @@
 """grammar_bitmask under spec-decode draft padding (#44006)."""
 
 from collections.abc import Iterable, Sequence
+from typing import overload
+from unittest.mock import Mock
 
 import pytest
 from transformers import AutoTokenizer
@@ -10,6 +12,7 @@ from transformers import AutoTokenizer
 from vllm.config import StructuredOutputsConfig, VllmConfig
 from vllm.config.model import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
+from vllm.reasoning.step3p5_reasoning_parser import Step3p5ReasoningParser
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
@@ -387,21 +390,27 @@ def test_speculative_grammar_filter_rejects_tokens_after_termination(backend):
 
 def test_reasoning_boundary_scan_uses_sequence_view_for_history():
     """Boundary detection exposes long token history without eagerly copying it."""
+    parser_calls = 0
 
     class TokenHistory(Sequence[int]):
         def __len__(self) -> int:
             return 300_000
 
+        @overload
+        def __getitem__(self, index: int) -> int: ...
+
+        @overload
+        def __getitem__(self, index: slice) -> list[int]: ...
+
         def __getitem__(self, index: int | slice) -> int | list[int]:
             raise AssertionError("committed token history was materialized")
 
     class EndTokenReasoner:
-        calls = 0
-
         def is_reasoning_end_streaming(
             self, input_ids: Sequence[int], delta_ids: Iterable[int]
         ) -> bool:
-            self.calls += 1
+            nonlocal parser_calls
+            parser_calls += 1
             assert len(input_ids) >= 300_000
             return 99 in delta_ids
 
@@ -411,19 +420,19 @@ def test_reasoning_boundary_scan_uses_sequence_view_for_history():
     )
 
     assert boundary == 1
-    assert reasoner.calls == 3
+    assert parser_calls == 3
 
 
 def test_reasoning_boundary_scan_checks_nontransition_block_once():
     """A sampled block without a transition requires one parser call."""
+    parser_calls = 0
 
     class NoBoundaryReasoner:
-        calls = 0
-
         def is_reasoning_end_streaming(
             self, input_ids: Sequence[int], delta_ids: Iterable[int]
         ) -> bool:
-            self.calls += 1
+            nonlocal parser_calls
+            parser_calls += 1
             return False
 
     reasoner = NoBoundaryReasoner()
@@ -432,7 +441,22 @@ def test_reasoning_boundary_scan_checks_nontransition_block_once():
     )
 
     assert boundary is None
-    assert reasoner.calls == 1
+    assert parser_calls == 1
+
+
+def test_reasoning_boundary_scan_preserves_stateful_parser():
+    """Pre-commit probing must not consume Step3.5's pending transition."""
+    tokenizer = Mock()
+    tokenizer.get_vocab.return_value = {"<think>": 1, "</think>": 2}
+    reasoner = Step3p5ReasoningParser(tokenizer)
+    reasoner._end_token_pending = True
+
+    boundary = StructuredOutputManager._find_reasoning_end_offset(
+        reasoner, [1, 2, 3], [10, 20]
+    )
+
+    assert boundary == 0
+    assert reasoner._end_token_pending
 
 
 def test_reasoning_boundary_scan_handles_whole_delta_marker():
