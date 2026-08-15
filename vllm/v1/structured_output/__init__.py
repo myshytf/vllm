@@ -526,6 +526,15 @@ class StructuredOutputManager:
         check. When the block contains a transition, cumulative delta prefixes
         locate single-token and multi-token markers, including markers that
         start in ``prior_token_ids`` and finish in ``new_token_ids``.
+
+        Args:
+            reasoner: Parser that detects the model's reasoning-end marker.
+            prior_token_ids: Tokens committed before the sampled block.
+            new_token_ids: Accepted tokens in the sampled block.
+
+        Returns:
+            The zero-based offset where the marker completes, or ``None`` if
+            the sampled block remains inside reasoning.
         """
         complete_tokens = _TokenSequenceView(prior_token_ids, new_token_ids)
         if not reasoner.is_reasoning_end_streaming(complete_tokens, new_token_ids):
@@ -556,6 +565,10 @@ class StructuredOutputManager:
         resampling. ``validate_tokens`` restores the grammar state before
         returning, so the scheduler's normal commit path remains its only
         state-advancing operation.
+
+        Args:
+            request: Request whose structured-output state validates the block.
+            new_token_ids: Accepted speculative tokens awaiting commit.
 
         Returns:
             The tokens that are safe to commit and the rejected suffix length.

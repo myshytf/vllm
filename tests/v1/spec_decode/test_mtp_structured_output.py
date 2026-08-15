@@ -378,7 +378,7 @@ def test_speculative_grammar_filter_rejects_tokens_after_termination(backend):
     invalid_suffix = tokenizer.encode("z")[0]
 
     filtered, rejected = manager.filter_speculative_grammar_tokens(
-        request, complete_object + [invalid_suffix]
+        request, [*complete_object, invalid_suffix]
     )
 
     assert filtered == complete_object
