@@ -222,6 +222,59 @@ def test_non_spec_one_token_state_classification(
         assert actual.has_initial_state is None
 
 
+def test_non_spec_mixed_batch_masks_only_stateless_first_token():
+    batch = BatchSpec(seq_lens=[100, 50, 1], query_lens=[1, 1, 1])
+    common_attn_metadata = create_common_attn_metadata(
+        batch, BLOCK_SIZE, DEVICE
+    ).replace(is_prefilling=torch.tensor([False, False, True]))
+    actual = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=0,
+        full_cuda_graph=False,
+    ).build(0, common_attn_metadata)
+
+    assert actual.num_decodes == 2
+    assert actual.num_decode_tokens == 2
+    assert actual.num_prefills == 1
+    assert actual.num_prefill_tokens == 1
+    assert actual.has_initial_state is not None
+    assert actual.has_initial_state.tolist() == [True, True, False]
+
+
+def test_non_spec_without_prefill_flags_keeps_decode_classification():
+    common_attn_metadata = create_common_attn_metadata(
+        BatchSpec(seq_lens=[100, 50, 1], query_lens=[1, 1, 1]),
+        BLOCK_SIZE,
+        DEVICE,
+    )
+    assert common_attn_metadata.is_prefilling is None
+    actual = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=0,
+        full_cuda_graph=False,
+    ).build(0, common_attn_metadata)
+
+    assert actual.num_decodes == 3
+    assert actual.num_prefills == 0
+    assert actual.has_initial_state is None
+
+
+def test_non_spec_zero_length_padding_is_not_promoted_to_prefill():
+    batch = BatchSpec(seq_lens=[100, 50, 0], query_lens=[1, 1, 0])
+    common_attn_metadata = create_common_attn_metadata(
+        batch, BLOCK_SIZE, DEVICE
+    ).replace(is_prefilling=torch.tensor([False, False, True]))
+    actual = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=0,
+        full_cuda_graph=False,
+    ).build(0, common_attn_metadata)
+
+    assert actual.num_decodes == 3
+    assert actual.num_prefills == 0
+    assert actual.has_initial_state is None
+
+
 def test_mixed_regular_and_spec_decode_uses_packed_decode_metadata():
     batch = BatchSpec(seq_lens=[100, 65, 20], query_lens=[1, 1, 3])
     common_attn_metadata = create_common_attn_metadata(
