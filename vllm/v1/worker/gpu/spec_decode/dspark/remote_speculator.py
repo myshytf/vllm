@@ -5,9 +5,13 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import queue  # kimi-k3-draft-async-ingest
+import threading  # kimi-k3-draft-async-ingest
 import time
 from dataclasses import dataclass
+from pathlib import Path as _Path
 from typing import Any
 
 import torch
@@ -17,6 +21,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -24,6 +29,7 @@ from vllm.v1.worker.gpu.spec_decode.speculator import (
     BaseSpeculator,
     CUDAGraphCapturePhase,
 )
+from vllm.v1.worker.gpu.spec_decode.utils import draft_gumbel_pos
 
 logger = init_logger(__name__)
 
@@ -88,8 +94,109 @@ def _contiguous_draft_output(
     return draft_tokens[:num_reqs, :num_speculative_tokens].contiguous()
 
 
+LOGITS_CAPABILITY = "dflash_logits_bf16_v1"
+
+
+def _decode_bfloat16_logits_frame(
+    response: dict[str, Any],
+    expected_shape: tuple[int, int, int],
+) -> torch.Tensor:
+    """Decode and validate a BF16 draft-logit multipart frame."""
+    metadata = response.get("logits")
+    frame = response.get("_logits_frame")
+    if not isinstance(metadata, dict) or not isinstance(frame, bytes):
+        raise ValueError("Remote DFlash response is missing its logits frame")
+    if metadata.get("capability") != LOGITS_CAPABILITY:
+        raise ValueError(f"Unsupported logits capability: {metadata}")
+    if metadata.get("dtype") != "bfloat16":
+        raise ValueError(f"Unsupported logits dtype: {metadata}")
+    if tuple(metadata.get("shape", ())) != expected_shape:
+        raise ValueError(
+            f"Remote DFlash logits shape mismatch: expected={expected_shape}, "
+            f"metadata={metadata}"
+        )
+    expected_nbytes = math.prod(expected_shape) * 2
+    if metadata.get("nbytes") != expected_nbytes or len(frame) != expected_nbytes:
+        raise ValueError(
+            "Remote DFlash logits byte count mismatch: "
+            f"expected={expected_nbytes}, metadata={metadata}, frame={len(frame)}"
+        )
+    return (
+        torch.frombuffer(bytearray(frame), dtype=torch.uint16)
+        .view(torch.bfloat16)
+        .reshape(expected_shape)
+    )
+
+
+# kimi-k3-dflash-feature-capture ------------------------------------------
+_K3_CAPTURE_DIR = os.environ.get("VLLM_K3_DRAFT_CAPTURE_DIR", "").strip()
+_K3_CAPTURE_STATE: dict[str, dict] = {}
+
+
+def _k3_capture_safe_name(request_id: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in request_id)[:180]
+
+
+def _k3_capture_records(
+    requests: list[dict],
+    positions_frame: bytes,
+    context_frame: bytes,
+    width: int,
+    anchor_positions: list[int],
+) -> None:
+    """Split one PROPOSE payload back into its per-request row ranges."""
+
+    import json as _json
+
+    directory = _Path(_K3_CAPTURE_DIR)
+    directory.mkdir(parents=True, exist_ok=True)
+    row_bytes = width * 2
+    row_offset = 0
+    for request, anchor_position in zip(requests, anchor_positions):
+        count = int(request["context_count"])
+        if count <= 0:
+            continue
+        request_id = str(request["request_id"])
+        name = _k3_capture_safe_name(request_id)
+        state = _K3_CAPTURE_STATE.get(request_id)
+        if state is None:
+            state = {
+                "request_id": request_id,
+                "width": width,
+                "records": [],
+                "bytes": 0,
+                "bin": str(directory / (name + ".bin")),
+                "index": str(directory / (name + ".json")),
+            }
+            _K3_CAPTURE_STATE[request_id] = state
+            # A reset means the remote state was rebuilt; start the file over.
+            _Path(state["bin"]).write_bytes(b"")
+        positions_slice = positions_frame[row_offset * 8 : (row_offset + count) * 8]
+        context_slice = context_frame[
+            row_offset * row_bytes : (row_offset + count) * row_bytes
+        ]
+        with open(state["bin"], "ab") as handle:
+            handle.write(positions_slice)
+            handle.write(context_slice)
+        state["records"].append(
+            {
+                "offset": state["bytes"],
+                "rows": count,
+                "positions_bytes": len(positions_slice),
+                "context_bytes": len(context_slice),
+                "reset": bool(request["reset"]),
+                "reset_position": int(request["reset_position"]),
+                "anchor_token_id": int(request["anchor_token_id"]),
+                "anchor_position": int(anchor_position),
+            }
+        )
+        state["bytes"] += len(positions_slice) + len(context_slice)
+        _Path(state["index"]).write_text(_json.dumps(state))
+        row_offset += count
+
+
 class RemoteK3DSparkSpeculator(BaseSpeculator):
-    """Forward target auxiliary states to a standalone greedy draft server."""
+    """Forward target auxiliary states to a standalone draft server."""
 
     def __init__(
         self,
@@ -105,8 +212,12 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         self.method = str(self.speculative_config.method)
         if self.method not in ("dspark", "dflash"):
             raise ValueError(f"Unsupported remote K3 draft method: {self.method}")
-        if self.speculative_config.draft_sample_method != "greedy":
-            raise ValueError("Remote K3 draft currently supports greedy drafting only")
+        sample_method = self.speculative_config.draft_sample_method
+        if sample_method not in ("greedy", "probabilistic"):
+            raise ValueError(f"Unsupported remote draft sample method: {sample_method}")
+        self._probabilistic = sample_method == "probabilistic"
+        if self._probabilistic and self.method != "dflash":
+            raise ValueError("Remote probabilistic sampling supports DFlash only")
         if self.speculative_config.rejection_sample_method != "block":
             raise ValueError(
                 "Remote K3 draft currently requires block rejection sampling"
@@ -128,6 +239,8 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             or draft_hf_config.hidden_size
         )
         self.raw_context_width = int(target_hidden_size * self.num_aux_layers)
+        self.vocab_size = int(draft_hf_config.vocab_size)
+        self.use_fp64_gumbel = bool(vllm_config.model_config.use_fp64_gumbel)
         self.address = address
         self.timeout_ms = int(
             os.environ.get(
@@ -137,6 +250,28 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         )
         self.supports_mm_inputs = False
         self.draft_logits: torch.Tensor | None = None
+        self._remote_logits: torch.Tensor | None = None
+        self._remote_sample_positions: torch.Tensor | None = None
+        if self._probabilistic:
+            head_dtype = vllm_config.model_config.head_dtype
+            if head_dtype != torch.bfloat16:
+                raise ValueError(
+                    "Remote probabilistic DFlash transport requires a BF16 head, "
+                    f"got {head_dtype}"
+                )
+            shape = (
+                self.max_num_reqs,
+                self.num_speculative_steps,
+                self.vocab_size,
+            )
+            self.draft_logits = torch.zeros(shape, dtype=head_dtype, device=device)
+            self._remote_logits = torch.zeros(shape, dtype=head_dtype, device=device)
+            self._remote_sample_positions = torch.full(
+                shape[:2],
+                -1,
+                dtype=torch.int64,
+                device=device,
+            )
         self.draft_tokens = torch.full(
             (self.max_num_reqs, self.num_speculative_steps),
             -1,
@@ -163,6 +298,23 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         tp_group = get_tp_group()
         self._tp_group = tp_group
         self._tp_rank = int(tp_group.rank_in_group)
+        self._cpu_token_broadcast = (
+            os.environ.get("VLLM_K3_DRAFT_CPU_TOKEN_BROADCAST", "0") == "1"
+        )
+        self._cpu_draft_tokens = {
+            depth: torch.empty(
+                (self.max_num_reqs, depth),
+                dtype=torch.int64,
+                pin_memory=True,
+            )
+            for depth in range(1, self.num_speculative_steps + 1)
+        }
+        self._cpu_broadcast_count = 0
+        self._cpu_broadcast_total_ms = 0.0
+        if self._cpu_token_broadcast:
+            logger.info_once(
+                "Remote K3 draft tokens use the CPU process group before H2D"
+            )
         self._zmq_context: zmq.Context | None = None
         self._socket: zmq.Socket | None = None
         if self._tp_rank == 0:
@@ -189,6 +341,62 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 dtype=torch.int64,
                 pin_memory=True,
             )
+            # kimi-k3-draft-async-ingest: begin
+            self._sampled_staging = torch.empty(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                pin_memory=True,
+            )
+            self._async_depth = int(
+                os.environ.get("VLLM_K3_DRAFT_ASYNC_PREFILL_INGEST", "2") or 0
+            )
+            self._async_ring: list[tuple[torch.Tensor, torch.Tensor]] = []
+            self._async_slot_free: list[threading.Event] = []
+            self._async_slot = 0
+            self._async_queue: queue.Queue = queue.Queue()
+            self._async_error: tuple[BaseException, list[str]] | None = None
+            self._async_lock = threading.Lock()
+            self._async_stats = {"deferred": 0, "deferred_ms": 0.0}
+            for _ in range(self._async_depth):
+                self._async_ring.append(
+                    (
+                        torch.empty(
+                            self.max_num_tokens,
+                            dtype=torch.int64,
+                            pin_memory=True,
+                        ),
+                        torch.empty(
+                            (self.max_num_tokens, self.raw_context_width),
+                            dtype=vllm_config.model_config.dtype,
+                            pin_memory=True,
+                        ),
+                    )
+                )
+                free = threading.Event()
+                free.set()
+                self._async_slot_free.append(free)
+            if self._async_depth > 0:
+                threading.Thread(
+                    target=self._async_ingest_worker,
+                    name="k3-draft-async-ingest",
+                    daemon=True,
+                ).start()
+                logger.info(
+                    "Remote K3 %s deferred prefill ingest enabled: ring depth %d",
+                    self.method,
+                    self._async_depth,
+                )
+            # kimi-k3-draft-async-ingest: end
+            if self._probabilistic:
+                self._logits_staging = torch.empty(
+                    (
+                        self.max_num_reqs,
+                        self.num_speculative_steps,
+                        self.vocab_size,
+                    ),
+                    dtype=torch.bfloat16,
+                    pin_memory=True,
+                )
             self._zmq_context = zmq.Context()
             self._connect()
             response = self._rpc(
@@ -200,6 +408,11 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 raise RuntimeError(
                     "Remote K3 draft method mismatch: "
                     f"target={self.method}, server={response.get('method')}"
+                )
+            capabilities = response.get("capabilities", [])
+            if self._probabilistic and LOGITS_CAPABILITY not in capabilities:
+                raise RuntimeError(
+                    "Remote DFlash server does not advertise probabilistic logits"
                 )
             self._remote_max_requests = int(
                 response.get("max_requests", self.max_num_reqs)
@@ -235,14 +448,70 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         socket.connect(self.address)
         self._socket = socket
 
+    # kimi-k3-draft-async-ingest: begin
+    def _drain_async_ingest(self) -> None:
+        pending = getattr(self, "_async_queue", None)
+        if pending is not None:
+            pending.join()
+
+    def _apply_async_error(self) -> None:
+        error = getattr(self, "_async_error", None)
+        if error is None:
+            return
+        self._async_error = None
+        exc, request_ids = error
+        self._disabled_requests.update(request_ids)
+        logger.warning(
+            "Remote K3 %s deferred prefill ingest failed (%s); drafting is "
+            "disabled for %d request(s) until they leave the batch",
+            self.method,
+            exc,
+            len(request_ids),
+        )
+
+    def _async_ingest_worker(self) -> None:
+        while True:
+            job = self._async_queue.get()
+            slot, frames, request_ids, enqueued = job
+            try:
+                with self._async_lock:
+                    try:
+                        self._socket.send_multipart(frames, copy=False)
+                        response_frames = self._socket.recv_multipart()
+                    except Exception:
+                        self._connect()
+                        raise
+                response = json.loads(response_frames[0])
+                if not isinstance(response, dict) or not response.get("ok", False):
+                    raise RuntimeError(f"K3 draft deferred ingest failed: {response}")
+                self._async_stats["deferred_ms"] += (
+                    time.perf_counter() - enqueued
+                ) * 1000
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Remote K3 deferred prefill ingest raised")
+                self._async_error = (exc, request_ids)
+            finally:
+                self._async_slot_free[slot].set()
+                self._async_queue.task_done()
+    # kimi-k3-draft-async-ingest: end
+
     def _rpc(self, frames: list[bytes]) -> dict[str, Any]:
         assert self._socket is not None
-        try:
-            self._socket.send_multipart(frames)
-            response = self._socket.recv_json()
-        except Exception:
-            self._connect()
-            raise
+        self._drain_async_ingest()
+        with self._async_lock:
+            try:
+                self._socket.send_multipart(frames, copy=False)  # kimi-k3-draft-zero-copy-sync
+                response_frames = self._socket.recv_multipart()
+            except Exception:
+                self._connect()
+                raise
+        if not 1 <= len(response_frames) <= 2:
+            raise RuntimeError(
+                f"K3 draft RPC returned {len(response_frames)} response frames"
+            )
+        response = json.loads(response_frames[0])
+        if len(response_frames) == 2:
+            response["_logits_frame"] = response_frames[1]
         if not isinstance(response, dict) or not response.get("ok", False):
             raise RuntimeError(f"K3 DSpark RPC failed: {response}")
         if int(response.get("protocol", -1)) != PROTOCOL_VERSION:
@@ -325,7 +594,21 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             retained.context_start,
             retained.committed_end - self._remote_prefix_cache_tokens,
         )
-        return restore_start >= retained_start
+        if restore_start >= retained_start:
+            return True
+        # reconnect-partial-window: the source begins after the ideal window
+        # origin because it was itself cold-bootstrapped from a cache-restored
+        # prefix.  Every conversation shorter than the window would otherwise
+        # be refused forever.  The server clamps the restore origin up to what
+        # its projected cache holds, which still hands the draft more history
+        # than a fresh bootstrap at prefix_end, so accept any source retaining
+        # a non-empty block-aligned range that ends at or after prefix_end.
+        aligned_start = (
+            (retained_start + self._remote_block_size - 1)
+            // self._remote_block_size
+            * self._remote_block_size
+        )
+        return aligned_start < prefix_end
 
     def _find_reconnect_source(
         self,
@@ -334,9 +617,17 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         current_request_ids: set[str],
     ) -> str | None:
         candidates: list[tuple[int, int, str]] = []
+        rejected: list[str] = []
         for request_id in self._known_requests - current_request_ids:
             retained = self._retained_prefixes.get(request_id)
-            if retained is None or not self._can_restore_prefix(retained, prefix_end):
+            if retained is None:
+                rejected.append(f"{request_id}:no-retained")
+                continue
+            if not self._can_restore_prefix(retained, prefix_end):
+                rejected.append(
+                    f"{request_id}:gate(committed={retained.committed_end},"
+                    f"ctx={retained.context_start},need={prefix_end})"
+                )
                 continue
             if torch.equal(retained.token_ids[:prefix_end], token_prefix):
                 candidates.append(
@@ -346,6 +637,19 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                         request_id,
                     )
                 )
+            else:
+                kept = retained.token_ids
+                limit = min(prefix_end, kept.shape[0], token_prefix.shape[0])
+                neq = (kept[:limit] != token_prefix[:limit]).nonzero()
+                where = int(neq[0].item()) if neq.numel() else -limit
+                rejected.append(f"{request_id}:tok@{where}")
+        if not candidates and rejected:
+            logger.info(
+                "Remote K3 %s reconnect diagnostics: prefix_end=%d rejected=%s",
+                self.method,
+                prefix_end,
+                rejected[:6],
+            )
         return min(candidates)[2] if candidates else None
 
     def _reconnect_request(
@@ -452,6 +756,109 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             0, active_gpu, remote_tokens
         )
 
+    def _copy_logits_from_response(
+        self,
+        response: dict[str, Any],
+        active_indices: list[int],
+        num_speculative_tokens: int,
+    ) -> None:
+        assert self._remote_logits is not None
+        assert self._remote_sample_positions is not None
+        expected_shape = (
+            len(active_indices),
+            num_speculative_tokens,
+            self.vocab_size,
+        )
+        logits = _decode_bfloat16_logits_frame(response, expected_shape)
+        sample_positions = response["logits"].get("sample_positions")
+        expected_positions = expected_shape[:2]
+        if (
+            not isinstance(sample_positions, list)
+            or len(sample_positions) != expected_positions[0]
+            or any(
+                not isinstance(row, list) or len(row) != expected_positions[1]
+                for row in sample_positions
+            )
+        ):
+            raise ValueError(
+                "Remote DFlash sample positions have the wrong shape: "
+                f"expected={expected_positions}, got={sample_positions!r}"
+            )
+        active_gpu = torch.tensor(active_indices, dtype=torch.int64, device=self.device)
+        logits_staging = self._logits_staging[
+            : len(active_indices), :num_speculative_tokens
+        ]
+        logits_staging.copy_(logits)
+        self._remote_logits.index_copy_(
+            0,
+            active_gpu,
+            logits_staging.to(self.device, non_blocking=True),
+        )
+        positions = torch.tensor(
+            sample_positions,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        self._remote_sample_positions.index_copy_(0, active_gpu, positions)
+
+    def _sample_remote_probabilistic(
+        self,
+        input_batch: InputBatch,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        num_speculative_tokens: int,
+    ) -> None:
+        assert self.draft_logits is not None
+        assert self._remote_logits is not None
+        assert self._remote_sample_positions is not None
+        logger.info_once(
+            "Remote K3 DFlash probabilistic sampling is active with "
+            "full-vocabulary BF16 logits"
+        )
+        num_reqs = input_batch.num_reqs
+        positions = self._remote_sample_positions[:num_reqs, :num_speculative_tokens]
+        request_rows, draft_steps = torch.where(positions >= 0)
+        if request_rows.numel() == 0:
+            return
+        idx_mapping = input_batch.idx_mapping[:num_reqs].index_select(0, request_rows)
+        logits = self._remote_logits[
+            request_rows,
+            draft_steps,
+        ].contiguous()
+        sampled = self._sample_probabilistic_draft(
+            logits=logits,
+            positions=positions[request_rows, draft_steps] - 2,
+            idx_mapping=idx_mapping,
+            temperature=temperature,
+            seeds=seeds,
+            draft_step=draft_steps,
+            draft_logits=self.draft_logits,
+        )
+        self.draft_tokens[request_rows, draft_steps] = sampled
+
+    def _sample_probabilistic_draft(
+        self,
+        logits: torch.Tensor,
+        positions: torch.Tensor,
+        idx_mapping: torch.Tensor,
+        temperature: torch.Tensor,
+        seeds: torch.Tensor,
+        draft_step: torch.Tensor,
+        draft_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sample remote logits from the standard disjoint draft stream."""
+        return gumbel_sample(
+            logits,
+            idx_mapping,
+            temperature,
+            seeds,
+            draft_gumbel_pos(positions),
+            apply_temperature=True,
+            logits_cache=draft_logits,
+            logits_cache_col=draft_step,
+            use_fp64=self.use_fp64_gumbel,
+        )
+
     def _record_timing(self, timing_ms: dict[str, float]) -> None:
         if self._timing_log_interval <= 0:
             return
@@ -484,6 +891,10 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         num_speculative_tokens: int,
     ) -> None:
         started = time.perf_counter()
+        # kimi-k3-metadata-d2h-detail: drain the stream at entry to measure
+        # how much pending GPU/UVA work the runner queued before propose().
+        torch.cuda.current_stream(self.device).synchronize()
+        self._detail_entry_drain = time.perf_counter() - started
         if aux_hidden_states is None or len(aux_hidden_states) != self.num_aux_layers:
             raise ValueError(
                 f"Remote K3 {self.method} requires {self.num_aux_layers} configured "
@@ -506,13 +917,22 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         # Queue both small D2H copies and wait once.  The same stream owns the
         # preceding token-table update, so this synchronization also makes the
         # UVA-backed table safe for prefix matching below.
+        _detail_prep_t0 = time.perf_counter()
+        torch.cuda.current_stream(self.device).synchronize()
+        self._detail_prep_drain = time.perf_counter() - _detail_prep_t0
+        self._apply_async_error()  # kimi-k3-draft-async-ingest
         rejected_staging = self._rejected_staging[:num_reqs]
         anchor_staging = self._anchor_staging[:num_reqs]
+        sampled_staging = self._sampled_staging[:num_reqs]  # kimi-k3-draft-async-ingest
         rejected_staging.copy_(num_rejected[:num_reqs], non_blocking=True)
         anchor_staging.copy_(anchor_tokens, non_blocking=True)
+        sampled_staging.copy_(sampled_counts, non_blocking=True)  # kimi-k3-draft-async-ingest
+        _detail_copy_t0 = time.perf_counter()
         torch.cuda.current_stream(self.device).synchronize()
+        self._detail_copy_sync = time.perf_counter() - _detail_copy_t0
         rejected_counts = rejected_staging.tolist()
         anchor_tokens_cpu = anchor_staging.tolist()
+        sampled_counts_cpu = sampled_staging.tolist()  # kimi-k3-draft-async-ingest
         gather_indices, valid_counts = _build_valid_context_plan(
             input_batch, rejected_counts
         )
@@ -629,8 +1049,24 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                 f"{self.raw_context_width}"
             )
         context_ready = time.perf_counter()
-        positions_staging = self._positions_staging[:num_context_rows]
-        context_staging = self._context_staging[:num_context_rows]
+        # kimi-k3-draft-async-ingest: a step in which no active request sampled a token is a
+        # pure mid-prefill step; its proposal is never consumed, so only the
+        # context ingest matters and it can complete off the critical path.
+        deferred = self._async_depth > 0 and not _K3_CAPTURE_DIR and all(
+            sampled_counts_cpu[request_idx] == 0 for request_idx in active_indices
+        )
+        if deferred:
+            slot = self._async_slot
+            self._async_slot = (slot + 1) % self._async_depth
+            self._async_slot_free[slot].wait()
+            self._async_slot_free[slot].clear()
+            positions_full, context_full = self._async_ring[slot]
+            positions_staging = positions_full[:num_context_rows]
+            context_staging = context_full[:num_context_rows]
+        else:
+            slot = -1
+            positions_staging = self._positions_staging[:num_context_rows]
+            context_staging = self._context_staging[:num_context_rows]
         positions_staging.copy_(positions, non_blocking=True)
         context_staging.copy_(context, non_blocking=True)
         torch.cuda.current_stream(self.device).synchronize()
@@ -641,28 +1077,64 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
         )
         for request, anchor_position in zip(requests, anchor_positions):
             request["anchor_position"] = anchor_position
-        positions_frame = positions_staging.numpy().tobytes()
-        # NumPy has inconsistent bfloat16 support; preserve its exact bits as u16.
-        context_frame = context_staging.view(torch.uint16).numpy().tobytes()
+        if deferred:  # kimi-k3-draft-async-ingest: the ring slot stays reserved until the reply
+            positions_frame = memoryview(positions_staging.numpy())
+            context_frame = memoryview(context_staging.view(torch.uint16).numpy())
+        else:  # kimi-k3-draft-zero-copy-sync: staging memory stays valid until the reply arrives
+            positions_frame = memoryview(positions_staging.numpy())
+            # NumPy has inconsistent bfloat16 support; preserve its exact bits as u16.
+            context_frame = memoryview(context_staging.view(torch.uint16).numpy())
+        # kimi-k3-dflash-feature-capture: persist the exact served feature
+        # stream for offline draft training. Inert without the env var.
+        if _K3_CAPTURE_DIR:
+            _k3_capture_records(
+                requests,
+                positions_frame,
+                context_frame,
+                int(context_staging.shape[1]),
+                anchor_positions,
+            )
         serialized = time.perf_counter()
         header = {
             "protocol": PROTOCOL_VERSION,
             "op": "PROPOSE",
             "projected": False,
             "num_speculative_tokens": num_speculative_tokens,
+            "return_logits": self._probabilistic,
             "requests": requests,
         }
-        response = self._rpc(
-            [json.dumps(header).encode(), positions_frame, context_frame]
-        )
-        rpc_done = time.perf_counter()
-        self._copy_tokens_from_response(
-            response,
-            active_indices,
-            num_speculative_tokens,
-        )
-        output_copied = time.perf_counter()
+        frames = [json.dumps(header).encode(), positions_frame, context_frame]
+        if deferred:  # kimi-k3-draft-async-ingest
+            self._async_queue.put(
+                (
+                    slot,
+                    frames,
+                    [str(request["request_id"]) for request in requests],
+                    time.perf_counter(),
+                )
+            )
+            self._async_stats["deferred"] += 1
+            response = {}
+            rpc_done = output_copied = time.perf_counter()
+        else:
+            response = self._rpc(frames)
+            rpc_done = time.perf_counter()
+            self._copy_tokens_from_response(
+                response,
+                active_indices,
+                num_speculative_tokens,
+            )
+            if self._probabilistic:
+                self._copy_logits_from_response(
+                    response,
+                    active_indices,
+                    num_speculative_tokens,
+                )
+            output_copied = time.perf_counter()
         timing_ms = {
+            "entry_drain": getattr(self, "_detail_entry_drain", 0.0) * 1000,
+            "prep_drain": getattr(self, "_detail_prep_drain", 0.0) * 1000,
+            "copy_sync": getattr(self, "_detail_copy_sync", 0.0) * 1000,
             "metadata_d2h": (metadata_ready - started) * 1000,
             "request_plan": (requests_ready - metadata_ready) * 1000,
             "context_gather": (context_ready - requests_ready) * 1000,
@@ -671,6 +1143,7 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             "rpc_roundtrip": (rpc_done - serialized) * 1000,
             "tokens_h2d": (output_copied - rpc_done) * 1000,
             "client_total": (output_copied - started) * 1000,
+            "deferred": 1.0 if deferred else 0.0,  # kimi-k3-draft-async-ingest
         }
         server_timing = response.get("timing_ms")
         if isinstance(server_timing, dict):
@@ -717,8 +1190,6 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             attn_metadata,
             slot_mappings,
             last_hidden_states,
-            temperature,
-            seeds,
             num_tokens_across_dp,
             skip_attn_for_dummy_run,
             mm_inputs,
@@ -740,6 +1211,13 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             )
         output = self.draft_tokens[: input_batch.num_reqs, :active_k]
         output.fill_(-1)
+        if self._probabilistic:
+            assert self.draft_logits is not None
+            assert self._remote_logits is not None
+            assert self._remote_sample_positions is not None
+            self.draft_logits.zero_()
+            self._remote_logits.zero_()
+            self._remote_sample_positions.fill_(-1)
         if self._tp_rank == 0 and not (dummy_run or is_profile):
             try:
                 self._rank0_propose(
@@ -762,6 +1240,17 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
                     "Remote K3 DSpark proposal failed; drafting is disabled for "
                     "this step"
                 )
+        if self._probabilistic and not (dummy_run or is_profile):
+            assert self._remote_logits is not None
+            assert self._remote_sample_positions is not None
+            self._tp_group.broadcast(self._remote_logits, src=0)
+            self._tp_group.broadcast(self._remote_sample_positions, src=0)
+            self._sample_remote_probabilistic(
+                input_batch,
+                temperature,
+                seeds,
+                active_k,
+            )
         # Slicing the active depth from the max-width persistent buffer leaves
         # a larger row stride whenever adaptive K is below the configured
         # maximum. NCCL broadcast requires a contiguous tensor. Materialize
@@ -771,5 +1260,36 @@ class RemoteK3DSparkSpeculator(BaseSpeculator):
             input_batch.num_reqs,
             active_k,
         )
-        self._tp_group.broadcast(output, src=0)
+        use_cpu_broadcast = (
+            self._cpu_token_broadcast
+            and not dummy_run
+            and not is_profile
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        if use_cpu_broadcast:
+            broadcast_started = time.perf_counter()
+            output_cpu = self._cpu_draft_tokens[active_k][: input_batch.num_reqs]
+            if self._tp_rank == 0:
+                output_cpu.copy_(output, non_blocking=False)
+            torch.distributed.broadcast(
+                output_cpu,
+                src=self._tp_group.ranks[0],
+                group=self._tp_group.cpu_group,
+            )
+            output.copy_(output_cpu, non_blocking=True)
+            if self._tp_rank == 0 and self._timing_log_interval > 0:
+                self._cpu_broadcast_count += 1
+                self._cpu_broadcast_total_ms += (
+                    time.perf_counter() - broadcast_started
+                ) * 1000
+                if self._cpu_broadcast_count >= self._timing_log_interval:
+                    logger.info(
+                        "Remote K3 CPU token broadcast over %d proposals (ms): %.3f",
+                        self._cpu_broadcast_count,
+                        self._cpu_broadcast_total_ms / self._cpu_broadcast_count,
+                    )
+                    self._cpu_broadcast_count = 0
+                    self._cpu_broadcast_total_ms = 0.0
+        else:
+            self._tp_group.broadcast(output, src=0)
         return output
