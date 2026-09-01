@@ -9,14 +9,51 @@ import torch.distributed
 from .parallel_state import get_tp_group
 
 
+def _ubatch_comm_region():
+    """Ubatch-aware wrapper for a TP collective.
+
+    When this thread runs one half of a split prefill (``UBatchContext``
+    active), the collective is issued on the shared comm stream after the
+    half's compute so far has been recorded, and the CPU then yields to the
+    other half so its compute fills the GPU while the collective runs; on
+    resumption the compute stream waits for the collective. Outside a ubatch
+    context this is a no-op.
+    """
+    import threading
+
+    from vllm.v1.worker import ubatching
+    from vllm.v1.worker.ubatching import (
+        dbo_switch_to_comm_sync,
+        dbo_yield_and_switch_from_comm_to_compute,
+    )
+
+    class _Region:
+        def __enter__(self):
+            # Only threads that own a ubatch context take part; any other
+            # thread (e.g. a background store thread) keeps the plain path.
+            self.active = threading.get_ident() in ubatching._THREAD_ID_TO_CONTEXT
+            if self.active:
+                dbo_switch_to_comm_sync()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            if self.active and exc_type is None:
+                dbo_yield_and_switch_from_comm_to_compute()
+            return False
+
+    return _Region()
+
+
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().all_reduce(input_)
+    with _ubatch_comm_region():
+        return get_tp_group().all_reduce(input_)
 
 
 def tensor_model_parallel_all_reduce_in_place(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce a dead input tensor without allocating an output tensor."""
-    return get_tp_group().all_reduce_in_place(input_)
+    with _ubatch_comm_region():
+        return get_tp_group().all_reduce_in_place(input_)
 
 
 def tensor_model_parallel_all_gather(

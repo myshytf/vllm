@@ -106,6 +106,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
+from vllm.v1.worker.gpu import k3_ubatch_prefill
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
@@ -2030,6 +2031,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     assert self.cudagraph_manager is not None
                     model_output = self.cudagraph_manager.run_pw_graph(
                         self.model, model_inputs
+                    )
+                elif (
+                    not dummy_run
+                    and k3_ubatch_prefill.ubatch_prefill_enabled()
+                    and k3_ubatch_prefill.eligible(input_batch)
+                    and self.parallel_config.tensor_parallel_size > 1
+                ):
+                    # Kimi-K3 split prefill: the chunk runs as two consecutive
+                    # row halves (see k3_ubatch_prefill).
+                    model_output = k3_ubatch_prefill.run_split_prefill(
+                        self,
+                        scheduler_output,
+                        input_batch,
+                        model_inputs,
+                        cudagraph_runtime_mode=batch_desc.cg_mode,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        batch_descriptor=batch_descriptor,
+                        skip_compiled=skip_compiled,
                     )
                 else:
                     # Eager (NONE): call the raw model directly.

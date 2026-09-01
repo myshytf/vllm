@@ -2018,6 +2018,20 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 shape[2],
             ).permute(1, 0, 2)
             self._attn_res_workspace = workspace
+        # A split prefill runs its second half on another thread with the
+        # same row count; give it the upper half of the reserved rows so the
+        # two halves' block residuals never alias (the reserved workspace
+        # covers the full chunk and the second half is the smaller one).
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+        ubatch = dbo_current_ubatch_id()
+        if ubatch > 0:
+            offset = ubatch * (workspace.size(0) // 2)
+            if offset + shape[0] > workspace.size(0):
+                raise RuntimeError(
+                    "AttnRes workspace too small for the split prefill half"
+                )
+            return workspace[offset : offset + shape[0]]
         return workspace[: shape[0]]
 
     def reserve_attn_res_workspace(self) -> None:
