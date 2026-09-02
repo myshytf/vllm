@@ -46,6 +46,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context
+from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     _init_kv_cache_quant,
@@ -961,6 +962,24 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             cos_sin_cache=cos_sin_cache,
         )
 
+    _split_latent_stash: tuple[torch.Tensor, torch.Tensor] | None = None
+    _split_cu_k_cache: dict[int, torch.Tensor] = {}
+
+    @staticmethod
+    def _split_stash_enabled() -> bool:
+        import os
+
+        return os.getenv("VLLM_K3_UBATCH_PREFILL_EXACT", "1") == "1"
+
+    @classmethod
+    def _split_cu_seqlens_k(cls, k_len: int, device: torch.device) -> torch.Tensor:
+        key = (k_len, device.index)
+        cu = cls._split_cu_k_cache.get(key)
+        if cu is None:
+            cu = torch.tensor([0, k_len], dtype=torch.int32, device=device)
+            cls._split_cu_k_cache[key] = cu
+        return cu
+
     def _forward_prefill_fused(
         self,
         q: torch.Tensor,
@@ -1068,20 +1087,77 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
             )
 
+        # Split prefill (k3_ubatch_prefill): the chunk's first row half runs
+        # as ubatch 0 and the second as ubatch 1. The second half must see
+        # the first half's keys exactly as the unsplit chunk would (bf16, not
+        # through the fp8 cache), so ubatch 0 stashes its latents per layer
+        # and ubatch 1 rebuilds those keys with the same projection and
+        # attends over [first half | own rows] with a bottom-right-aligned
+        # causal mask; its chunked context then covers earlier chunks only
+        # (the driver builds its MLA metadata with the chunk start as the
+        # computed length).
+        split_k_len = None
+        if (
+            self._split_stash_enabled()
+            and not fp8_prefill
+            and self.kv_cache_dtype != "fp8_ds_mla"
+        ):
+            ubatch = dbo_current_ubatch_id()
+            if ubatch == 0:
+                self._split_latent_stash = (kv_c_normed, k_pe)
+            elif ubatch == 1 and self._split_latent_stash is not None:
+                stash_kv_c, stash_k_pe = self._split_latent_stash
+                self._split_latent_stash = None
+                stash_nope = self.kv_b_proj(stash_kv_c)[0].view(
+                    -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+                )
+                stash_k_nope, stash_v = stash_nope.split(
+                    [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+                )
+                stash_k_pe_flat = stash_k_pe.reshape(stash_k_pe.shape[0], -1)
+                stash_k = torch.cat(
+                    (
+                        stash_k_nope,
+                        stash_k_pe_flat[:, None, :].expand(-1, stash_k_nope.shape[1], -1),
+                    ),
+                    dim=-1,
+                )
+                k = torch.cat((stash_k, k), dim=0)
+                v = torch.cat((stash_v, v), dim=0)
+                split_k_len = int(k.shape[0])
+
         # When there is no chunked context, backends that honor `out` write the
         # attention result straight into it, avoiding a slice+flatten+copy.
         writes_out = not has_context and prefill.prefill_backend.supports_out()
-        output_prefill = prefill.prefill_backend.run_prefill_new_tokens(
-            q=q,
-            k=k,
-            v=v,
-            return_softmax_lse=has_context,
-            out=(
-                out.view(-1, self.num_local_heads, self.v_head_dim)
-                if writes_out
-                else None
-            ),
+        prefill_out = (
+            out.view(-1, self.num_local_heads, self.v_head_dim)
+            if writes_out
+            else None
         )
+        if split_k_len is not None:
+            backend = prefill.prefill_backend
+            cu_k = self._split_cu_seqlens_k(split_k_len, q.device)
+            output_prefill = backend._flash_attn_varlen_diff_headdims(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=prefill.query_start_loc,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=prefill.max_query_len,
+                max_seqlen_k=split_k_len,
+                softmax_scale=backend.scale,
+                causal=True,
+                return_softmax_lse=has_context,
+                out=prefill_out,
+            )
+        else:
+            output_prefill = prefill.prefill_backend.run_prefill_new_tokens(
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=has_context,
+                out=prefill_out,
+            )
 
         if has_context:
             suffix_output, suffix_lse = output_prefill

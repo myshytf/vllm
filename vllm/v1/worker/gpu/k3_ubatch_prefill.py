@@ -143,15 +143,22 @@ def _half_batch(
     input_batch: InputBatch,
     row_start: int,
     row_end: int,
+    computed_offset: int | None = None,
 ) -> InputBatch:
     """The rows [row_start, row_end) of a single-request batch as a batch of
-    their own, positioned as if the earlier rows were already computed."""
+    their own, positioned as if ``computed_offset`` earlier rows (default:
+    ``row_start``) were already computed. Positions and slot mappings always
+    follow the true rows; ``computed_offset=0`` builds MLA metadata whose
+    chunked context excludes the first half (its keys are supplied in bf16
+    by the attention layer itself, see KimiK3 mla.py split stash)."""
     rows = row_end - row_start
+    if computed_offset is None:
+        computed_offset = row_start
     device = input_batch.query_start_loc.device
     computed = input_batch.num_computed_tokens_np.copy()
-    computed[0] += row_start
+    computed[0] += computed_offset
     computed_prefill = input_batch.num_computed_prefill_tokens_np.copy()
-    computed_prefill[0] += row_start
+    computed_prefill[0] += computed_offset
     seq_len = int(computed[0] + rows)
     seq_lens = torch.full((input_batch.num_reqs_after_padding,), seq_len,
                           dtype=torch.int32, device=device)
@@ -213,6 +220,7 @@ def run_split_prefill(
     prepared = []
     num_computed_gpu = runner.req_states.num_computed_tokens.gpu
     req_state_idx = int(input_batch.idx_mapping_np[0])
+    exact_mla = os.getenv("VLLM_K3_UBATCH_PREFILL_EXACT", "1") == "1"
     for start, end in halves:
         hb = _half_batch(runner, input_batch, start, end)
         block_tables, slot_mappings = runner.prepare_attn(hb)
@@ -235,6 +243,19 @@ def run_split_prefill(
             hb, cudagraph_runtime_mode, block_tables, slot_mappings,
             runner.attn_groups, runner.kv_cache_config, for_capture=False,
         )
+        if start > 0 and exact_mla:
+            # MLA layers of the second half: context = earlier chunks only;
+            # the first half's keys come from the layer's bf16 stash.
+            hb_mla = _half_batch(runner, input_batch, start, end, computed_offset=0)
+            mla_metadata = runner.model_state.prepare_attn(
+                hb_mla, cudagraph_runtime_mode, block_tables, slot_mappings,
+                runner.attn_groups, runner.kv_cache_config, for_capture=False,
+            )
+            merged = dict(attn_metadata)
+            for name, md in mla_metadata.items():
+                if hasattr(md, "prefill") and hasattr(md, "num_decode_tokens"):
+                    merged[name] = md
+            attn_metadata = merged
         half_inputs = dict(model_inputs)
         half_inputs["input_ids"] = (
             None if model_inputs.get("input_ids") is None
