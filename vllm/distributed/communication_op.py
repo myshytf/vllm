@@ -96,6 +96,8 @@ def _ubatch_all_reduce(input_: torch.Tensor) -> torch.Tensor:
         dbo_yield_and_switch_from_comm_to_compute,
     )
 
+    from vllm.v1.worker.ubatching import dbo_switch_to_compute_sync
+
     lockstep = _ubatch_lockstep()
     snapshot = input_.clone()
     if lockstep:
@@ -106,11 +108,28 @@ def _ubatch_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     _UbatchTrace.end(token)
     if lockstep:
         torch.cuda.synchronize()
-    dbo_yield_and_switch_from_comm_to_compute()
+    if input_.shape[-1] >= _ubatch_yield_min_cols():
+        dbo_yield_and_switch_from_comm_to_compute()
+    else:
+        # Narrow collectives (the latent all-reduce sits between the MoE and
+        # a short up-projection) stay on the comm stream but hand the CPU
+        # straight back: the other half's MoE is already queued on the
+        # compute stream, so yielding here would only leave this half's
+        # final all-reduce nothing long to hide behind.
+        dbo_switch_to_compute_sync()
     if lockstep:
         torch.cuda.synchronize()
     del snapshot
     return out
+
+
+def _ubatch_yield_min_cols() -> int:
+    """Collectives narrower than this many columns do not yield (default
+    7168: yield at the attention-output and final all-reduces, not at the
+    3584-wide latent one)."""
+    import os
+
+    return int(os.getenv("VLLM_K3_UBATCH_YIELD_MIN_COLS", "7168") or 0)
 
 
 def _ubatch_lockstep() -> bool:

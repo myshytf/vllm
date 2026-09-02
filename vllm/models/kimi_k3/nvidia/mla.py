@@ -1104,7 +1104,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         ):
             ubatch = dbo_current_ubatch_id()
             if ubatch == 0:
-                self._split_latent_stash = (kv_c_normed, k_pe)
+                # Own copies: the latents may live in projection/gather
+                # workspaces that the second half's own projection overwrites
+                # before it rebuilds these keys.
+                self._split_latent_stash = (kv_c_normed.clone(), k_pe.clone())
             elif ubatch == 1 and self._split_latent_stash is not None:
                 stash_kv_c, stash_k_pe = self._split_latent_stash
                 self._split_latent_stash = None
