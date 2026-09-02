@@ -962,7 +962,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             cos_sin_cache=cos_sin_cache,
         )
 
-    _split_latent_stash: tuple[torch.Tensor, torch.Tensor] | None = None
+    _split_latent_stash: tuple | None = None
     _split_cu_k_cache: dict[int, torch.Tensor] = {}
 
     @staticmethod
@@ -970,6 +970,48 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         import os
 
         return os.getenv("VLLM_K3_UBATCH_PREFILL_EXACT", "1") == "1"
+
+    @staticmethod
+    def _split_stash_check() -> bool:
+        import os
+
+        return os.getenv("VLLM_K3_UBATCH_STASH_CHECK", "0") == "1"
+
+    def _split_stash_self_check(
+        self, stash_k, stash_v, stash_kv_c, stash_k_pe, k, v, kv_c_normed, k_pe
+    ) -> None:
+        """Diagnostics for the exact split (VLLM_K3_UBATCH_STASH_CHECK=1).
+
+        Logs, per layer and rank, whether rebuilding the first half's keys
+        from its latents with ``kv_b_proj`` reproduces the keys its own
+        attention used, whether the second half's own keys survive that
+        projection (a workspace-backed projection output would be clobbered),
+        and the row-wise statistics of both halves' keys.
+        """
+        own_k, own_v = k.clone(), v.clone()
+        rebuilt = self.kv_b_proj(stash_kv_c)[0].view(
+            -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        rb_k_nope, rb_v = rebuilt.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        rb_k_pe = stash_k_pe.reshape(stash_k_pe.shape[0], -1)
+        rb_k = torch.cat(
+            (rb_k_nope, rb_k_pe[:, None, :].expand(-1, rb_k_nope.shape[1], -1)), dim=-1
+        )
+        own_k_after = self.kv_b_proj(kv_c_normed)[0]
+        logger.info(
+            "split stash check %s ub1: rows stash %d own %d | rebuilt==stash k %s v %s "
+            "(max|dk| %.3e max|dv| %.3e) | own k/v intact after projection: %s %s | "
+            "|k| stash %.3f own %.3f | k_pe stash %.3f own %.3f | projection rows %d",
+            self.layer_name if hasattr(self, "layer_name") else "?",
+            stash_k.shape[0], k.shape[0],
+            torch.equal(rb_k, stash_k), torch.equal(rb_v, stash_v),
+            (rb_k.float() - stash_k.float()).abs().max().item(),
+            (rb_v.float() - stash_v.float()).abs().max().item(),
+            torch.equal(k, own_k), torch.equal(v, own_v),
+            stash_k.float().norm(dim=-1).mean().item(), own_k.float().norm(dim=-1).mean().item(),
+            stash_k_pe.float().norm(dim=-1).mean().item(), k_pe.float().norm(dim=-1).mean().item(),
+            own_k_after.shape[0],
+        )
 
     @classmethod
     def _split_cu_seqlens_k(cls, k_len: int, device: torch.device) -> torch.Tensor:
@@ -979,6 +1021,94 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             cu = torch.tensor([0, k_len], dtype=torch.int32, device=device)
             cls._split_cu_k_cache[key] = cu
         return cu
+
+    _split_dumped: bool = False
+
+    def _split_dump(self, q, k, v, prefill, split_k_len, out, reference) -> None:
+        """Diagnostics: with VLLM_K3_UBATCH_STASH_DUMP=<dir>, save the exact
+        split's attention inputs and both outputs of this rank's first
+        dumped layer once, for an offline check against a naive attention
+        (research/prefill-w4a16-20260902/ubatch/check_split_dump.py)."""
+        import os
+
+        dump_dir = os.getenv("VLLM_K3_UBATCH_STASH_DUMP", "")
+        if not dump_dir or type(self)._split_dumped:
+            return
+        type(self)._split_dumped = True
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        os.makedirs(dump_dir, exist_ok=True)
+        path = os.path.join(dump_dir, f"split-rank{get_tensor_model_parallel_rank()}.pt")
+        torch.save(
+            {
+                "layer": getattr(self, "layer_name", "?"),
+                "q": q.detach().clone().cpu(),
+                "k": k.detach().clone().cpu(),
+                "v": v.detach().clone().cpu(),
+                "cu_seqlens_q": prefill.query_start_loc.cpu(),
+                "max_query_len": int(prefill.max_query_len),
+                "split_k_len": int(split_k_len),
+                "scale": float(prefill.prefill_backend.scale),
+                "out_exact": out.detach().clone().cpu(),
+                "out_reference": reference.detach().clone().cpu(),
+                "q_strides": tuple(q.stride()),
+                "out_strides": tuple(out.stride()),
+            },
+            path,
+        )
+        logger.info("split dump written: %s", path)
+
+    def _split_naive_reference(self, q, k, v, k_len, backend_scale):
+        """Diagnostics: fp32 softmax attention of q over k/v with the
+        bottom-right causal mask (query row t attends keys <= k_len - Q + t).
+        Returns [Q, heads, v_head_dim] fp32."""
+        Q = q.shape[0]
+        qf, kf, vf = q.float(), k.float(), v.float()
+        scores = torch.einsum("qhd,khd->hqk", qf, kf) * float(backend_scale)
+        t = torch.arange(Q, device=q.device)[:, None]
+        j = torch.arange(k_len, device=q.device)[None, :]
+        scores = scores.masked_fill((j > (k_len - Q) + t)[None], float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        return torch.einsum("hqk,khd->qhd", probs, vf)
+
+    def _split_cache_reference(self, q, k_own, v_own, attn_metadata):
+        """Diagnostics: the second half's attention output computed the way
+        an unsplit continuation would see it -- own rows in bf16, everything
+        before them (first half included) through the KV cache. Needs the
+        driver to attach the cache-path MLA metadata of the half as
+        ``k3_split_cache_metadata``. Returns [rows, heads, v_head_dim] or
+        None when that metadata is absent."""
+        cache_md = getattr(attn_metadata, "k3_split_cache_metadata", None)
+        if cache_md is None or cache_md.prefill is None:
+            return None
+        prefill = attn_metadata.prefill
+        backend = prefill.prefill_backend
+        new_out, new_lse = backend.run_prefill_new_tokens(
+            q=q, k=k_own, v=v_own, return_softmax_lse=True, out=None
+        )
+        if cache_md.prefill.chunked_context is None:
+            return new_out[..., : self.v_head_dim].clone()
+        ctx_out, ctx_lse = self._compute_prefill_context(q, cache_md)
+        # The direct DCP gather relies on the layer's output collective to
+        # fence slot reuse across ranks; this extra context pass has none
+        # before the exact path's own gather, so fence explicitly.
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        tensor_model_parallel_all_reduce(
+            torch.zeros(8, dtype=torch.float32, device=q.device)
+        )
+        ref = torch.empty(
+            (q.shape[0], self.num_local_heads, self.v_head_dim),
+            dtype=new_out.dtype, device=q.device,
+        )
+        merge_attn_states(
+            output=ref,
+            prefix_output=ctx_out[..., : self.v_head_dim].contiguous(),
+            prefix_lse=ctx_lse,
+            suffix_output=new_out[..., : self.v_head_dim].contiguous(),
+            suffix_lse=new_lse,
+        )
+        return ref
 
     def _forward_prefill_fused(
         self,
@@ -1090,41 +1220,38 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         # Split prefill (k3_ubatch_prefill): the chunk's first row half runs
         # as ubatch 0 and the second as ubatch 1. The second half must see
         # the first half's keys exactly as the unsplit chunk would (bf16, not
-        # through the fp8 cache), so ubatch 0 stashes its latents per layer
-        # and ubatch 1 rebuilds those keys with the same projection and
-        # attends over [first half | own rows] with a bottom-right-aligned
-        # causal mask; its chunked context then covers earlier chunks only
-        # (the driver builds its MLA metadata with the chunk start as the
-        # computed length).
+        # through the fp8 cache), so ubatch 0 stashes its bf16 keys/values
+        # per layer and ubatch 1 attends over [first half | own rows] with a
+        # bottom-right-aligned causal mask; its chunked context then covers
+        # earlier chunks only (the driver builds its MLA metadata with the
+        # chunk start as the computed length).
         split_k_len = None
+        split_reference = None
         if (
-            self._split_stash_enabled()
+            getattr(attn_metadata, "k3_split_exact", False)
             and not fp8_prefill
             and self.kv_cache_dtype != "fp8_ds_mla"
         ):
             ubatch = dbo_current_ubatch_id()
             if ubatch == 0:
-                # Own copies: the latents may live in projection/gather
-                # workspaces that the second half's own projection overwrites
-                # before it rebuilds these keys.
-                self._split_latent_stash = (kv_c_normed.clone(), k_pe.clone())
+                # The first half's bf16 keys/values exactly as its own
+                # attention consumed them (own copies: `k`/`v` may alias
+                # projection storage that the second half reuses). The
+                # latents ride along only for the self-check below.
+                self._split_latent_stash = (
+                    k.clone(),
+                    v.clone(),
+                    kv_c_normed.clone() if self._split_stash_check() else None,
+                    k_pe.clone() if self._split_stash_check() else None,
+                )
             elif ubatch == 1 and self._split_latent_stash is not None:
-                stash_kv_c, stash_k_pe = self._split_latent_stash
+                stash_k, stash_v, stash_kv_c, stash_k_pe = self._split_latent_stash
                 self._split_latent_stash = None
-                stash_nope = self.kv_b_proj(stash_kv_c)[0].view(
-                    -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-                )
-                stash_k_nope, stash_v = stash_nope.split(
-                    [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-                )
-                stash_k_pe_flat = stash_k_pe.reshape(stash_k_pe.shape[0], -1)
-                stash_k = torch.cat(
-                    (
-                        stash_k_nope,
-                        stash_k_pe_flat[:, None, :].expand(-1, stash_k_nope.shape[1], -1),
-                    ),
-                    dim=-1,
-                )
+                if self._split_stash_check():
+                    self._split_stash_self_check(
+                        stash_k, stash_v, stash_kv_c, stash_k_pe, k, v, kv_c_normed, k_pe
+                    )
+                    split_reference = None  # naive reference computed after the call
                 k = torch.cat((stash_k, k), dim=0)
                 v = torch.cat((stash_v, v), dim=0)
                 split_k_len = int(k.shape[0])
@@ -1199,3 +1326,43 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
         elif not writes_out:
             out.copy_(output_prefill[..., : self.v_head_dim].flatten(start_dim=-2))
+
+        if (
+            split_k_len is not None
+            and self._split_stash_check()
+            and dbo_current_ubatch_id() == 1
+        ):
+            # Naive fp32 attention over [first half | own rows] with the
+            # bottom-right causal mask, against the served FA4 result. With
+            # context the served `out` also carries the merged context, so
+            # only the no-context case compares the raw call.
+            final = out.view(-1, self.num_local_heads, self.v_head_dim).float()
+            ref = self._split_naive_reference(q, k, v, split_k_len, backend_scale=prefill.prefill_backend.scale)
+            diff = (final - ref).abs()
+            if has_context:
+                logger.info(
+                    "split naive check %s ub1: (context merged, raw-call compare skipped) rows %d",
+                    self.layer_name if hasattr(self, "layer_name") else "?", final.shape[0],
+                )
+            else:
+                logger.info(
+                    "split naive check %s ub1: FA4 vs naive fp32 bottom-right max|d| %.3e "
+                    "mean|d| %.3e ref mean|x| %.3e cos %.6f rows %d keys %d",
+                    self.layer_name if hasattr(self, "layer_name") else "?",
+                    diff.max().item(), diff.mean().item(), ref.abs().mean().item(),
+                    torch.nn.functional.cosine_similarity(
+                        final.flatten(), ref.flatten(), dim=0
+                    ).item(),
+                    final.shape[0], split_k_len,
+                )
+            self._split_dump(q, k, v, prefill, split_k_len, out, ref)
+            logger.info(
+                "split reference check %s ub1: exact vs cache-path output "
+                "max|d| %.3e mean|d| %.3e ref mean|x| %.3e cos %.6f rows %d",
+                self.layer_name if hasattr(self, "layer_name") else "?",
+                diff.max().item(), diff.mean().item(), ref.abs().mean().item(),
+                torch.nn.functional.cosine_similarity(
+                    final.flatten(), ref.flatten(), dim=0
+                ).item(),
+                final.shape[0],
+            )

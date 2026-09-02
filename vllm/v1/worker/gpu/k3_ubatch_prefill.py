@@ -45,9 +45,11 @@ def runtime_mode() -> str | None:
     the mode for the next split-eligible forwards: ``off`` (no split),
     ``stage1`` (sequential halves, one thread), ``noyield`` (two threads
     and ubatch ids, collectives on the compute stream, no hand-off),
-    ``lockstep`` (hand-offs with the device drained around each), or
-    ``overlap``. The file is re-read at most once per second; a missing
-    file leaves the environment-derived behaviour in place.
+    ``lockstep`` (hand-offs with the device drained around each),
+    ``overlap``, or ``inexact`` (overlap with the second half reading the
+    first half through the KV cache instead of the bf16 stash). The file is
+    re-read at most once per second; a missing file leaves the
+    environment-derived behaviour in place.
     """
     path = os.getenv("VLLM_K3_UBATCH_MODE_FILE", "")
     if not path:
@@ -81,7 +83,7 @@ def ubatch_prefill_overlap() -> bool:
     shared comm stream (see communication_op._ubatch_comm_region)."""
     mode = runtime_mode()
     if mode is not None:
-        return mode in ("noyield", "lockstep", "overlap")
+        return mode in ("noyield", "lockstep", "overlap", "inexact")
     return os.getenv("VLLM_K3_UBATCH_PREFILL_OVERLAP", "0") == "1"
 
 
@@ -220,7 +222,14 @@ def run_split_prefill(
     prepared = []
     num_computed_gpu = runner.req_states.num_computed_tokens.gpu
     req_state_idx = int(input_batch.idx_mapping_np[0])
-    exact_mla = os.getenv("VLLM_K3_UBATCH_PREFILL_EXACT", "1") == "1"
+    # Exact split: the second half's MLA layers take the first half's keys
+    # in bf16 from a per-layer stash and their chunked context excludes it
+    # (see mla.py, `k3_split_exact`); `inexact` mode (mode file) keeps the
+    # cache path for the first half instead.
+    exact_mla = (
+        os.getenv("VLLM_K3_UBATCH_PREFILL_EXACT", "1") == "1"
+        and runtime_mode() != "inexact"
+    )
     for start, end in halves:
         hb = _half_batch(runner, input_batch, start, end)
         block_tables, slot_mappings = runner.prepare_attn(hb)
@@ -243,6 +252,12 @@ def run_split_prefill(
             hb, cudagraph_runtime_mode, block_tables, slot_mappings,
             runner.attn_groups, runner.kv_cache_config, for_capture=False,
         )
+        if exact_mla:
+            # Both halves' MLA layers take the exact path: the first half
+            # stashes its bf16 keys, the second consumes them.
+            for md in attn_metadata.values():
+                if hasattr(md, "prefill") and hasattr(md, "num_decode_tokens"):
+                    md.k3_split_exact = True
         if start > 0 and exact_mla:
             # MLA layers of the second half: context = earlier chunks only;
             # the first half's keys come from the layer's bf16 stash.
@@ -254,6 +269,19 @@ def run_split_prefill(
             merged = dict(attn_metadata)
             for name, md in mla_metadata.items():
                 if hasattr(md, "prefill") and hasattr(md, "num_decode_tokens"):
+                    md.k3_split_exact = True
+                    if os.getenv("VLLM_K3_UBATCH_STASH_CHECK", "0") == "1":
+                        # Diagnostics (mla.py _split_cache_reference): the
+                        # half's cache-path metadata, context through the
+                        # first half's cache entries.
+                        try:
+                            md.k3_split_cache_metadata = attn_metadata[name]
+                        except Exception as exc:  # frozen/slots dataclass
+                            from vllm.logger import init_logger
+
+                            init_logger(__name__).warning(
+                                "split check: cannot attach cache metadata: %s", exc
+                            )
                     merged[name] = md
             attn_metadata = merged
         half_inputs = dict(model_inputs)
