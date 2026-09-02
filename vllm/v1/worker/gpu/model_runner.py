@@ -1212,6 +1212,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
         elapsed_time = end_time - start_time
         cuda_graph_size = start_free_gpu_memory - end_free_gpu_memory
+        k3_ubatch_prefill.prime_workspaces()
         lock_workspace()
         # This usually takes 5~20 seconds.
         logger.info(

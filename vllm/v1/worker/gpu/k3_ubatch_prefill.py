@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import threading
+import time
 
 import numpy as np
 import torch
@@ -34,7 +35,40 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
+_MODE_CACHE: list = [0.0, None]
+
+
+def runtime_mode() -> str | None:
+    """Operator override of the split mode without a restart.
+
+    When ``VLLM_K3_UBATCH_MODE_FILE`` names a file, its first word selects
+    the mode for the next split-eligible forwards: ``off`` (no split),
+    ``stage1`` (sequential halves, one thread), ``noyield`` (two threads
+    and ubatch ids, collectives on the compute stream, no hand-off),
+    ``lockstep`` (hand-offs with the device drained around each), or
+    ``overlap``. The file is re-read at most once per second; a missing
+    file leaves the environment-derived behaviour in place.
+    """
+    path = os.getenv("VLLM_K3_UBATCH_MODE_FILE", "")
+    if not path:
+        return None
+    now = time.time()
+    if now - _MODE_CACHE[0] < 1.0:
+        return _MODE_CACHE[1]
+    try:
+        with open(path) as fh:
+            mode = fh.read().split()[0].strip().lower()
+    except Exception:
+        mode = None
+    _MODE_CACHE[0] = now
+    _MODE_CACHE[1] = mode
+    return mode
+
+
 def ubatch_prefill_enabled() -> bool:
+    mode = runtime_mode()
+    if mode is not None:
+        return mode != "off"
     return os.getenv("VLLM_K3_UBATCH_PREFILL", "0") == "1"
 
 
@@ -45,6 +79,9 @@ def ubatch_prefill_min_tokens() -> int:
 def ubatch_prefill_overlap() -> bool:
     """Stage 2: run the halves on two threads with the TP all-reduces on a
     shared comm stream (see communication_op._ubatch_comm_region)."""
+    mode = runtime_mode()
+    if mode is not None:
+        return mode in ("noyield", "lockstep", "overlap")
     return os.getenv("VLLM_K3_UBATCH_PREFILL_OVERLAP", "0") == "1"
 
 
@@ -58,6 +95,37 @@ def _comm_resources(device: torch.device):
         _COMM_STREAM = torch.cuda.Stream(device=device)
         _READY_BARRIER = threading.Barrier(3)
     return _COMM_STREAM, _READY_BARRIER
+
+
+def prime_workspaces() -> None:
+    """Give the second half its own workspace slots before the manager locks.
+
+    ``vllm.v1.worker.workspace`` keys its scratch buffers by
+    ``(ubatch id, lane)``; the worker sizes the manager for one ubatch unless
+    DBO is enabled, and after warm-up the manager is locked against growth.
+    The split's second thread runs as ubatch 1, so without this it either
+    indexes past the slot list or hits the growth lock on its first KDA/MLA
+    workspace request. Each ubatch-1 lane gets a buffer as large as the
+    corresponding ubatch-0 lane after warm-up (sized for the full chunk, so
+    a half fits). No-op when the split is disabled or the slots exist.
+    """
+    if not ubatch_prefill_enabled():
+        return
+    from vllm.v1.worker.workspace import current_workspace_manager
+
+    mgr = current_workspace_manager()
+    lanes = mgr._num_lanes
+    if mgr._num_ubatches < 2:
+        mgr._num_ubatches = 2
+        mgr._current_workspaces.extend([None] * lanes)
+    for lane in range(lanes):
+        base = mgr._current_workspaces[lane]
+        slot = 1 * lanes + lane
+        if base is None or mgr._current_workspaces[slot] is not None:
+            continue
+        mgr._current_workspaces[slot] = torch.empty(
+            (base.numel(),), dtype=torch.uint8, device=base.device
+        )
 
 
 def eligible(input_batch: InputBatch) -> bool:
@@ -248,10 +316,22 @@ def _run_overlapped(runner, prepared, cudagraph_runtime_mode, batch_descriptor,
     @torch.inference_mode()
     def _thread(ctx, half_inputs):
         try:
+            # vLLM's thread-local current_stream() would otherwise create a
+            # fresh CUDA stream for this thread on first use (a device
+            # allocation that fails when the device is full); bind the
+            # thread to the step's compute stream up front.
+            torch.cuda.set_stream(compute_stream)
             with ctx:
                 out = runner.model(**half_inputs)
             results.append((ctx.id, out))
         except BaseException as exc:  # surfaced after join
+            import traceback
+
+            from vllm.logger import init_logger
+
+            init_logger(__name__).error(
+                "split-prefill half %d failed: %s\n%s", ctx.id, exc, traceback.format_exc()
+            )
             errors.append(exc)
             ctx.cpu_signal_event.set()
 
@@ -264,8 +344,60 @@ def _run_overlapped(runner, prepared, cudagraph_runtime_mode, batch_descriptor,
             th.start()
         ready_barrier.wait()
         ctxs[0].cpu_wait_event.set()
-        for th in threads:
-            th.join()
+        try:
+            _join_with_watchdog(threads, runner)
+        finally:
+            # A half that failed inside UBatchContext.__enter__ never ran
+            # __exit__, leaving its thread registered; a later forward on the
+            # main thread would then take the ubatch path of
+            # dbo_current_ubatch_id() and fail with KeyError.
+            from vllm.v1.worker import ubatching
+
+            for th in threads:
+                ubatching._THREAD_ID_TO_CONTEXT.pop(th.ident, None)
+            for i in range(len(ubatching._CURRENT_CONTEXTS)):
+                ubatching._CURRENT_CONTEXTS[i] = None
     if errors:
         raise errors[0]
     return [out for _, out in sorted(results, key=lambda r: r[0])]
+
+
+def _join_with_watchdog(threads, runner) -> None:
+    """Join the half threads; if they do not finish within
+    ``VLLM_K3_UBATCH_WATCHDOG_S`` seconds (0 = off), log this rank's
+    collective trace and the halves' Python stacks every few seconds so a
+    cross-rank stall can be located from the worker logs."""
+    import sys
+    import traceback
+
+    timeout = float(os.getenv("VLLM_K3_UBATCH_WATCHDOG_S", "0") or 0)
+    if timeout <= 0:
+        for th in threads:
+            th.join()
+        return
+    from vllm.distributed.communication_op import _UbatchTrace
+    from vllm.logger import init_logger
+
+    logger = init_logger(__name__)
+    deadline = time.time() + timeout
+    reported = 0
+    while any(th.is_alive() for th in threads):
+        for th in threads:
+            th.join(timeout=0.5)
+        if time.time() > deadline and time.time() - reported > 5:
+            reported = time.time()
+            frames = sys._current_frames()
+            stacks = []
+            for th in threads:
+                fr = frames.get(th.ident)
+                if fr is not None:
+                    stacks.append(
+                        f"{th.name}: " + " <- ".join(
+                            f"{f.name}:{f.lineno}" for f in traceback.extract_stack(fr)[-6:]
+                        )
+                    )
+            logger.error(
+                "split-prefill watchdog (rank %s): %s | %s",
+                getattr(runner, "rank", "?"), _UbatchTrace.report(), " || ".join(stacks),
+            )
+    _UbatchTrace.reset()
