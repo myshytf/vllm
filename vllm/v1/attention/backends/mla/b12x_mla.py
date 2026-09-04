@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Any, ClassVar, cast
@@ -54,6 +55,15 @@ _FP8_DS_MLA_RECORD_BYTES = 656
 _PACKED_DENSE_MAX_SPLITS = 64
 _PACKED_DENSE_INDEX_BLOCK = 256
 _MAX_I32 = torch.iinfo(torch.int32).max
+# Research-only decode window for the packed reader: when positive, every
+# decode query attends to at most this many most recent tokens (global
+# positions) instead of the whole visible context. Prefill stays exact-dense
+# and every token is still written to the cache, so the window changes the
+# attention semantics of the 24 MLA layers at decode time only. ``0`` keeps
+# the exact-dense behavior. The file override is read on every metadata build
+# so a research boot can switch the window without restarting.
+_DECODE_WINDOW_TOKENS_ENV = "VLLM_K3_MLA_DECODE_WINDOW_TOKENS"
+_DECODE_WINDOW_FILE_ENV = "VLLM_K3_MLA_DECODE_WINDOW_FILE"
 
 
 def _load_dense_mla() -> Any:
@@ -113,6 +123,7 @@ def _planned_query_dtype(vllm_config: VllmConfig) -> torch.dtype:
 def _materialize_paged_dense_indices_kernel(
     block_table_ptr,
     seq_lens_ptr,
+    window_starts_ptr,
     output_ptr,
     block_table_stride_row,
     output_stride_row,
@@ -120,21 +131,32 @@ def _materialize_paged_dense_indices_kernel(
     OUTPUT_WIDTH: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    HAS_WINDOW: tl.constexpr,
 ):
-    """Expand a paged block table into exact-dense physical cache slots."""
+    """Expand a paged block table into exact-dense physical cache slots.
+
+    With ``HAS_WINDOW`` the row's candidates start at its window start slot
+    and the table is compacted so candidate ``j`` is local slot ``start + j``;
+    ``seq_lens`` then holds the number of candidates per row.
+    """
     row = tl.program_id(0)
     tile = tl.program_id(1)
     offsets = tile * BLOCK_N + tl.arange(0, BLOCK_N)
     output_mask = offsets < OUTPUT_WIDTH
     seq_len = tl.load(seq_lens_ptr + row)
     live = output_mask & (offsets < seq_len)
-    logical_page = offsets // PAGE_SIZE
+    if HAS_WINDOW:
+        window_start = tl.load(window_starts_ptr + row)
+        local_slots = offsets + window_start
+    else:
+        local_slots = offsets
+    logical_page = local_slots // PAGE_SIZE
     physical_page = tl.load(
         block_table_ptr + row * block_table_stride_row + logical_page,
         mask=live & (logical_page < TABLE_WIDTH),
         other=0,
     ).to(tl.int32)
-    physical_slot = physical_page * PAGE_SIZE + offsets % PAGE_SIZE
+    physical_slot = physical_page * PAGE_SIZE + local_slots % PAGE_SIZE
     tl.store(
         output_ptr + row * output_stride_row + offsets,
         tl.where(live, physical_slot, -1),
@@ -148,12 +170,24 @@ def _materialize_paged_dense_indices(
     output: torch.Tensor,
     *,
     page_size: int,
+    window_starts: torch.Tensor | None = None,
 ) -> None:
-    """Populate ``output`` with every valid physical slot in causal order."""
+    """Populate ``output`` with every valid physical slot in causal order.
+
+    ``window_starts`` selects a suffix of each row's local slots: candidate
+    ``j`` of a row maps local slot ``window_starts[row] + j`` and ``seq_lens``
+    counts the candidates. Without it the row starts at local slot 0.
+    """
     if block_table.ndim != 2 or block_table.dtype != torch.int32:
         raise TypeError("block_table must be a rank-2 int32 tensor")
     if seq_lens.ndim != 1 or seq_lens.dtype != torch.int32:
         raise TypeError("seq_lens must be a rank-1 int32 tensor")
+    if window_starts is not None and (
+        window_starts.shape != seq_lens.shape
+        or window_starts.dtype != torch.int32
+        or window_starts.device != seq_lens.device
+    ):
+        raise TypeError("window_starts must match seq_lens in shape, dtype, device")
     if output.ndim != 2 or output.dtype != torch.int32 or not output.is_contiguous():
         raise TypeError("output must be a contiguous rank-2 int32 tensor")
     rows = int(seq_lens.shape[0])
@@ -171,6 +205,7 @@ def _materialize_paged_dense_indices(
     ](
         block_table,
         seq_lens,
+        seq_lens if window_starts is None else window_starts,
         output,
         block_table.stride(0),
         output.stride(0),
@@ -178,7 +213,49 @@ def _materialize_paged_dense_indices(
         OUTPUT_WIDTH=width,
         PAGE_SIZE=int(page_size),
         BLOCK_N=_PACKED_DENSE_INDEX_BLOCK,
+        HAS_WINDOW=window_starts is not None,
     )
+
+
+def _decode_window_tokens_from_env() -> int:
+    """Return the configured decode window in global tokens (0 = exact dense)."""
+    file_path = os.environ.get(_DECODE_WINDOW_FILE_ENV)
+    if file_path:
+        try:
+            with open(file_path) as handle:
+                return max(0, int(handle.read().strip() or "0"))
+        except (OSError, ValueError):
+            pass
+    try:
+        return max(0, int(os.environ.get(_DECODE_WINDOW_TOKENS_ENV, "0")))
+    except ValueError:
+        return 0
+
+
+def _decode_window_starts(
+    global_lens: torch.Tensor,
+    local_lens: torch.Tensor,
+    *,
+    window_tokens: int,
+    dcp_rank: int,
+    dcp_size: int,
+) -> torch.Tensor:
+    """Return the first local slot each row keeps for a decode window.
+
+    Token ``p`` of a sequence lives on DCP rank ``p % dcp_size`` at local slot
+    ``p // dcp_size``. The window keeps global positions
+    ``[global_len - window_tokens, global_len)``; the first kept local slot is
+    the first local token at or past that position, clamped to the row's local
+    length so short rows keep everything.
+    """
+    if window_tokens <= 0:
+        raise ValueError("window_tokens must be positive")
+    if dcp_size <= 0 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError("dcp_rank must lie inside [0, dcp_size)")
+    window_first = global_lens - window_tokens - dcp_rank
+    starts = torch.div(window_first + (dcp_size - 1), dcp_size, rounding_mode="floor")
+    starts = starts.clamp_(min=0)
+    return torch.minimum(starts, local_lens).to(torch.int32)
 
 
 def _max_dcp_local_cache_tokens(
@@ -480,6 +557,7 @@ class B12xMLAMetadata(MLACommonMetadata):
     dense_mla_verify_block_table: torch.Tensor | None = None
     dense_mla_query_cache_seq_lens: torch.Tensor | None = None
     dense_mla_selected_indices: torch.Tensor | None = None
+    dense_mla_selected_counts: torch.Tensor | None = None
     dense_mla_dcp_world_size: int = 1
 
 
@@ -668,6 +746,29 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             if self._uses_packed_ds_mla
             else None
         )
+        # Candidate counts and window starts are persistent so a CUDA graph
+        # captured in either mode replays with the values of the current step.
+        self._dense_mla_selected_counts = (
+            torch.empty(max_dense_mla_rows, dtype=torch.int32, device=device)
+            if self._uses_packed_ds_mla
+            else None
+        )
+        self._dense_mla_window_starts = (
+            torch.empty(max_dense_mla_rows, dtype=torch.int32, device=device)
+            if self._uses_packed_ds_mla
+            else None
+        )
+        self._decode_window_tokens_static = _decode_window_tokens_from_env()
+        self._decode_window_file = os.environ.get(_DECODE_WINDOW_FILE_ENV) or None
+        if self._uses_packed_ds_mla and (
+            self._decode_window_tokens_static or self._decode_window_file
+        ):
+            logger.warning(
+                "B12X_MLA research decode window enabled: %d tokens (file %s); "
+                "decode attention is no longer exact over the full context.",
+                self._decode_window_tokens_static,
+                self._decode_window_file,
+            )
         logger.info_once(
             "B12X dense K3 MLA plans: cache_format=%s, local_heads=%d, "
             "effective_heads=%d, "
@@ -692,11 +793,18 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             or "disabled",
         )
 
+    def _decode_window_tokens(self) -> int:
+        """Current research decode window (0 = exact dense)."""
+        if getattr(self, "_decode_window_file", None):
+            return _decode_window_tokens_from_env()
+        return int(getattr(self, "_decode_window_tokens_static", 0))
+
     def _attach_packed_dense_indices(
         self,
         metadata: B12xMLAMetadata,
         block_table: torch.Tensor,
         seq_lens: torch.Tensor,
+        global_lens: torch.Tensor | None = None,
     ) -> None:
         if not getattr(self, "_uses_packed_ds_mla", False):
             return
@@ -705,13 +813,44 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             raise RuntimeError("B12X_MLA packed dense slot storage is missing")
         rows = int(seq_lens.shape[0])
         selected = selected_storage[:rows]
+        window_tokens = self._decode_window_tokens()
+        counts_storage = getattr(self, "_dense_mla_selected_counts", None)
+        if window_tokens <= 0 or counts_storage is None:
+            _materialize_paged_dense_indices(
+                block_table,
+                seq_lens,
+                selected,
+                page_size=self.page_size,
+            )
+            metadata.dense_mla_selected_indices = selected
+            if counts_storage is not None:
+                counts = counts_storage[:rows]
+                counts.copy_(seq_lens)
+                metadata.dense_mla_selected_counts = counts
+            return
+        if global_lens is None:
+            global_lens = seq_lens
+        starts = self._dense_mla_window_starts[:rows]
+        starts.copy_(
+            _decode_window_starts(
+                global_lens,
+                seq_lens,
+                window_tokens=window_tokens,
+                dcp_rank=self._dcp_rank,
+                dcp_size=self.dcp_world_size,
+            )
+        )
+        counts = counts_storage[:rows]
+        torch.sub(seq_lens, starts, out=counts)
         _materialize_paged_dense_indices(
             block_table,
-            seq_lens,
+            counts,
             selected,
             page_size=self.page_size,
+            window_starts=starts,
         )
         metadata.dense_mla_selected_indices = selected
+        metadata.dense_mla_selected_counts = counts
 
     def _materialize_query_cache_seq_lens(
         self,
@@ -806,6 +945,11 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
                 metadata,
                 decode_metadata.block_table,
                 decode_metadata.seq_lens,
+                global_lens=(
+                    decode_metadata.dcp_tot_seq_lens
+                    if self.dcp_world_size > 1
+                    else decode_metadata.seq_lens
+                ),
             )
             return metadata
 
@@ -865,7 +1009,15 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         metadata.dense_mla_flat_query_start_loc = self._dense_mla_flat_query_start_loc[
             : total_q + 1
         ]
-        self._attach_packed_dense_indices(metadata, flat_table, flat_lens)
+        flat_global_lens = (
+            self._dense_mla_flat_global_seq_lens[:total_q]
+            if self.dcp_world_size > 1
+            and self._dense_mla_flat_global_seq_lens is not None
+            else flat_lens
+        )
+        self._attach_packed_dense_indices(
+            metadata, flat_table, flat_lens, global_lens=flat_global_lens
+        )
         return metadata
 
 
@@ -1276,12 +1428,14 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             packed_run = self._packed_dense_run
             if packed_run is None:
                 raise RuntimeError("B12X_MLA packed dense reader is unavailable")
+            selected_counts = getattr(attn_metadata, "dense_mla_selected_counts", None)
+            candidate_lens = seq_lens if selected_counts is None else selected_counts
             binding = plan.bind(
                 scratch=scratch,
                 q=q,
                 selected_indices=selected_indices,
-                cache_seqlens_int32=seq_lens,
-                nsa_cache_seqlens_int32=seq_lens,
+                cache_seqlens_int32=candidate_lens,
+                nsa_cache_seqlens_int32=candidate_lens,
             )
             output, lse = cast(
                 tuple[torch.Tensor, torch.Tensor],

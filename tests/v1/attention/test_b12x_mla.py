@@ -3,6 +3,7 @@
 
 import math
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -1299,3 +1300,181 @@ def test_b12x_mla_adapter_requires_caller_owned_scratch(monkeypatch) -> None:
             metadata,
             SimpleNamespace(_q_scale=None, _k_scale=None),
         )
+
+
+# ---------------------------------------------------------------------------
+# Research decode window over the packed reader.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("global_len", "local_len", "window", "rank", "expected_start"),
+    [
+        # 5,049 tokens over DCP 8: rank 0 holds 632 slots, ranks 1-7 hold 631.
+        (5049, 632, 2048, 0, 376),
+        (5049, 631, 2048, 1, 375),
+        (5049, 631, 2048, 7, 375),
+        # A sequence shorter than the window keeps every slot.
+        (1000, 125, 2048, 0, 0),
+        (1000, 125, 2048, 3, 0),
+        # Window equal to the sequence keeps every slot.
+        (2048, 256, 2048, 0, 0),
+        # No DCP: the window is a plain suffix.
+        (5049, 5049, 2048, 0, 3001),
+    ],
+)
+def test_b12x_mla_decode_window_starts_keep_the_recent_suffix(
+    global_len: int, local_len: int, window: int, rank: int, expected_start: int
+) -> None:
+    dcp_size = 8 if local_len != global_len else 1
+    starts = b12x_mla._decode_window_starts(
+        torch.tensor([global_len], dtype=torch.int32),
+        torch.tensor([local_len], dtype=torch.int32),
+        window_tokens=window,
+        dcp_rank=rank,
+        dcp_size=dcp_size,
+    )
+    assert starts.dtype == torch.int32
+    assert int(starts[0]) == expected_start
+    kept = local_len - int(starts[0])
+    if global_len > window:
+        # Every rank keeps window/dcp_size slots, up to one more on the ranks
+        # that own the extra tokens of a non-aligned window start.
+        assert window // dcp_size <= kept <= window // dcp_size + 1
+    else:
+        assert kept == local_len
+    if dcp_size > 1 and int(starts[0]) > 0:
+        first_kept_position = int(starts[0]) * dcp_size + rank
+        assert first_kept_position >= global_len - window
+        assert (int(starts[0]) - 1) * dcp_size + rank < global_len - window
+
+
+def test_b12x_mla_decode_window_rejects_bad_geometry() -> None:
+    lens = torch.tensor([10], dtype=torch.int32)
+    with pytest.raises(ValueError, match="window_tokens"):
+        b12x_mla._decode_window_starts(
+            lens, lens, window_tokens=0, dcp_rank=0, dcp_size=1
+        )
+    with pytest.raises(ValueError, match="dcp_rank"):
+        b12x_mla._decode_window_starts(
+            lens, lens, window_tokens=4, dcp_rank=2, dcp_size=2
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_b12x_mla_materializes_windowed_slots_from_the_row_start() -> None:
+    block_table = torch.tensor([[2, 5]], dtype=torch.int32, device="cuda")
+    counts = torch.tensor([3], dtype=torch.int32, device="cuda")
+    starts = torch.tensor([3], dtype=torch.int32, device="cuda")
+    output = torch.empty((1, 8), dtype=torch.int32, device="cuda")
+
+    b12x_mla._materialize_paged_dense_indices(
+        block_table, counts, output, page_size=4, window_starts=starts
+    )
+
+    torch.testing.assert_close(
+        output.cpu(),
+        torch.tensor([[11, 20, 21, -1, -1, -1, -1, -1]], dtype=torch.int32),
+    )
+
+
+def _window_builder(window_tokens: int, dcp_size: int, dcp_rank: int) -> Any:
+    builder = object.__new__(B12xMLAMetadataBuilder)
+    builder._uses_packed_ds_mla = True
+    builder._dense_mla_selected_indices = torch.empty(4, 8, dtype=torch.int32)
+    builder._dense_mla_selected_counts = torch.empty(4, dtype=torch.int32)
+    builder._dense_mla_window_starts = torch.empty(4, dtype=torch.int32)
+    builder._decode_window_tokens_static = window_tokens
+    builder._decode_window_file = None
+    builder._dcp_rank = dcp_rank
+    builder.dcp_world_size = dcp_size
+    builder.page_size = 4
+    return builder
+
+
+def _materialize_on_cpu(
+    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]],
+):
+    def materialize(table, lengths, output, *, page_size, window_starts=None):
+        calls.append((table, lengths, window_starts))
+        output.fill_(-1)
+        for row, length in enumerate(lengths.tolist()):
+            start = 0 if window_starts is None else int(window_starts[row])
+            for j in range(length):
+                slot = start + j
+                output[row, j] = (
+                    table[row, slot // page_size] * page_size + slot % page_size
+                )
+
+    return materialize
+
+
+def test_b12x_mla_builder_windows_decode_candidates(monkeypatch) -> None:
+    """With a window the table holds the recent suffix only and the counts
+    passed to the reader shrink accordingly; the local slots are the ones
+    this DCP rank owns inside the window."""
+    builder = _window_builder(window_tokens=8, dcp_size=2, dcp_rank=1)
+    metadata = SimpleNamespace(
+        dense_mla_selected_indices=None, dense_mla_selected_counts=None
+    )
+    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
+    monkeypatch.setattr(
+        b12x_mla, "_materialize_paged_dense_indices", _materialize_on_cpu(calls)
+    )
+    block_table = torch.tensor([[2, 5]], dtype=torch.int32)
+    local_lens = torch.tensor([6], dtype=torch.int32)  # global 13 tokens, rank 1 owns 6
+    global_lens = torch.tensor([13], dtype=torch.int32)
+
+    builder._attach_packed_dense_indices(
+        metadata, block_table, local_lens, global_lens=global_lens
+    )
+
+    # Window keeps global positions [5, 13); rank 1 owns positions 5,7,9,11
+    # = local slots 2..5, so the start is 2 and four candidates remain.
+    assert calls[0][2] is not None and int(calls[0][2][0]) == 2
+    assert metadata.dense_mla_selected_counts.tolist() == [4]
+    torch.testing.assert_close(
+        metadata.dense_mla_selected_indices,
+        torch.tensor([[10, 11, 20, 21, -1, -1, -1, -1]], dtype=torch.int32),
+    )
+
+
+def test_b12x_mla_builder_without_window_keeps_exact_dense_counts(monkeypatch) -> None:
+    builder = _window_builder(window_tokens=0, dcp_size=2, dcp_rank=1)
+    metadata = SimpleNamespace(
+        dense_mla_selected_indices=None, dense_mla_selected_counts=None
+    )
+    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = []
+    monkeypatch.setattr(
+        b12x_mla, "_materialize_paged_dense_indices", _materialize_on_cpu(calls)
+    )
+    block_table = torch.tensor([[2, 5]], dtype=torch.int32)
+    local_lens = torch.tensor([6], dtype=torch.int32)
+
+    builder._attach_packed_dense_indices(
+        metadata,
+        block_table,
+        local_lens,
+        global_lens=torch.tensor([13], dtype=torch.int32),
+    )
+
+    assert calls[0][2] is None
+    assert metadata.dense_mla_selected_counts.tolist() == [6]
+    torch.testing.assert_close(
+        metadata.dense_mla_selected_indices,
+        torch.tensor([[8, 9, 10, 11, 20, 21, -1, -1]], dtype=torch.int32),
+    )
+
+
+def test_b12x_mla_decode_window_file_override(monkeypatch, tmp_path) -> None:
+    window_file = tmp_path / "window"
+    monkeypatch.setenv(b12x_mla._DECODE_WINDOW_FILE_ENV, str(window_file))
+    monkeypatch.setenv(b12x_mla._DECODE_WINDOW_TOKENS_ENV, "1024")
+    builder = _window_builder(window_tokens=1024, dcp_size=1, dcp_rank=0)
+    builder._decode_window_file = str(window_file)
+
+    assert builder._decode_window_tokens() == 1024  # file absent: env value
+    window_file.write_text("2048\n")
+    assert builder._decode_window_tokens() == 2048
+    window_file.write_text("0")
+    assert builder._decode_window_tokens() == 0
