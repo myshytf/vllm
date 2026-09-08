@@ -1496,6 +1496,53 @@ def test_query_gather_fallback_copies_into_caller_output(monkeypatch):
     torch.testing.assert_close(actual, gathered)
 
 
+@pytest.mark.parametrize("backend_support", ["supported", "legacy", "declined"])
+def test_query_gather_dispatches_padded_output_by_backend_capability(
+    monkeypatch, backend_support
+):
+    """Exercise host dispatch and fallback copies without launching CUDA work."""
+    from vllm.v1.attention.ops import dcp_alltoall
+
+    class _HostQuery(torch.Tensor):
+        @property
+        def is_cuda(self):
+            return True
+
+    local = torch.zeros(4, 11, 656, dtype=torch.float8_e4m3fn).as_subclass(_HostQuery)
+    gathered = torch.full((4, 99, 656), 3, dtype=local.dtype)
+    storage = torch.full((4, 112, 656), 7, dtype=local.dtype)
+    out = storage[:, :99]
+    outputs = []
+
+    class _FakePool:
+        def all_gather_heads(self, local_input, *, out=None, channel_id):
+            assert local_input is local
+            outputs.append(out)
+            if out is not None:
+                out.copy_(gathered)
+                return out
+            return gathered
+
+    pool = _FakePool()
+    if backend_support != "legacy":
+        pool.supports_all_gather_heads_output = (  # type: ignore[attr-defined]
+            lambda value: backend_support == "supported"
+        )
+    monkeypatch.setenv("VLLM_DCP_A2A_MAX_TOKENS", "8")
+    monkeypatch.setattr(dcp_alltoall, "_get_b12x_dcp_a2a_pool", lambda *a, **k: pool)
+    group = _FakeCPGroup(9, None)  # type: ignore[arg-type]
+
+    actual = dcp_alltoall._try_b12x_dcp_all_gather_heads(
+        local, group, max_batch_size=8, output_head_dim=512, out=out
+    )
+
+    assert actual is out
+    assert len(outputs) == 1
+    assert outputs[0] is (out if backend_support == "supported" else None)
+    torch.testing.assert_close(out.view(torch.uint8), gathered.view(torch.uint8))
+    assert torch.all(storage[:, 99:].float() == 7)
+
+
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
 def test_b12x_lse_reduce_preserves_supported_layouts(monkeypatch: pytest.MonkeyPatch):
     """Preserve head-major input while materializing legacy head slices."""
@@ -2545,8 +2592,12 @@ def _distributed_b12x_packed_query_gather_worker(env: dict[str, str]) -> None:
             generator = torch.Generator(device=device)
             generator.manual_seed(20000 * step + rank)
             return torch.randint(
-                0, 256, (batch, h_per_rank, record_bytes), device=device,
-                dtype=torch.uint8, generator=generator,
+                0,
+                256,
+                (batch, h_per_rank, record_bytes),
+                device=device,
+                dtype=torch.uint8,
+                generator=generator,
             )
 
         def expected(records: torch.Tensor) -> torch.Tensor:
