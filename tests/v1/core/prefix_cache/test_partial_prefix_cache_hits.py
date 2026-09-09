@@ -254,6 +254,7 @@ def test_hybrid_mamba_align_partial_hash_hit():
         KVCacheBlockCopy(
             src_block_id=partial_mamba_block[0].block_id,
             dst_block_id=mamba_new_block_ids[0],
+            kv_cache_group_id=1,
         )
         in copies
     )
@@ -1016,6 +1017,7 @@ def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
         KVCacheBlockCopy(
             src_block_id=moved_block_id,
             dst_block_id=mamba_new_block_ids[0],
+            kv_cache_group_id=1,
         )
         in copies
     )
@@ -1149,6 +1151,7 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
         KVCacheBlockCopy(
             src_block_id=partial_full_block[0].block_id,
             dst_block_id=full_new_block_ids[0],
+            kv_cache_group_id=0,
         )
         in copies
     )

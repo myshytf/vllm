@@ -17,6 +17,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
+    MambaManager,
     SingleTypeKVCacheManager,
     get_manager_for_kv_cache_spec,
 )
@@ -698,13 +699,20 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     "full-attention, Mamba, and dcp_replicated groups, got: "
                     f"{type(g.kv_cache_spec).__name__}."
                 )
-        # Fine-grained hash hits are safe when an aligned Mamba group can
-        # materialize recurrent state at every candidate boundary. Recurrent
-        # state exists at Mamba block boundaries only, so interior attention
-        # hits are aligned to the least common multiple of the hash unit and
-        # every aligned Mamba block size (equal to the hash unit when the
-        # Mamba block matches it, as on TP8; 4,608 tokens for a 1,536-token
-        # hash unit with a 4,608-token Mamba block, as on TP9/DCP9). The
+        # Fine-grained hash hits are safe when every aligned Mamba group can
+        # materialize a complete recurrent state at hash-unit boundaries. That
+        # holds when the Mamba block equals the hash unit (one state block per
+        # hash unit natively), when the group exports prefill checkpoints
+        # (num_prefill_checkpoint_blocks > 0: the kernel snapshots the
+        # hash-boundary state into a durable checkpoint block), or when there
+        # is no context parallelism (the producer's own copy-on-write keeps
+        # the boundary state durable locally). Otherwise recurrent state
+        # exists only at Mamba block boundaries, and under DCP a partial
+        # recurrent-state hand-off across ranks is unavailable, so interior
+        # hits align to the least common multiple of the hash unit and every
+        # such Mamba block size (equal to the hash unit when the Mamba block
+        # matches it; 4,608 tokens for a 1,536-token hash unit with a
+        # 4,608-token Mamba block without checkpoints, as on TP9/DCP9). The
         # alignment must still be finer than the scheduler block, otherwise
         # partial hits add nothing.
         aligned_mamba_managers = [
@@ -716,6 +724,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             )
             if isinstance(group.kv_cache_spec, MambaSpec)
             and group.kv_cache_spec.mamba_cache_mode == "align"
+            and isinstance(manager, MambaManager)
         ]
         has_fine_grained_group = any(
             manager.supports_fine_grained_hash_lookup
@@ -723,8 +732,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for manager in self.single_type_managers
         )
         partial_hit_alignment = hash_block_size
-        for manager in aligned_mamba_managers:
-            partial_hit_alignment = math.lcm(partial_hit_alignment, manager.block_size)
+        for mamba_manager in aligned_mamba_managers:
+            if (
+                mamba_manager.block_size == hash_block_size
+                or mamba_manager.has_prefill_checkpoint_blocks
+                or dcp_world_size == 1
+            ):
+                continue
+            partial_hit_alignment = math.lcm(
+                partial_hit_alignment, mamba_manager.block_size
+            )
         self.partial_hit_alignment_tokens = partial_hit_alignment
         self.enable_partial_hash_hits = (
             bool(aligned_mamba_managers)
