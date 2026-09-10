@@ -211,8 +211,9 @@ def test_poisoning_is_block_size_independent(
 
 @pytest.mark.parametrize("partial_hit", [False, True])
 @pytest.mark.parametrize("resume_at", [331, 1599, 1601, 2531, 3011])
+@pytest.mark.parametrize("use_eagle", [False, True])
 def test_unaligned_resume_never_runs_past_its_block(
-    partial_hit: bool, resume_at: int
+    partial_hit: bool, resume_at: int, use_eagle: bool
 ) -> None:
     """A prefill resuming mid-block must re-align before crossing a boundary.
 
@@ -223,11 +224,16 @@ def test_unaligned_resume_never_runs_past_its_block(
     prompt_len = 3602
     (request,) = create_requests(1, num_tokens=prompt_len, block_size=ATTN_BLOCK_SIZE)
     tail_boundary = prompt_len // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE
+    if use_eagle:
+        # Draft replay requires a state below its last complete attention block.
+        tail_boundary -= ATTN_BLOCK_SIZE
 
     pos, ends = resume_at, []
     while pos < prompt_len:
         request.num_computed_tokens = pos
-        num_new = _split(request, prompt_len - pos, partial_hit=partial_hit)
+        num_new = _split(
+            request, prompt_len - pos, use_eagle=use_eagle, partial_hit=partial_hit
+        )
         assert num_new > 0, f"no progress at {pos}"
         if pos % MAMBA_BLOCK_SIZE != 0:
             block_end = (pos // MAMBA_BLOCK_SIZE + 1) * MAMBA_BLOCK_SIZE

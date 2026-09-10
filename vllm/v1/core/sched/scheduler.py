@@ -476,6 +476,12 @@ class Scheduler(SchedulerInterface):
             if self.mamba_partial_cache_hit
             else 0
         )
+        if tail_boundary and getattr(
+            self, "use_eagle_for_target_cache", self.use_eagle
+        ):
+            # Publish a recurrent state at the boundary the draft can reuse.
+            # Stopping above it cannot supply an earlier recurrent state.
+            tail_boundary = max(0, tail_boundary - self.hash_block_size)
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.

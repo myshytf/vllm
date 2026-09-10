@@ -395,8 +395,8 @@ class DFlashSpeculator(DraftModelSpeculator):
         req_state_indices = input_batch.idx_mapping_np[: input_batch.num_reqs]
         cached = self.num_cached_tokens_np[req_state_indices]
         return any(
-            np.any(cached % block_size != 0)
-            for block_size in self.block_tables.kernel_block_sizes
+            np.any(cached % self.block_tables.kernel_block_sizes[gid] != 0)
+            for gid in self.draft_kv_cache_group_ids
         )
 
     def set_attn(
