@@ -1,0 +1,182 @@
+{
+  "status": "qualified for the recorded replay conditions; not a universal throughput claim",
+  "measurement_date": "2026-09-10",
+  "base_revision": "f9ac0209a2edb6d54cd40a27913fde5dd833f944",
+  "implementation_revision": "6054d5e56b1e1649f35a16de7c09a1cf05b58067",
+  "base_image": "sha256:a8948e4338c28904a513463d8ce82bd94a952eba73c30e6b4efeec6c2df257e4",
+  "implementation_image": "sha256:4e2684fde7c1adf76728900dc5511f84dd2a8aa18507cce32712c49cd65b8fb2",
+  "conditions": {
+    "gpu": "9 RTX PRO 6000 Blackwell GPUs, TP9/DCP9",
+    "draft": "colocated DFlash2 K=3",
+    "kv_dtype": "fp8_ds_mla",
+    "temperature": 0,
+    "max_tokens": 16,
+    "input_token_rule": "1000 + (i * 37) % 10000 for i in range(prompt_tokens)",
+    "measurement": "serialized requests on an idle engine; completion-scoped computed-token counters; nonempty SSE delta TTFT",
+    "limitations": "Synthetic token input, two lengths, short decode samples; long-context throughput requires separate evidence."
+  },
+  "rows": [
+    {
+      "base": {
+        "prompt_tokens": 17125,
+        "ttft_s": 1.958057540000027,
+        "decode_tail_s": 0.28219914600003904,
+        "computed_tokens": 3301.0,
+        "local_hit_tokens": 13824.0,
+        "drafts": 8.0,
+        "accepted_tokens": 7.0,
+        "token_ids": [
+          4625,
+          4662,
+          4699,
+          4736,
+          4773,
+          4810,
+          4847,
+          4884,
+          4921,
+          4958,
+          4995,
+          5032,
+          5069,
+          5106,
+          5143,
+          5180
+        ],
+        "finite_logprobs": true
+      },
+      "recurrent_tail_with_drafting": {
+        "prompt_tokens": 17125,
+        "ttft_s": 1.0427335020003738,
+        "decode_tail_s": 0.2813570130001608,
+        "computed_tokens": 1765.0,
+        "local_hit_tokens": 15360.0,
+        "drafts": 8.0,
+        "accepted_tokens": 7.0,
+        "token_ids": [
+          4625,
+          4662,
+          4699,
+          4736,
+          4773,
+          4810,
+          4847,
+          4884,
+          4921,
+          4958,
+          4995,
+          5032,
+          5069,
+          5106,
+          5143,
+          5180
+        ],
+        "finite_logprobs": true
+      },
+      "token_ids_equal": true,
+      "retained_production_namespace": true
+    },
+    {
+      "base": {
+        "prompt_tokens": 18086,
+        "ttft_s": 2.405658802999824,
+        "decode_tail_s": 0.28163049500017223,
+        "computed_tokens": 4262.0,
+        "local_hit_tokens": 13824.0,
+        "drafts": 8.0,
+        "accepted_tokens": 8.0,
+        "token_ids": [
+          10182,
+          10219,
+          10256,
+          10293,
+          10330,
+          10367,
+          10404,
+          10441,
+          10478,
+          10515,
+          10552,
+          10589,
+          10626,
+          10663,
+          10700,
+          10737
+        ],
+        "finite_logprobs": true
+      },
+      "recurrent_tail_with_drafting": {
+        "prompt_tokens": 18086,
+        "ttft_s": 1.4965406450000955,
+        "decode_tail_s": 0.2810271130001638,
+        "computed_tokens": 2726.0,
+        "local_hit_tokens": 15360.0,
+        "drafts": 8.0,
+        "accepted_tokens": 8.0,
+        "token_ids": [
+          10182,
+          10219,
+          10256,
+          10293,
+          10330,
+          10367,
+          10404,
+          10441,
+          10478,
+          10515,
+          10552,
+          10589,
+          10626,
+          10663,
+          10700,
+          10737
+        ],
+        "finite_logprobs": true
+      },
+      "token_ids_equal": true,
+      "retained_production_namespace": true
+    }
+  ],
+  "absolute_sustained_screens": {
+    "c1": [
+      {
+        "requested_context": 0,
+        "output_tok_s": 66.91297336610482,
+        "request_steps_s": 30.22091419226868,
+        "errors": 0
+      },
+      {
+        "requested_context": 16384,
+        "output_tok_s": 63.25425570528816,
+        "request_steps_s": 28.557828525172294,
+        "errors": 0
+      },
+      {
+        "requested_context": 65536,
+        "output_tok_s": 71.89471385638579,
+        "request_steps_s": 28.370708810551495,
+        "errors": 0
+      },
+      {
+        "requested_context": 131072,
+        "output_tok_s": 65.63945449482644,
+        "request_steps_s": 26.576299988749664,
+        "errors": 0
+      }
+    ],
+    "c4": [
+      {
+        "requested_context": 16384,
+        "aggregate_tok_s": 155.8863312064313,
+        "errors": 0
+      }
+    ],
+    "note": "Absolute measurements under the recorded host settings; not an A/B against historical hardware conditions."
+  },
+  "retained_cache_check": {
+    "external_tokens": 9216,
+    "generated_token_strings": 96,
+    "greedy_equal": true,
+    "max_logprob_delta": 0.0
+  }
+}
