@@ -126,6 +126,10 @@ class SingleTypeKVCacheManager(ABC):
         # determining the attention groups.
         self.use_eagle = False
 
+        # The recurrent checkpoint producer can rewind target state when
+        # speculative drafting uses a separately annotated cache group.
+        self.checkpoint_drop_eagle = False
+
         # Partial-hit copy-on-write bookkeeping. Populated only by fine-grained
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
@@ -795,9 +799,19 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                 max_length // hash_unit,
                 len(block_hashes),
             )
-            for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
-                candidate_length = (fine_idx + 1) * hash_unit
-                if candidate_length % alignment_tokens:
+            # A matching chained hash authenticates the earlier prefix in
+            # the same append-only attention page.
+            # Probe published tails above the resume cap, but never claim
+            # tokens beyond the scheduler's aligned limit.
+            lookup_end = (
+                min(first_partial_idx + scale_factor - 1, len(block_hashes))
+                if max_partial_idx > first_partial_idx
+                else first_partial_idx
+            )
+            for fine_idx in range(lookup_end - 1, first_partial_idx - 1, -1):
+                candidate_length = min(fine_idx + 1, max_partial_idx) * hash_unit
+                candidate_length -= candidate_length % alignment_tokens
+                if candidate_length <= hit_length:
                     continue
                 cached_tail = block_pool.get_cached_block(
                     block_hashes[fine_idx], kv_cache_group_ids
@@ -1603,7 +1617,7 @@ class MambaManager(SingleTypeKVCacheManager):
             checkpoint_position = get_mamba_prefill_checkpoint_position(
                 num_tokens,
                 self.block_pool.hash_block_size,
-                self.use_eagle,
+                self.checkpoint_drop_eagle,
             )
             if not self._needs_internal_checkpoint(
                 request_id,
@@ -1832,9 +1846,9 @@ class MambaManager(SingleTypeKVCacheManager):
             return None
         if num_tokens % hash_block_size != 0:
             return None
-        latest_prompt_hash_boundary = (
-            request.num_prompt_tokens // hash_block_size
-        ) * hash_block_size
+        latest_prompt_hash_boundary = get_mamba_prefill_checkpoint_position(
+            request.num_prompt_tokens, hash_block_size, self.checkpoint_drop_eagle
+        )
         if num_tokens != latest_prompt_hash_boundary:
             return None
 

@@ -128,6 +128,11 @@ class KVCacheCoordinator(ABC):
             pcp_world_size,
         )
 
+        # Target KDA checkpoints are rewound even when only the separate
+        # speculative draft group carries the EAGLE cache-hit annotation.
+        for manager in self.single_type_managers:
+            manager.checkpoint_drop_eagle = bool(self.eagle_group_ids)
+
         # A positive retention interval must be a multiple of the base hit granularity
         # (``scheduler_block_size``) to land on real cache-hit boundaries.
         # 0 = keep only the latest replay boundary; None = dense;

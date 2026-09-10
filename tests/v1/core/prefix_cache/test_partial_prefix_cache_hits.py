@@ -12,6 +12,7 @@ import torch
 
 from tests.v1.core.test_prefix_caching import make_kv_cache_manager, make_request
 from vllm.utils.hashing import sha256
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
     KVCacheBlockCopy,
     get_block_hash,
@@ -19,17 +20,151 @@ from vllm.v1.core.kv_cache_utils import (
     init_none_hash,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     MambaSpec,
+    SlidingWindowSpec,
 )
 
 
 @pytest.fixture(autouse=True)
 def _auto_init_hash_fn():
     init_none_hash(sha256)
+
+
+@pytest.mark.parametrize("leading_blocks", [0, 1])
+@pytest.mark.parametrize("alignment", [2, 6])
+@pytest.mark.parametrize("drop_eagle", [False, True])
+def test_dcp9_attention_tail_authenticates_an_earlier_resume(
+    leading_blocks, alignment, drop_eagle
+):
+    """An authenticated tail can prove a smaller prefix, even after rewind."""
+    unit, page = 2, 18
+    boundary = leading_blocks * page + 10
+    tokens = list(range(boundary))
+    producer = make_request("producer", tokens, unit, sha256)
+    pool = BlockPool(num_gpu_blocks=8, enable_caching=True, hash_block_size=unit)
+    blocks = pool.get_new_blocks(leading_blocks + 1)
+    pool.cache_full_blocks(producer, blocks, 0, leading_blocks, page, 0)
+    pool.cache_partial_block(producer, blocks[-1], boundary, 0, page)
+    pool.free_blocks(blocks)
+    spec = FullAttentionSpec(
+        block_size=unit, num_kv_heads=1, head_size=1, dtype=torch.float32
+    )
+
+    def lookup(prompt):
+        consumer = make_request("consumer", prompt, unit, sha256)
+        return FullAttentionManager.find_longest_cache_hit(
+            consumer.block_hashes,
+            max_length=boundary - 1,
+            kv_cache_group_ids=[0],
+            block_pool=pool,
+            kv_cache_spec=spec,
+            drop_eagle_block=drop_eagle,
+            alignment_tokens=alignment,
+            dcp_world_size=9,
+        )
+
+    found, hit = lookup(tokens)
+    expected = (boundary - 1) // alignment * alignment
+    expected = max(0, expected - unit * int(drop_eagle))
+    expected = expected // alignment * alignment
+    assert hit == expected
+    assert list(found[0]) == blocks[: (expected + page - 1) // page]
+
+    # Matching only the earlier prefix is insufficient proof for this alias.
+    divergent = tokens[:-1] + [999]
+    _, hit = lookup(divergent)
+    expected = max(0, leading_blocks * page - unit * int(drop_eagle))
+    assert hit == expected // alignment * alignment
+
+
+def test_dcp9_separate_draft_reuses_exported_mamba_checkpoint():
+    """Target checkpoints and attention aliases meet below the draft rewind."""
+    unit = 2
+    config = KVCacheConfig(
+        num_blocks=64,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["target_attention"],
+                FullAttentionSpec(
+                    block_size=unit,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["target_recurrent"],
+                MambaSpec(
+                    block_size=6,
+                    shapes=(1, 1),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                    num_prefill_checkpoint_blocks=1,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["draft_attention"],
+                SlidingWindowSpec(
+                    block_size=unit,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=6,
+                    dcp_replicated=True,
+                ),
+                is_eagle_group=True,
+            ),
+        ],
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config=config,
+        max_model_len=128,
+        enable_caching=True,
+        scheduler_block_size=18,
+        hash_block_size=unit,
+        dcp_world_size=9,
+        use_eagle=True,
+    )
+    tokens = list(range(23))
+    producer = make_request("producer", tokens, unit, sha256)
+    scheduler = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=unit),
+        mamba_block_size=6,
+        max_num_scheduled_tokens=6,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        use_eagle=True,
+        use_eagle_for_target_cache=True,
+        mamba_eagle_block_sizes=(unit,),
+        hash_block_size=unit,
+        mamba_partial_cache_hit=True,
+    )
+    chunks = []
+    while producer.num_computed_tokens < len(tokens):
+        remaining = len(tokens) - producer.num_computed_tokens
+        chunk = Scheduler._mamba_block_aligned_split(
+            scheduler, producer, min(6, remaining)
+        )
+        assert chunk > 0
+        chunks.append(chunk)
+        assert manager.allocate_slots(producer, chunk) is not None
+        producer.num_computed_tokens += chunk
+        manager.new_step_starts()
+    assert chunks == [6, 6, 6, 2, 3]
+    manager.free(producer)
+    manager.new_step_starts()
+
+    consumer = make_request("consumer", tokens, unit, sha256)
+    blocks, hit, _ = manager.get_computed_blocks(consumer)
+    assert hit == 20  # Last hash boundary 22, minus one draft hash unit.
+    assert manager.allocate_slots(consumer, 3, hit, blocks) is not None
+    copies, _ = manager.take_kv_cache_block_copies()
+    assert {copy.kv_cache_group_id for copy in copies} == {0, 1}
 
 
 def test_connector_without_divergent_hit_support_uses_common_lookup():
