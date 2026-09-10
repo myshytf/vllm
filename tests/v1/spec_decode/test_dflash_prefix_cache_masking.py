@@ -33,6 +33,7 @@ def test_unaligned_cached_prefix_detection():
     speculator = SimpleNamespace(
         num_cached_tokens_np=np.array([32, 35, 64], dtype=np.int32),
         block_tables=SimpleNamespace(kernel_block_sizes=[16]),
+        draft_kv_cache_group_ids=[0],
     )
 
     aligned = SimpleNamespace(
@@ -44,6 +45,23 @@ def test_unaligned_cached_prefix_detection():
         num_reqs=2,
     )
 
+    assert not DFlashSpeculator._has_unaligned_cached_prefix(speculator, aligned)
+    assert DFlashSpeculator._has_unaligned_cached_prefix(speculator, unaligned)
+
+
+def test_cached_prefix_alignment_uses_only_draft_groups():
+    """Target recurrent/page widths must not disable an aligned draft tail."""
+    speculator = SimpleNamespace(
+        num_cached_tokens_np=np.array([15360, 13824, 15361], dtype=np.int32),
+        block_tables=SimpleNamespace(kernel_block_sizes=[4608, 13824, 1536]),
+        draft_kv_cache_group_ids=[2],
+    )
+    aligned = SimpleNamespace(
+        idx_mapping_np=np.array([1, 0], dtype=np.int32), num_reqs=2
+    )
+    unaligned = SimpleNamespace(
+        idx_mapping_np=np.array([2, 0], dtype=np.int32), num_reqs=2
+    )
     assert not DFlashSpeculator._has_unaligned_cached_prefix(speculator, aligned)
     assert DFlashSpeculator._has_unaligned_cached_prefix(speculator, unaligned)
 
