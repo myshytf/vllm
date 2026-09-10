@@ -3313,6 +3313,16 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             workspace_head_size = (
                 self.mla_dims.kv_lora_rank + self.mla_dims.qk_rope_head_dim
             )
+            packed_transport = (
+                use_packed_fp8_cache
+                and envs.VLLM_K3_DCP_GATHER_PACKED
+                and getattr(attention_layer, "supports_packed_kv_transport", False)
+            )
+            if packed_transport and (
+                self.mla_dims.kv_lora_rank != 512
+                or self.mla_dims.qk_rope_head_dim != 64
+            ):
+                raise ValueError("packed Kimi KV transport requires latent/rope 512/64")
             self.dcp_manager = getattr(attention_layer, "dcp_manager", None)
             if self.dcp_manager is None and self.supports_direct_dcp_kv_gather:
                 self.dcp_manager = MLADCPKVGather(
@@ -3330,10 +3340,20 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     )
                 use_direct_kv_gather = self.dcp_manager.init_kv_gather(
                     self.chunked_prefill_workspace_size,
-                    workspace_head_size,
-                    self.mla_dims.kv_lora_rank,
-                    workspace_dtype,
+                    656 if packed_transport else workspace_head_size,
+                    528 if packed_transport else self.mla_dims.kv_lora_rank,
+                    torch.float8_e4m3fn if packed_transport else workspace_dtype,
                 )
+                if packed_transport and not use_direct_kv_gather:
+                    raise ValueError(
+                        "packed Kimi KV transport requires the direct publisher"
+                    )
+                if packed_transport:
+                    from vllm.v1.attention.ops.kimi_packed_kv_transport import (
+                        warmup_packed_transport,
+                    )
+
+                    warmup_packed_transport(self.page_size, device)
             elif not self.supports_direct_dcp_kv_gather:
                 raise RuntimeError(
                     f"{type(self).__name__} requires MLADCPManager when DCP is enabled."

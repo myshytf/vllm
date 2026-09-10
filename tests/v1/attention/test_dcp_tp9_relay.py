@@ -37,7 +37,10 @@ def test_tp9_relay_delivers_every_source_with_twelve_cross_switch_copies(monkeyp
     os.getenv("VLLM_K3_TEST_TP9_DMA") != "1",
     reason="set VLLM_K3_TEST_TP9_DMA=1 for the single-device DMA protocol test",
 )
-def test_tp9_mixed_relay_and_direct_publication_preserves_all_kv_bytes(monkeypatch):
+@pytest.mark.parametrize("packed_records", [False, True])
+def test_tp9_mixed_relay_and_direct_publication_preserves_all_kv_bytes(
+    monkeypatch, packed_records
+):
     from vllm import _custom_ops  # noqa: F401
 
     torch.ops.load_library(os.environ["VLLM_K3_DCP_GATHER_ROTATE_LIB"])
@@ -80,10 +83,11 @@ def test_tp9_mixed_relay_and_direct_publication_preserves_all_kv_bytes(monkeypat
     torch.accelerator.synchronize()
     monkeypatch.setenv("VLLM_K3_DCP_GATHER_CLUSTERS", "0,1,2,3,8;4,5,6,7")
     world, slots, capacity, split, dim = 9, 3, 9216, 512, 576
+    dtype = torch.bfloat16
+    if packed_records:
+        split, dim, dtype = 528, 656, torch.float8_e4m3fn
     received = [
-        torch.full(
-            (slots, capacity, dim), float("nan"), dtype=torch.bfloat16, device="cuda"
-        )
+        torch.full((slots, capacity, dim), float("nan"), dtype=dtype, device="cuda")
         for _ in range(world)
     ]
     signals = [
@@ -103,10 +107,18 @@ def test_tp9_mixed_relay_and_direct_publication_preserves_all_kv_bytes(monkeypat
     ]
     starts = [0, 0]
     for window in range(4):
-        sources = [
-            (torch.randn((1024, dim), device="cuda") + rank + window).to(torch.bfloat16)
-            for rank in range(world)
-        ]
+        if packed_records:
+            sources = [
+                torch.randint(
+                    0, 256, (1024, dim), dtype=torch.uint8, device="cuda"
+                ).view(torch.float8_e4m3fn)
+                for rank in range(world)
+            ]
+        else:
+            sources = [
+                (torch.randn((1024, dim), device="cuda") + rank + window).to(dtype)
+                for rank in range(world)
+            ]
         pieces = [
             sources[rank][request * 512 : request * 512 + lengths[request][rank]]
             for request in range(2)
@@ -154,6 +166,10 @@ def test_tp9_mixed_relay_and_direct_publication_preserves_all_kv_bytes(monkeypat
             flat = received[rank][slot].flatten()
             actual_c = flat[: capacity * split].view(capacity, split)[:rows]
             actual_pe = flat[capacity * split :].view(capacity, dim - split)[:rows]
-            assert torch.equal(actual_c, expected[:, :split])
-            assert torch.equal(actual_pe, expected[:, split:])
+            assert torch.equal(
+                actual_c.view(torch.uint8), expected[:, :split].view(torch.uint8)
+            )
+            assert torch.equal(
+                actual_pe.view(torch.uint8), expected[:, split:].view(torch.uint8)
+            )
             assert torch.all(signals[rank][slot] == window + 1)

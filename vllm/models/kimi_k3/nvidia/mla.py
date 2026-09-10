@@ -30,10 +30,10 @@ Out of scope (extension points, not wired here): prefill context parallelism
 """
 
 import math
-import re
 import time
 from typing import TYPE_CHECKING, cast
 
+import regex as re
 import torch
 from torch import nn
 
@@ -394,6 +394,8 @@ def _backend_owns_decode_dcp(impl: object, dcp_world_size: int) -> bool:
 class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     """Kimi-K3 Multi-head Latent Attention with optional RoPE and output gate."""
 
+    supports_packed_kv_transport = True
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -647,7 +649,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     "Kimi-K3 DCP query replication requires a backend-owned "
                     "decode DCP path."
                 )
-            self.impl.dcp_q_replicate = True
+            self.impl.dcp_q_replicate = True  # type: ignore[attr-defined]
         assert (
             self.dcp_world_size <= 1
             or self.rotary_emb is None
@@ -1278,6 +1280,12 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             out: torch.Tensor | None,
             release=None,
         ) -> tuple[torch.Tensor, torch.Tensor]:
+            manager = chunked_context.dcp_manager
+            if manager is not None and manager.uses_packed_records:
+                kv_c_normed, k_pe = manager.unpack_context_planes(kv_c_normed, k_pe)
+                if release is not None:
+                    release()
+                    release = None
             if kv_b_proj_input_dtype is not None:
                 kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
             kv_nope = project_context(kv_c_normed).view(
@@ -1476,7 +1484,26 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             assert chunk.padded_local_token_to_seq is not None
             assert chunk.final_layout_dst_rows is not None
             toks = chunk.num_local_context_tokens
-            if self.kv_cache_dtype == "fp8_ds_mla":
+            packed_transport = dcp_kv_gather.uses_packed_records
+            if packed_transport:
+                from vllm.v1.attention.ops.kimi_packed_kv_transport import (
+                    gather_packed_records,
+                )
+
+                local_records = (
+                    workspace.view(torch.uint8)
+                    .reshape(-1)[: toks * 656]
+                    .view(toks, 656)
+                )
+                gather_packed_records(
+                    kv_cache,
+                    local_records,
+                    block_table,
+                    chunk.padded_local_token_to_seq,
+                    chunk.padded_local_cu_seq_lens,
+                    chunk.starts,
+                )
+            elif self.kv_cache_dtype == "fp8_ds_mla":
                 ops.cp_gather_and_upconvert_fp8_kv_cache(
                     src_cache=kv_cache,
                     dst=workspace[:toks],
@@ -1531,9 +1558,14 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                             relay[0],
                         )
                     )
-                stage_kv_c, stage_k_pe = self._dma_staging(workspace, toks)
-                stage_kv_c.copy_(workspace[:toks, : self.kv_lora_rank])
-                stage_k_pe.copy_(workspace[:toks, self.kv_lora_rank :])
+                if packed_transport:
+                    stage_kv_c, stage_k_pe = dcp_kv_gather.packed_dma_planes(toks)
+                    stage_kv_c.copy_(local_records[:, :528].view(torch.float8_e4m3fn))
+                    stage_k_pe.copy_(local_records[:, 528:].view(torch.float8_e4m3fn))
+                else:
+                    stage_kv_c, stage_k_pe = self._dma_staging(workspace, toks)
+                    stage_kv_c.copy_(workspace[:toks, : self.kv_lora_rank])
+                    stage_k_pe.copy_(workspace[:toks, self.kv_lora_rank :])
                 return dcp_kv_gather.direct_kv_gather_dma(
                     stage_kv_c,
                     stage_k_pe,
@@ -1543,7 +1575,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                     partner_runs=chunk.final_layout_partner_runs,
                 )
             return dcp_kv_gather.direct_kv_gather(
-                workspace[:toks],
+                local_records.view(torch.float8_e4m3fn)
+                if packed_transport
+                else workspace[:toks],
                 chunk.final_layout_dst_rows,
                 chunk.num_context_tokens,
                 slot,
