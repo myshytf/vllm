@@ -1723,6 +1723,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                     # Full-rotation trellis owns one immutable route geometry
                     # for prewarm, eager execution, and CUDA-graph replay.
                     w4a16_block_size_m=8,
+                    w4a16_shared_input_rotation=state.uses_qsrt_atoms,
                 )
                 plan = fused_moe.plan(caps)
                 runtime.launches[key] = plan
@@ -1797,6 +1798,7 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                                     quant_mode="w4a16",
                                     route_num_experts=self.moe.num_experts,
                                     w4a16_block_size_m=block_m,
+                                    w4a16_shared_input_rotation=state.uses_qsrt_atoms,
                                 )
                             )
                         except (KeyError, ValueError) as exc:
