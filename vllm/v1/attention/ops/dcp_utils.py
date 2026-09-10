@@ -557,6 +557,24 @@ class DirectDCPKVGatherWorkspace(_DirectDCPWorkspace):
         kv_shape = (num_ubatches, num_slots, max_gathered_tokens, token_dim)
         signal_shape = (num_ubatches, num_slots, self.world_size)
         self.received_kv, self.peer_kv_ptrs = self._allocate(kv_shape, dtype)
+        self.uses_packed_records = (
+            token_dim == 656 and plane_split_dim == 528 and dtype == torch.float8_e4m3fn
+        )
+        self._decoded_records = None
+        self._packed_dma_staging = None
+        if self.uses_packed_records:
+            # Only the compute stream consumes decoded planes. Publication
+            # slots retain their packed records until that decode completes.
+            self._decoded_records = torch.empty(
+                (num_ubatches, max_gathered_tokens * 576),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self._packed_dma_staging = torch.empty(
+                (num_ubatches, max_gathered_tokens // self.world_size * 656),
+                dtype=torch.float8_e4m3fn,
+                device=device,
+            )
         # Host copy for the copy-engine publisher, whose memcpys are issued
         # from the host.
         self.peer_kv_ptrs_host = self.peer_kv_ptrs.cpu()
@@ -995,6 +1013,45 @@ class MLADCPKVGather:
     @property
     def use_direct_kv_gather(self) -> bool:
         return self._direct_kv_gather_workspace is not None
+
+    @property
+    def uses_packed_records(self) -> bool:
+        workspace = self._direct_kv_gather_workspace
+        return workspace is not None and workspace.uses_packed_records
+
+    def packed_dma_planes(self, tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        workspace = self._direct_kv_gather_workspace
+        if workspace is None or workspace._packed_dma_staging is None:
+            raise RuntimeError("packed KV staging was not reserved")
+        flat = workspace._packed_dma_staging[dbo_current_ubatch_id()]
+        if tokens * 656 > flat.numel():
+            raise ValueError("packed KV staging capacity exceeded")
+        return (
+            flat[: tokens * 528].view(tokens, 528),
+            flat[tokens * 528 : tokens * 656].view(tokens, 128),
+        )
+
+    def unpack_context_planes(
+        self, packed_c: torch.Tensor, packed_rope: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm.v1.attention.ops.kimi_packed_kv_transport import unpack_packed_planes
+
+        workspace = self._direct_kv_gather_workspace
+        if workspace is None or workspace._decoded_records is None:
+            raise RuntimeError("packed KV receive workspace was not reserved")
+        tokens = packed_c.shape[0]
+        flat = workspace._decoded_records[dbo_current_ubatch_id()]
+        if tokens * 576 > flat.numel():
+            raise ValueError("decoded KV workspace capacity exceeded")
+        kv_c = flat[: tokens * 512].view(tokens, 512)
+        rope = flat[tokens * 512 : tokens * 576].view(tokens, 64)
+        unpack_packed_planes(
+            packed_c.reshape(tokens, 528),
+            packed_rope.reshape(tokens, 128),
+            kv_c,
+            rope,
+        )
+        return kv_c.unsqueeze(1), rope.unsqueeze(1)
 
     @property
     def kv_gather_slots(self) -> int:
