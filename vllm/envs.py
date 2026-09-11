@@ -268,6 +268,8 @@ if TYPE_CHECKING:
     VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES: int = 8
     VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE: str = ""
     VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG: bool = False
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY: bool = False
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE: str = ""
     VLLM_K3_DCP_GATHER_DMA_MIN_ROWS: int = 2048
     VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE: str = ""
     VLLM_DEEP_GEMM_WARMUP: Literal[
@@ -2619,6 +2621,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the recurrent-state pages read and written by the endpoint copies.
     "VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG": lambda: bool(
         int(os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG", "0"))
+    ),
+    # Materialize request-endpoint recurrent states with per-state torch
+    # copies instead of the fused Triton kernel (same results; a fallback
+    # and reference path). The file, when named, enables it while present.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY": lambda: bool(
+        int(os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY", "0"))
+    ),
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE": lambda: os.getenv(
+        "VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE", ""
     ),
     # Windows with fewer padded local rows than this use the push kernel
     # instead of the copy-engine publisher (one launch and one rendezvous

@@ -483,6 +483,111 @@ def _snapshot_mamba_state_to_shadow(
         )
 
 
+class EndpointCopyRecord(NamedTuple):
+    """One request-endpoint materialization (host form of a kernel record)."""
+
+    from_shadow: bool
+    req_idx: int
+    token_bias: int
+    dst_block_id: int
+    conv_src_block_ids: tuple[int, ...]
+    temporal_src_block_ids: tuple[int, ...]
+
+
+def endpoint_layer_states(
+    kv_cache_config: KVCacheConfig,
+    forward_context: dict[str, Any],
+    mamba_group_ids: list[int],
+) -> list[tuple[torch.Tensor, ...]]:
+    """Every recurrent layer's state views in the context's state order
+    (groups in ``mamba_group_ids`` order, layers in group order)."""
+    return [
+        tuple(forward_context[layer_name].kv_cache)
+        for group_id in mamba_group_ids
+        for layer_name in kv_cache_config.kv_cache_groups[group_id].layer_names
+    ]
+
+
+def _conv_window_copy(
+    dst: torch.Tensor, src: torch.Tensor, token_bias: int, conv_dim_first: bool
+) -> None:
+    """``src[token_bias:] -> dst[:width - token_bias]`` along the conv slide
+    axis (V1 ``get_conv_copy_spec`` semantics for both conv layouts)."""
+    if conv_dim_first:
+        width = src.shape[1]
+        dst[:, : width - token_bias].copy_(src[:, token_bias:])
+    else:
+        width = src.shape[0]
+        dst[: width - token_bias].copy_(src[token_bias:])
+
+
+def materialize_endpoints_torch(
+    ctx: "MambaSpecDecodeGPUContext",
+    layer_states: list[tuple[torch.Tensor, ...]],
+    records: list[EndpointCopyRecord],
+    conv_dim_first: bool,
+) -> None:
+    """Torch reference of ``materialize_mamba_endpoint_kernel``: one tensor
+    copy per (record, layer, state type) with identical results."""
+    for record in records:
+        sources = ctx.endpoint_source_pages(record, layer_states)
+        for layer, states in enumerate(layer_states):
+            for type_idx, state in enumerate(states):
+                state_idx = layer * ctx.num_state_types + type_idx
+                src = sources[layer][type_idx]
+                dst = state[record.dst_block_id]
+                if ctx.state_conv_widths_cpu[state_idx] > 0:
+                    _conv_window_copy(dst, src, record.token_bias, conv_dim_first)
+                else:
+                    dst.copy_(src)
+
+
+def verify_endpoints(
+    ctx: "MambaSpecDecodeGPUContext",
+    layer_states: list[tuple[torch.Tensor, ...]],
+    records: list[EndpointCopyRecord],
+    conv_dim_first: bool,
+) -> list[dict[str, Any]]:
+    """Compare every record's destination block with the copy-spec reference
+    (the conv window a reader consumes and the whole temporal page). Returns
+    one entry per mismatching (record, layer, state type)."""
+    mismatches: list[dict[str, Any]] = []
+    for record_idx, record in enumerate(records):
+        sources = ctx.endpoint_source_pages(record, layer_states)
+        for layer, states in enumerate(layer_states):
+            for type_idx, state in enumerate(states):
+                state_idx = layer * ctx.num_state_types + type_idx
+                src = sources[layer][type_idx]
+                dst = state[record.dst_block_id]
+                if ctx.state_conv_widths_cpu[state_idx] > 0:
+                    bias = record.token_bias
+                    if conv_dim_first:
+                        expected = src[:, bias:]
+                        actual = dst[:, : src.shape[1] - bias]
+                    else:
+                        expected = src[bias:]
+                        actual = dst[: src.shape[0] - bias]
+                else:
+                    expected, actual = src, dst
+                if torch.equal(expected, actual):
+                    continue
+                mismatches.append(
+                    {
+                        "record": record_idx,
+                        "layer": layer,
+                        "state_idx": state_idx,
+                        "kind": "conv"
+                        if ctx.state_conv_widths_cpu[state_idx] > 0
+                        else "temporal",
+                        "expected_head": expected.flatten()[:3].float().tolist(),
+                        "actual_head": actual.flatten()[:3].float().tolist(),
+                        "expected_sum": float(expected.float().sum().item()),
+                        "actual_sum": float(actual.float().sum().item()),
+                    }
+                )
+    return mismatches
+
+
 # Per-copy int32 record of ``materialize_mamba_endpoint_kernel``:
 # [from_shadow, req_idx, token_bias, dst_block, conv_src[num_groups],
 #  temporal_src[num_groups]]. ``token_bias`` selects the conv shift and,
@@ -1030,6 +1135,12 @@ class MambaSpecDecodeGPUContext:
     # Temporal shadow pages per request: one per speculative state slot, so a
     # stop inside the accepted tokens can still be materialized.
     shadow_temporal_slots: int = 1
+    # Host copies of the per-state metadata (filled by
+    # ``initialize_from_forward_context``) for the torch reference path of
+    # the request-endpoint materialization and its verification.
+    state_block_strides_cpu: list[int] = dataclasses.field(default_factory=list)
+    state_conv_widths_cpu: list[int] = dataclasses.field(default_factory=list)
+    state_group_indices_cpu: list[int] = dataclasses.field(default_factory=list)
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
@@ -1157,6 +1268,47 @@ class MambaSpecDecodeGPUContext:
     @property
     def has_endpoint_shadow(self) -> bool:
         return self.shadow_buffers is not None
+
+    def shadow_page(
+        self, state_idx: int, page: int, like: torch.Tensor
+    ) -> torch.Tensor:
+        """Shadow page ``page`` of state ``state_idx`` viewed as one block of
+        ``like`` (the state tensor whose blocks the shadow mirrors)."""
+        assert self.shadow_buffers is not None
+        stride = self.state_block_strides_cpu[state_idx]
+        nbytes = like[0].numel() * like.element_size()
+        raw = self.shadow_buffers[state_idx][page * stride : page * stride + nbytes]
+        return raw.view(like.dtype).view(like.shape[1:])
+
+    def endpoint_source_pages(
+        self,
+        record: "EndpointCopyRecord",
+        layer_states: list[tuple[torch.Tensor, ...]],
+    ) -> list[list[torch.Tensor]]:
+        """Per layer and state type, the page a request-endpoint copy reads:
+        the request's shadow pages (conv unshifted, temporal slot
+        ``token_bias``) or its own state blocks per recurrent group."""
+        pages: list[list[torch.Tensor]] = []
+        for layer, states in enumerate(layer_states):
+            per_layer: list[torch.Tensor] = []
+            for type_idx, state in enumerate(states):
+                state_idx = layer * self.num_state_types + type_idx
+                is_conv = self.state_conv_widths_cpu[state_idx] > 0
+                if record.from_shadow:
+                    page = record.req_idx
+                    if not is_conv:
+                        page = page * self.shadow_temporal_slots + record.token_bias
+                    per_layer.append(self.shadow_page(state_idx, page, state))
+                else:
+                    group = self.state_group_indices_cpu[state_idx]
+                    block = (
+                        record.conv_src_block_ids[group]
+                        if is_conv
+                        else record.temporal_src_block_ids[group]
+                    )
+                    per_layer.append(state[block])
+            pages.append(per_layer)
+        return pages
 
     def initialize_from_forward_context(
         self,
@@ -1301,6 +1453,13 @@ class MambaSpecDecodeGPUContext:
         for i, bt in enumerate(block_tables):
             self.block_table_ptrs[i] = bt.data_ptr()
 
+        self.state_block_strides_cpu = [
+            int(v) for v in self.state_block_strides.tolist()
+        ]
+        self.state_conv_widths_cpu = [int(v) for v in self.state_conv_widths.tolist()]
+        self.state_group_indices_cpu = [
+            int(v) for v in self.state_group_indices.tolist()
+        ]
         self.is_initialized = True
 
     def compute_aligned_state_indices(

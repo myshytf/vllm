@@ -1405,7 +1405,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._debug_log_recurrent_cow(scheduler_output.kv_cache_block_copies)
 
     def _debug_log_recurrent_cow(self, copies) -> None:
-        """Endpoint-cache debugging: fingerprint the first recurrent group's
+        """Endpoint-cache debugging: fingerprint the first recurrent layer's
         copy-on-write source and destination pages after the copies ran."""
         from vllm.v1.core.kv_cache_utils import request_endpoint_cache_debug
 
@@ -1421,11 +1421,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if first_mamba is None:
             return
-        entries = self.kv_caches_by_group[first_mamba]
-        if not entries or not isinstance(entries[0], (list, tuple)):
+        # The group entries are whole-page byte views; the layer holds the
+        # typed conv and temporal views of the same pages.
+        layer = self.compilation_config.static_forward_context.get(
+            groups[first_mamba].layer_names[0]
+        )
+        states = getattr(layer, "kv_cache", None)
+        if states is None or len(states) < 2:
             return
-        conv_state, temporal_state = entries[0][0], entries[0][1]
-        torch.cuda.synchronize()
+        conv_state, temporal_state = states[0], states[1]
+        torch.accelerator.synchronize()
         for copy in copies:
             if copy.kv_cache_group_id != first_mamba:
                 continue

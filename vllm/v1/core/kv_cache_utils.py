@@ -237,6 +237,15 @@ def request_endpoint_cache_debug() -> bool:
     return bool(envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG)
 
 
+def request_endpoint_cache_torch_copy() -> bool:
+    """Whether endpoint states are materialized by torch copies (env flag or
+    the presence of the named file) instead of the fused kernel."""
+    if envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY:
+        return True
+    path = envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE
+    return bool(path) and os.path.exists(path)
+
+
 def request_endpoint_cache_max_entries() -> int:
     """Upper bound on live request-endpoint entries (each pins one block)."""
     return max(int(envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES), 0)

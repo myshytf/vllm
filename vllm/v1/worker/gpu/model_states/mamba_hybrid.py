@@ -12,10 +12,14 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
-from vllm.v1.core.kv_cache_utils import request_endpoint_cache_debug
+from vllm.v1.core.kv_cache_utils import (
+    request_endpoint_cache_debug,
+    request_endpoint_cache_torch_copy,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
@@ -26,8 +30,12 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.mamba_utils import (
     ENDPOINT_COPY_META_FIXED,
+    EndpointCopyRecord,
     MambaSpecDecodeGPUContext,
+    endpoint_layer_states,
+    materialize_endpoints_torch,
     preprocess_mamba_align_fused_kernel,
+    verify_endpoints,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -119,6 +127,9 @@ class MambaHybridModelState(DefaultModelState):
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
+            # Every recurrent layer's state views in the context's state
+            # order (torch reference path of the endpoint materialization).
+            self._mamba_layer_states: list[tuple[torch.Tensor, ...]] = []
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
             # Request-endpoint cache: keep every request's committed state in
@@ -203,6 +214,9 @@ class MambaHybridModelState(DefaultModelState):
                 self.model.get_mamba_state_copy_func(),
                 [block_tables[gid] for gid in mamba_group_ids],
             )
+            self._mamba_layer_states = endpoint_layer_states(
+                kv_cache_config, forward_context, mamba_group_ids
+            )
         if self._endpoint_shadow and not ctx.has_endpoint_shadow:
             ctx.ensure_endpoint_shadow(self.max_num_reqs)
         return ctx
@@ -271,6 +285,11 @@ class MambaHybridModelState(DefaultModelState):
         requests' slots are recycled, so it is ordered after the in-flight
         step that may have overwritten their state slots and before any
         consumer's copy-on-write of the destination block.
+
+        The fused kernel performs the copies; with the torch-copy switch the
+        per-state torch reference performs them instead. In debug mode the
+        kernel result is verified against the reference for every state and
+        the mismatches are logged on the first tensor-parallel rank.
         """
         if not copies or not self._align_mode:
             return
@@ -285,6 +304,7 @@ class MambaHybridModelState(DefaultModelState):
         num_groups = ctx.num_groups
         width = ENDPOINT_COPY_META_FIXED + 2 * num_groups
         meta = np.full((len(copies), width), -1, dtype=np.int32)
+        records: list[EndpointCopyRecord] = []
         rows = 0
         for copy in copies:
             req_idx = req_id_to_index.get(copy.req_id)
@@ -321,34 +341,88 @@ class MambaHybridModelState(DefaultModelState):
                 meta[rows, 4 : 4 + num_groups] = copy.conv_src_block_ids
                 meta[rows, 4 + num_groups : width] = copy.temporal_src_block_ids
             meta[rows, 3] = copy.dst_block_id
+            records.append(
+                EndpointCopyRecord(
+                    from_shadow=bool(copy.from_shadow),
+                    req_idx=req_idx if copy.from_shadow and req_idx is not None else 0,
+                    token_bias=int(copy.token_bias),
+                    dst_block_id=int(copy.dst_block_id),
+                    conv_src_block_ids=tuple(copy.conv_src_block_ids),
+                    temporal_src_block_ids=tuple(copy.temporal_src_block_ids),
+                )
+            )
             rows += 1
         if rows == 0:
             return
+        torch_copy = request_endpoint_cache_torch_copy()
         debug = request_endpoint_cache_debug() and get_tensor_model_parallel_rank() == 0
+        conv_dim_first = is_conv_state_dim_first()
+        layer_states = self._mamba_layer_states
         if debug:
             self._debug_log_endpoint_sources(copies, req_id_to_index, ctx)
-        copy_meta = torch.from_numpy(meta[:rows]).to(self.device)
-        ctx.run_endpoint_materialize(copy_meta)
-        if debug:
-            torch.cuda.synchronize()
-            states = self._debug_mamba_states()
-            for copy in copies:
-                if states is None or len(states) < 2:
-                    break
-                logger.info(
-                    "[endpoint] materialized req=%s dst=%d conv=%s temporal=%s",
-                    copy.req_id,
-                    copy.dst_block_id,
-                    _page_sig(states[0], copy.dst_block_id),
-                    _page_sig(states[1], copy.dst_block_id),
+        if not torch_copy or debug:
+            copy_meta = torch.from_numpy(meta[:rows]).to(self.device)
+            ctx.run_endpoint_materialize(copy_meta)
+            if debug:
+                torch.accelerator.synchronize()
+                self._debug_log_verification(
+                    "kernel", records, layer_states, conv_dim_first
                 )
+        if torch_copy:
+            materialize_endpoints_torch(ctx, layer_states, records, conv_dim_first)
+            if debug:
+                torch.accelerator.synchronize()
+                self._debug_log_verification(
+                    "torch", records, layer_states, conv_dim_first
+                )
+
+    def _debug_log_verification(
+        self,
+        path: str,
+        records: list[EndpointCopyRecord],
+        layer_states: list[tuple[torch.Tensor, ...]],
+        conv_dim_first: bool,
+    ) -> None:
+        ctx = self._mamba_ctx
+        assert ctx is not None
+        mismatches = verify_endpoints(ctx, layer_states, records, conv_dim_first)
+        total = len(records) * len(layer_states) * ctx.num_state_types
+        by_record: dict[int, int] = {}
+        for entry in mismatches:
+            by_record[entry["record"]] = by_record.get(entry["record"], 0) + 1
+        logger.info(
+            "[endpoint] verify path=%s records=%d states=%d mismatched=%d "
+            "per_record=%s first=%s",
+            path,
+            len(records),
+            total,
+            len(mismatches),
+            {records[i].dst_block_id: n for i, n in sorted(by_record.items())},
+            mismatches[0] if mismatches else None,
+        )
 
     def _debug_log_endpoint_sources(self, copies, req_id_to_index, ctx) -> None:
         states = self._debug_mamba_states()
         if states is None or len(states) < 2 or not ctx.is_initialized:
             return
-        torch.cuda.synchronize()
-        strides = ctx.state_block_strides[:2].tolist()
+        torch.accelerator.synchronize()
+        strides = ctx.state_block_strides_cpu[:2]
+        base0 = int(ctx.state_base_addrs[0].item())
+        base1 = int(ctx.state_base_addrs[1].item())
+        logger.info(
+            "[endpoint] views conv_ptr=%#x ctx_base0=%#x temporal_ptr=%#x "
+            "ctx_base1=%#x "
+            "shadow0_ptr=%#x ctx_shadow0=%#x shadow1_ptr=%#x ctx_shadow1=%#x layers=%d",
+            states[0].data_ptr(),
+            base0,
+            states[1].data_ptr(),
+            base1,
+            ctx.shadow_buffers[0].data_ptr() if ctx.has_endpoint_shadow else 0,
+            int(ctx.shadow_base_addrs[0].item()),
+            ctx.shadow_buffers[1].data_ptr() if ctx.has_endpoint_shadow else 0,
+            int(ctx.shadow_base_addrs[1].item()),
+            len(self._mamba_layer_states),
+        )
         for copy in copies:
             if copy.from_shadow:
                 req_idx = req_id_to_index.get(copy.req_id)
@@ -378,9 +452,9 @@ class MambaHybridModelState(DefaultModelState):
                 copy.dst_block_id,
                 conv_sig,
                 temporal_sig,
-                int(ctx.state_base_addrs[0].item()),
+                base0,
                 int(strides[0]),
-                int(ctx.state_base_addrs[1].item()),
+                base1,
                 int(strides[1]),
                 tuple(states[0].shape),
                 tuple(states[0].stride()),
