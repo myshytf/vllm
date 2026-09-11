@@ -511,7 +511,9 @@ def test_torch_reference_matches_kernel_and_verifies():
     device = torch.device("cuda")
     torch.manual_seed(2)
     dim_first = is_conv_state_dim_first()
-    num_blocks = MAX_REQS * MAX_COLS + 24
+    # Block-table ids, four records x two groups of destinations, and the
+    # torch-path destinations 16 above them.
+    num_blocks = MAX_REQS * MAX_COLS + 32
     layer_names = ["l0", "l1", "l2"]
     convs, ssms = [], []
     for _ in layer_names:
