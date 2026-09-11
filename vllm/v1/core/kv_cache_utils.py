@@ -185,22 +185,24 @@ class KVCacheBlockCopy(NamedTuple):
 
 
 class MambaEndpointStateCopy(NamedTuple):
-    """Materialize a finished request's recurrent state into a durable block.
+    """Materialize a finished request's recurrent state into durable blocks.
 
-    ``dst_block_id`` is a pool block whose page in every recurrent cache
-    group receives the state after the request's endpoint token. When
-    ``from_shadow`` is set the state is read from the worker's per-request
-    shadow pages (written before the request's final in-flight step could
-    overwrite its state slots): the unshifted conv window shifted by
-    ``token_bias`` and temporal shadow slot ``token_bias``. Otherwise it is
-    read from the request's own blocks: the temporal state of
-    ``temporal_src_block_ids`` and the convolution window of
-    ``conv_src_block_ids`` shifted by ``token_bias``, one entry per recurrent
-    cache group in ascending group-id order.
+    ``dst_block_ids`` holds one pool block per recurrent cache group, in
+    ascending group-id order. A block id names the same physical page in
+    every group (each raw KV tensor is shared by one layer of every group),
+    so groups must not share a destination. Every block receives the state
+    after the request's endpoint token. When ``from_shadow`` is set the
+    state is read from the worker's per-request shadow pages (written before
+    the request's final in-flight step could overwrite its state slots): the
+    unshifted conv window shifted by ``token_bias`` and temporal shadow slot
+    ``token_bias``. Otherwise it is read from the request's own blocks: the
+    temporal state of ``temporal_src_block_ids`` and the convolution window
+    of ``conv_src_block_ids`` shifted by ``token_bias``, one entry per
+    recurrent cache group in ascending group-id order.
     """
 
     req_id: str
-    dst_block_id: int
+    dst_block_ids: tuple[int, ...]
     from_shadow: bool
     conv_src_block_ids: tuple[int, ...]
     temporal_src_block_ids: tuple[int, ...]

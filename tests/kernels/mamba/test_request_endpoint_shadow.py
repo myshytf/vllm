@@ -240,13 +240,16 @@ def test_snapshot_then_materialize_matches_the_copy_specs(
     # inside the accepted tokens keeps two rows less).
     dst_shadow, dst_slots, dst_trim = num_blocks - 2, num_blocks - 1, num_blocks - 3
     num_groups = 1
-    width_meta = ENDPOINT_COPY_META_FIXED + 2 * num_groups
+    width_meta = ENDPOINT_COPY_META_FIXED + 3 * num_groups
     meta = torch.full((3, width_meta), -1, dtype=torch.int32, device=device)
-    meta[0, :4] = torch.tensor([1, 1, 2, dst_shadow], dtype=torch.int32)
-    meta[1, :4] = torch.tensor([0, 0, 3, dst_slots], dtype=torch.int32)
-    meta[1, 4] = int(bt_cpu[4, 1])
-    meta[1, 5] = int(bt_cpu[4, 1 + 3])
-    meta[2, :4] = torch.tensor([1, 4, 1, dst_trim], dtype=torch.int32)
+    meta[0, :3] = torch.tensor([1, 1, 2], dtype=torch.int32)
+    meta[0, 4] = dst_shadow
+    meta[1, :3] = torch.tensor([0, 0, 3], dtype=torch.int32)
+    meta[1, 4] = dst_slots
+    meta[1, 5] = int(bt_cpu[4, 1])
+    meta[1, 6] = int(bt_cpu[4, 1 + 3])
+    meta[2, :3] = torch.tensor([1, 4, 1], dtype=torch.int32)
+    meta[2, 4] = dst_trim
     grid = (3, NUM_LAYERS * 2, temporal_tiles)
     materialize_mamba_endpoint_kernel[grid](
         meta,
@@ -390,14 +393,17 @@ def test_context_allocates_shadow_pages_and_materializes_from_them():
     # the accepted tokens); slot 5 at its full bias.
     dst_a, dst_a_trim, dst_b = num_blocks - 1, num_blocks - 2, num_blocks - 3
     meta = torch.full(
-        (3, ENDPOINT_COPY_META_FIXED + 2 * ctx.num_groups),
+        (3, ENDPOINT_COPY_META_FIXED + 3 * ctx.num_groups),
         -1,
         dtype=torch.int32,
         device=device,
     )
-    meta[0, :4] = torch.tensor([1, 2, 2, dst_a], dtype=torch.int32)
-    meta[1, :4] = torch.tensor([1, 2, 1, dst_a_trim], dtype=torch.int32)
-    meta[2, :4] = torch.tensor([1, 5, 1, dst_b], dtype=torch.int32)
+    meta[0, :3] = torch.tensor([1, 2, 2], dtype=torch.int32)
+    meta[0, 4] = dst_a
+    meta[1, :3] = torch.tensor([1, 2, 1], dtype=torch.int32)
+    meta[1, 4] = dst_a_trim
+    meta[2, :3] = torch.tensor([1, 5, 1], dtype=torch.int32)
+    meta[2, 4] = dst_b
     ctx.run_endpoint_materialize(meta)
     torch.accelerator.synchronize()
 
@@ -420,15 +426,73 @@ def test_context_allocates_shadow_pages_and_materializes_from_them():
             torch.testing.assert_close(ssms[layer][dst], ssm_ref, rtol=0, atol=0)
 
 
-def test_torch_reference_matches_kernel_and_verifies():
-    """``materialize_endpoints_torch`` writes the same bytes as the kernel for
-    shadow and block sources, and ``verify_endpoints`` reports no mismatch for
-    either result but flags a corrupted destination."""
+def _two_group_context(device, num_blocks, layer_names, convs, ssms, bts):
     from vllm.model_executor.layers.mamba.mamba_utils import (
         get_conv_copy_spec,
         get_temporal_copy_spec,
-        is_conv_state_dim_first,
     )
+
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((CONV_WIDTH, CONV_DIM), SSM_SHAPE),
+        dtypes=(torch.bfloat16, torch.float32),  # type: ignore[arg-type]
+        mamba_cache_mode="align",
+        num_speculative_blocks=TEMPORAL_SLOTS - 1,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names[:2], spec),
+            KVCacheGroupSpec(layer_names[2:], spec),
+        ],
+    )
+    forward_context = {
+        name: _mock_attention(c, s) for name, c, s in zip(layer_names, convs, ssms)
+    }
+    ctx = MambaSpecDecodeGPUContext.create(
+        max_num_reqs=MAX_REQS,
+        kv_cache_config=kv_cache_config,
+        num_state_types=2,
+        device=device,
+        make_buffer=lambda n, dtype: _Buffer(n, dtype, device),  # type: ignore[arg-type,return-value]
+    )
+    ctx.initialize_from_forward_context(
+        kv_cache_config,
+        forward_context,
+        (get_conv_copy_spec, get_temporal_copy_spec),
+        bts,
+    )
+    ctx.ensure_endpoint_shadow(MAX_REQS)
+    return ctx, kv_cache_config, forward_context
+
+
+def _meta_from_records(records, num_groups, device):
+    """Kernel records: [from_shadow, req_idx, token_bias, reserved, dst[G],
+    conv_src[G], temporal_src[G]]."""
+    width = ENDPOINT_COPY_META_FIXED + 3 * num_groups
+    meta = torch.full((len(records), width), -1, dtype=torch.int32)
+    for row, rec in enumerate(records):
+        meta[row, :3] = torch.tensor(
+            [int(rec.from_shadow), rec.req_idx, rec.token_bias]
+        )
+        meta[row, 4 : 4 + num_groups] = torch.tensor(rec.dst_block_ids)
+        if not rec.from_shadow:
+            meta[row, 4 + num_groups : 4 + 2 * num_groups] = torch.tensor(
+                rec.conv_src_block_ids
+            )
+            meta[row, 4 + 2 * num_groups : width] = torch.tensor(
+                rec.temporal_src_block_ids
+            )
+    return meta.to(device)
+
+
+def test_torch_reference_matches_kernel_and_verifies():
+    """``materialize_endpoints_torch`` writes the same bytes as the kernel for
+    shadow and block sources with one destination block per group, and
+    ``verify_endpoints`` reports no mismatch for either result but flags a
+    corrupted destination."""
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
     from vllm.v1.worker.mamba_utils import (
         EndpointCopyRecord,
         endpoint_layer_states,
@@ -439,7 +503,7 @@ def test_torch_reference_matches_kernel_and_verifies():
     device = torch.device("cuda")
     torch.manual_seed(2)
     dim_first = is_conv_state_dim_first()
-    num_blocks = MAX_REQS * MAX_COLS + 8
+    num_blocks = MAX_REQS * MAX_COLS + 24
     layer_names = ["l0", "l1", "l2"]
     convs, ssms = [], []
     for _ in layer_names:
@@ -452,32 +516,6 @@ def test_torch_reference_matches_kernel_and_verifies():
         ssms.append(
             torch.randn(num_blocks, *SSM_SHAPE, dtype=torch.float32, device=device)
         )
-    forward_context = {
-        name: _mock_attention(c, s) for name, c, s in zip(layer_names, convs, ssms)
-    }
-    spec = MambaSpec(
-        block_size=16,
-        shapes=((CONV_WIDTH, CONV_DIM), SSM_SHAPE),
-        dtypes=(torch.bfloat16, torch.float32),  # type: ignore[arg-type]
-        mamba_cache_mode="align",
-        num_speculative_blocks=TEMPORAL_SLOTS - 1,
-    )
-    # Two recurrent groups with distinct block tables, as in a hybrid model.
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(layer_names[:2], spec),
-            KVCacheGroupSpec(layer_names[2:], spec),
-        ],
-    )
-    ctx = MambaSpecDecodeGPUContext.create(
-        max_num_reqs=MAX_REQS,
-        kv_cache_config=kv_cache_config,
-        num_state_types=2,
-        device=device,
-        make_buffer=lambda n, dtype: _Buffer(n, dtype, device),  # type: ignore[arg-type,return-value]
-    )
     num_reqs = 2
     idx_mapping = torch.tensor([2, 5], dtype=torch.int32, device=device)
     bts = []
@@ -486,13 +524,9 @@ def test_torch_reference_matches_kernel_and_verifies():
         bt[0] = torch.arange(1, 1 + MAX_COLS) + group * 20
         bt[1] = torch.arange(9, 9 + MAX_COLS) + group * 20
         bts.append(bt)
-    ctx.initialize_from_forward_context(
-        kv_cache_config,
-        forward_context,
-        (get_conv_copy_spec, get_temporal_copy_spec),
-        bts,
+    ctx, kv_cache_config, forward_context = _two_group_context(
+        device, num_blocks, layer_names, convs, ssms, bts
     )
-    ctx.ensure_endpoint_shadow(MAX_REQS)
     layer_states = endpoint_layer_states(
         kv_cache_config, forward_context, ctx.mamba_group_ids
     )
@@ -507,68 +541,150 @@ def test_torch_reference_matches_kernel_and_verifies():
         num_reqs, state_idx, src_col, token_bias, idx_mapping, snapshot_to_shadow=True
     )
     bt_cpu = [bt.cpu() for bt in bts]
+    first = MAX_REQS * MAX_COLS + 1
+    dst = [(first + r, first + 8 + r) for r in range(4)]
     records = [
-        EndpointCopyRecord(True, 2, 3, num_blocks - 1, (), ()),
-        EndpointCopyRecord(True, 2, 1, num_blocks - 2, (), ()),
-        EndpointCopyRecord(True, 5, 1, num_blocks - 3, (), ()),
+        EndpointCopyRecord(True, 2, 3, dst[0], (), ()),
+        EndpointCopyRecord(True, 2, 1, dst[1], (), ()),
+        EndpointCopyRecord(True, 5, 1, dst[2], (), ()),
         EndpointCopyRecord(
             False,
             0,
             1,
-            num_blocks - 4,
+            dst[3],
             tuple(int(bt_cpu[g][1, 0]) for g in range(2)),
             tuple(int(bt_cpu[g][1, 1]) for g in range(2)),
         ),
     ]
-    meta = torch.full(
-        (len(records), ENDPOINT_COPY_META_FIXED + 2 * ctx.num_groups),
-        -1,
-        dtype=torch.int32,
-    )
-    for row, rec in enumerate(records):
-        meta[row, :4] = torch.tensor(
-            [int(rec.from_shadow), rec.req_idx, rec.token_bias, rec.dst_block_id]
-        )
-        if not rec.from_shadow:
-            meta[row, 4 : 4 + 2] = torch.tensor(rec.conv_src_block_ids)
-            meta[row, 6 : 6 + 2] = torch.tensor(rec.temporal_src_block_ids)
-    ctx.run_endpoint_materialize(meta.to(device))
+    ctx.run_endpoint_materialize(_meta_from_records(records, ctx.num_groups, device))
     torch.accelerator.synchronize()
     assert verify_endpoints(ctx, layer_states, records, dim_first) == []
 
-    torch_records = [rec._replace(dst_block_id=rec.dst_block_id - 4) for rec in records]
+    torch_records = [
+        rec._replace(dst_block_ids=tuple(d + 16 for d in rec.dst_block_ids))
+        for rec in records
+    ]
     materialize_endpoints_torch(ctx, layer_states, torch_records, dim_first)
     torch.accelerator.synchronize()
     assert verify_endpoints(ctx, layer_states, torch_records, dim_first) == []
     for layer in range(len(layer_names)):
+        group = ctx.state_group_indices_cpu[2 * layer]
         for rec, trec in zip(records, torch_records):
+            d, td = rec.dst_block_ids[group], trec.dst_block_ids[group]
             torch.testing.assert_close(
-                _leading(convs[layer][rec.dst_block_id], rec.token_bias, dim_first),
-                _leading(convs[layer][trec.dst_block_id], rec.token_bias, dim_first),
+                _leading(convs[layer][d], rec.token_bias, dim_first),
+                _leading(convs[layer][td], rec.token_bias, dim_first),
                 rtol=0,
                 atol=0,
             )
-            torch.testing.assert_close(
-                ssms[layer][rec.dst_block_id],
-                ssms[layer][trec.dst_block_id],
-                rtol=0,
-                atol=0,
-            )
+            torch.testing.assert_close(ssms[layer][d], ssms[layer][td], rtol=0, atol=0)
 
     # A corrupted destination is reported with its layer and state kind.
-    ssms[1][records[0].dst_block_id].add_(1.0)
+    ssms[1][records[0].dst_block_ids[0]].add_(1.0)
     mismatches = verify_endpoints(ctx, layer_states, records, dim_first)
     assert [(m["record"], m["layer"], m["kind"]) for m in mismatches] == [
         (0, 1, "temporal")
     ]
 
 
+def test_groups_sharing_raw_tensors_need_distinct_destinations():
+    """Served layout: one raw tensor per layer index is shared by every
+    cache group, so a block id names the same page in each group. Distinct
+    per-group destinations materialize every layer; a shared destination
+    (the layout of the failed candidate) makes the groups overwrite each
+    other."""
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+    from vllm.v1.worker.mamba_utils import (
+        EndpointCopyRecord,
+        endpoint_layer_states,
+        materialize_endpoints_torch,
+        verify_endpoints,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(4)
+    dim_first = is_conv_state_dim_first()
+    num_blocks = MAX_REQS * MAX_COLS + 24
+    shape = (
+        (num_blocks, CONV_DIM, CONV_WIDTH)
+        if dim_first
+        else (num_blocks, CONV_WIDTH, CONV_DIM)
+    )
+    # Layer i of group 0 and layer i of group 1 view the same storage.
+    shared_convs = [
+        torch.randn(*shape, dtype=torch.bfloat16, device=device) for _ in range(2)
+    ]
+    shared_ssms = [
+        torch.randn(num_blocks, *SSM_SHAPE, dtype=torch.float32, device=device)
+        for _ in range(2)
+    ]
+    layer_names = ["g0l0", "g0l1", "g1l0", "g1l1"]
+    convs = [shared_convs[0], shared_convs[1], shared_convs[0], shared_convs[1]]
+    ssms = [shared_ssms[0], shared_ssms[1], shared_ssms[0], shared_ssms[1]]
+    num_reqs = 1
+    idx_mapping = torch.tensor([1], dtype=torch.int32, device=device)
+    # Block ids are unique across groups, as with a shared block pool.
+    bts = []
+    for group in range(2):
+        bt = torch.zeros(MAX_REQS, MAX_COLS, dtype=torch.int32, device=device)
+        bt[0] = torch.arange(1, 1 + MAX_COLS) + group * MAX_COLS
+        bts.append(bt)
+    ctx, kv_cache_config, forward_context = _two_group_context(
+        device, num_blocks, layer_names, convs, ssms, bts
+    )
+    layer_states = endpoint_layer_states(
+        kv_cache_config, forward_context, ctx.mamba_group_ids
+    )
+    state_idx = torch.zeros(MAX_REQS, dtype=torch.int32, device=device)
+    src_col = torch.full((MAX_REQS,), -1, dtype=torch.int32, device=device)
+    token_bias = torch.zeros(MAX_REQS, dtype=torch.int32, device=device)
+    state_idx[1], src_col[1], token_bias[1] = 0, 0, 2
+    ctx.run_fused_precopy(
+        num_reqs, state_idx, src_col, token_bias, idx_mapping, snapshot_to_shadow=True
+    )
+    bt_cpu = [bt.cpu() for bt in bts]
+    first = 2 * MAX_COLS + 1
+    good = [
+        EndpointCopyRecord(True, 1, 2, (first, first + 1), (), ()),
+        EndpointCopyRecord(
+            False,
+            0,
+            2,
+            (first + 2, first + 3),
+            tuple(int(bt_cpu[g][0, 0]) for g in range(2)),
+            tuple(int(bt_cpu[g][0, 2]) for g in range(2)),
+        ),
+    ]
+    ctx.run_endpoint_materialize(_meta_from_records(good, ctx.num_groups, device))
+    torch.accelerator.synchronize()
+    assert verify_endpoints(ctx, layer_states, good, dim_first) == []
+    torch_good = [
+        rec._replace(dst_block_ids=tuple(d + 4 for d in rec.dst_block_ids))
+        for rec in good
+    ]
+    materialize_endpoints_torch(ctx, layer_states, torch_good, dim_first)
+    torch.accelerator.synchronize()
+    assert verify_endpoints(ctx, layer_states, torch_good, dim_first) == []
+
+    shared = [
+        rec._replace(dst_block_ids=(first + 8 + i,) * 2) for i, rec in enumerate(good)
+    ]
+    materialize_endpoints_torch(ctx, layer_states, shared, dim_first)
+    torch.accelerator.synchronize()
+    mismatches = verify_endpoints(ctx, layer_states, shared, dim_first)
+    # Group 1 writes last on the sequential torch path: group 0's states
+    # (two layers, two state types each) are overwritten for both records.
+    assert len(mismatches) == 2 * 4
+    assert {m["layer"] for m in mismatches} == {0, 1}
+
+
 def test_served_page_geometry_kernel_torch_and_trace():
     """The served Kimi-K3 layout: conv ``(6, 4608)`` bf16 and temporal
     ``(12, 128, 128)`` fp32 views of every layer share 1,007,616-byte pages
-    (temporal at byte offset 55,296), four recurrent groups, four temporal
-    slots. The kernel's shadow and block-source materializations, the torch
-    reference path and the resolved-address trace must all agree."""
+    (temporal at byte offset 55,296), four recurrent groups whose layers
+    share one raw tensor, four temporal slots. The kernel's shadow and
+    block-source materializations, the torch reference path and the
+    resolved-address trace must all agree."""
     from vllm.model_executor.layers.mamba.mamba_utils import (
         get_conv_copy_spec,
         get_temporal_copy_spec,
@@ -587,30 +703,23 @@ def test_served_page_geometry_kernel_torch_and_trace():
     torch.manual_seed(3)
     page, temporal_off = 1007616, 55296
     conv_shape, temporal_shape = (6, 4608), (12, 128, 128)
-    num_groups, num_blocks, max_reqs, max_cols, slots = 4, 24, 4, 8, 4
-    convs, temps, raws, groups = [], [], [], []
-    for g in range(num_groups):
-        raw = torch.randint(
-            0, 256, (num_blocks * page,), dtype=torch.uint8, device=device
-        )
-        conv = raw.view(torch.bfloat16).as_strided(
-            (num_blocks,) + conv_shape, (page // 2, 4608, 1)
-        )
-        temp = (
-            raw[temporal_off:]
-            .view(torch.float32)
-            .as_strided((num_blocks,) + temporal_shape, (page // 4, 16384, 128, 1))
-        )
-        conv.copy_(torch.randn(conv.shape, dtype=torch.bfloat16, device=device))
-        temp.copy_(torch.randn(temp.shape, dtype=torch.float32, device=device))
-        raws.append(raw)
-        convs.append(conv)
-        temps.append(temp)
-        groups.append([f"g{g}"])
-    assert temps[0].data_ptr() - convs[0].data_ptr() == temporal_off
-    forward_context = {
-        names[0]: _mock_attention(c, t) for names, c, t in zip(groups, convs, temps)
-    }
+    num_groups, num_blocks, max_reqs, max_cols, slots = 4, 96, 4, 8, 4
+    # One raw tensor shared by the single layer of every group (served
+    # sharing rule: raw tensor i holds layer i of each group).
+    raw = torch.randint(0, 256, (num_blocks * page,), dtype=torch.uint8, device=device)
+    conv = raw.view(torch.bfloat16).as_strided(
+        (num_blocks,) + conv_shape, (page // 2, 4608, 1)
+    )
+    temp = (
+        raw[temporal_off:]
+        .view(torch.float32)
+        .as_strided((num_blocks,) + temporal_shape, (page // 4, 16384, 128, 1))
+    )
+    conv.copy_(torch.randn(conv.shape, dtype=torch.bfloat16, device=device))
+    temp.copy_(torch.randn(temp.shape, dtype=torch.float32, device=device))
+    assert temp.data_ptr() - conv.data_ptr() == temporal_off
+    groups = [[f"g{g}"] for g in range(num_groups)]
+    forward_context = {names[0]: _mock_attention(conv, temp) for names in groups}
     spec = MambaSpec(
         block_size=4608,
         shapes=(conv_shape, temporal_shape),
@@ -631,12 +740,15 @@ def test_served_page_geometry_kernel_torch_and_trace():
         device=device,
         make_buffer=lambda n, dtype: _Buffer(n, dtype, device),  # type: ignore[arg-type,return-value]
     )
+    # Block ids are unique across groups (nine per group).
     bts = []
     for g in range(num_groups):
+        base = 1 + 9 * g
         bt = torch.zeros(max_reqs, max_cols, dtype=torch.int32, device=device)
-        bt[0] = torch.tensor([1, 2, 3, 4, 5, 0, 0, 0]) + g
-        bt[1] = torch.tensor([6, 7, 8, 9, 0, 0, 0, 0]) + g
+        bt[0] = torch.tensor([base, base + 1, base + 2, base + 3, base + 4, 0, 0, 0])
+        bt[1] = torch.tensor([base + 5, base + 6, base + 7, base + 8, 0, 0, 0, 0])
         bts.append(bt)
+    first_free = 1 + 9 * num_groups
     ctx.initialize_from_forward_context(
         kv_cache_config,
         forward_context,
@@ -656,13 +768,14 @@ def test_served_page_geometry_kernel_torch_and_trace():
     token_bias = torch.zeros(max_reqs, dtype=torch.int32, device=device)
     state_idx[1], src_col[1], token_bias[1] = 1, 1, 3
     state_idx[3], src_col[3], token_bias[3] = 0, 0, 1
-    conv_pre = [c.clone() for c in convs]
-    temp_pre = [t.clone() for t in temps]
+    conv_pre = conv.clone()
+    temp_pre = temp.clone()
     ctx.run_fused_precopy(
         num_reqs, state_idx, src_col, token_bias, idx_mapping, snapshot_to_shadow=True
     )
     bt_cpu = [bt.cpu() for bt in bts]
-    dst = [20, 21, 22, 23]
+    # Record r of group g writes block first_free + 4 * g + r.
+    dst = [tuple(first_free + 4 * g + r for g in range(num_groups)) for r in range(4)]
     records = [
         EndpointCopyRecord(True, 1, 3, dst[0], (), ()),
         EndpointCopyRecord(True, 1, 2, dst[1], (), ()),
@@ -676,20 +789,11 @@ def test_served_page_geometry_kernel_torch_and_trace():
             tuple(int(bt_cpu[g][1, 1]) for g in range(num_groups)),
         ),
     ]
-    width = ENDPOINT_COPY_META_FIXED + 2 * ctx.num_groups
-    meta = torch.full((len(records), width), -1, dtype=torch.int32)
-    for row, rec in enumerate(records):
-        meta[row, :4] = torch.tensor(
-            [int(rec.from_shadow), rec.req_idx, rec.token_bias, rec.dst_block_id]
-        )
-        if not rec.from_shadow:
-            meta[row, 4 : 4 + num_groups] = torch.tensor(rec.conv_src_block_ids)
-            meta[row, 4 + num_groups : width] = torch.tensor(rec.temporal_src_block_ids)
     total_states = ctx.num_layers * ctx.num_state_types
     trace = torch.zeros(
         (len(records), total_states, 4), dtype=torch.int64, device=device
     )
-    ctx.run_endpoint_materialize(meta.to(device), trace)
+    ctx.run_endpoint_materialize(_meta_from_records(records, num_groups, device), trace)
     torch.accelerator.synchronize()
     assert trace.cpu().tolist() == [
         [list(t) for t in per_state]
@@ -706,26 +810,24 @@ def test_served_page_geometry_kernel_torch_and_trace():
             sblk = int(bt_cpu[g][row, col])
             tblk = int(bt_cpu[g][row, col + rec.token_bias])
             n = 6 - rec.token_bias
-            assert torch.equal(
-                convs[layer][rec.dst_block_id][:n],
-                conv_pre[layer][sblk][rec.token_bias :],
-            )
-            assert torch.equal(temps[layer][rec.dst_block_id], temp_pre[layer][tblk])
-    for layer in range(num_groups):
-        for b in range(20):
-            assert torch.equal(convs[layer][b], conv_pre[layer][b])
-            assert torch.equal(temps[layer][b], temp_pre[layer][b])
+            d = rec.dst_block_ids[g]
+            assert torch.equal(conv[d][:n], conv_pre[sblk][rec.token_bias :])
+            assert torch.equal(temp[d], temp_pre[tblk])
+    for b in range(first_free):
+        assert torch.equal(conv[b], conv_pre[b])
+        assert torch.equal(temp[b], temp_pre[b])
 
-    torch_records = [rec._replace(dst_block_id=rec.dst_block_id - 4) for rec in records]
+    torch_records = [
+        rec._replace(dst_block_ids=tuple(d + 4 * num_groups for d in rec.dst_block_ids))
+        for rec in records
+    ]
     materialize_endpoints_torch(ctx, layer_states, torch_records, False)
     torch.accelerator.synchronize()
     assert verify_endpoints(ctx, layer_states, torch_records, False) == []
     for layer in range(num_groups):
+        g = ctx.state_group_indices_cpu[2 * layer]
         for rec, trec in zip(records, torch_records):
             n = 6 - rec.token_bias
-            assert torch.equal(
-                convs[layer][rec.dst_block_id][:n], convs[layer][trec.dst_block_id][:n]
-            )
-            assert torch.equal(
-                temps[layer][rec.dst_block_id], temps[layer][trec.dst_block_id]
-            )
+            d, td = rec.dst_block_ids[g], trec.dst_block_ids[g]
+            assert torch.equal(conv[d][:n], conv[td][:n])
+            assert torch.equal(temp[d], temp[td])

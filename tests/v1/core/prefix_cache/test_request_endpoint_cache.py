@@ -85,9 +85,23 @@ def _dcp9_config() -> KVCacheConfig:
     )
 
 
-def _manager():
+def _two_recurrent_groups_config() -> KVCacheConfig:
+    """The DCP9 layout with a second recurrent group (group 3)."""
+    config = _dcp9_config()
+    recurrent = config.kv_cache_groups[MAMBA_GROUP]
+    return KVCacheConfig(
+        num_blocks=config.num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            *config.kv_cache_groups,
+            KVCacheGroupSpec(["target_recurrent_2"], recurrent.kv_cache_spec),
+        ],
+    )
+
+
+def _manager(kv_cache_config: KVCacheConfig | None = None):
     return make_kv_cache_manager(
-        kv_cache_config=_dcp9_config(),
+        kv_cache_config=kv_cache_config or _dcp9_config(),
         max_model_len=128,
         enable_caching=True,
         scheduler_block_size=18,
@@ -181,7 +195,7 @@ def test_next_turn_resumes_at_the_last_computed_token(in_flight):
     copy = copies[0]
     assert copy.req_id == "producer"
     assert copy.from_shadow == in_flight
-    dst = next(block for block in retained if block.block_id == copy.dst_block_id)
+    dst = next(block for block in retained if block.block_id == copy.dst_block_ids[0])
     assert dst.ref_cnt == 1 and dst.block_hash is not None
     num_drafts, num_accepted = final_step
     # The bias selects the conv shift and, for a shadow source, the temporal
@@ -444,3 +458,59 @@ def test_an_incomplete_request_publishes_nothing():
     # Aborted before its first token: nothing beyond the prompt is committed.
     assert not manager.cache_endpoint(producer, (0, 0), in_flight=False)
     assert manager.block_pool.num_endpoint_entries == 0
+
+
+@pytest.mark.parametrize("in_flight", [False, True])
+def test_every_recurrent_group_gets_its_own_durable_block(in_flight):
+    """Block ids name the same physical page in every group, so an entry
+    holds one distinct block per recurrent group and the copy record lists
+    them in group order."""
+    manager = _manager(_two_recurrent_groups_config())
+    producer, final_step = _run_producer(manager)
+    num_tokens = producer.num_tokens - 1
+    free_before = manager.block_pool.get_num_free_blocks()
+    assert manager.cache_endpoint(producer, final_step, in_flight=in_flight)
+    assert manager.block_pool.get_num_free_blocks() == free_before - 2
+    manager.free(producer)
+    manager.new_step_starts()
+    copies, retained = manager.take_mamba_endpoint_copies()
+    (copy,) = copies
+    assert len(copy.dst_block_ids) == 2
+    assert len(set(copy.dst_block_ids)) == 2
+    retained_ids = {block.block_id for block in retained}
+    assert set(copy.dst_block_ids) <= retained_ids
+    if not in_flight:
+        assert len(copy.conv_src_block_ids) == 2
+        assert len(copy.temporal_src_block_ids) == 2
+    entry = manager.block_pool.find_endpoints(
+        producer.block_hashes[num_tokens // UNIT - 1]
+    )[0]
+    recurrent_groups = [MAMBA_GROUP, 3]
+    assert [entry.group_blocks[gid][1][0].block_id for gid in recurrent_groups] == list(
+        copy.dst_block_ids
+    )
+    manager.block_pool.free_blocks(retained)
+
+    consumer_tokens = list(producer.all_token_ids) + [700, 701, 702]
+    consumer = make_request("consumer", consumer_tokens, UNIT, sha256)
+    blocks, hit, _ = manager.get_computed_blocks(consumer)
+    assert hit == num_tokens
+    for gid, dst_id in zip(recurrent_groups, copy.dst_block_ids):
+        assert blocks.blocks[gid][-1].block_id == dst_id
+
+
+def test_endpoint_needs_a_spare_block_beyond_one_per_group():
+    manager = _manager(_two_recurrent_groups_config())
+    producer, final_step = _run_producer(manager)
+    pool = manager.block_pool
+    spare = pool.get_new_blocks(pool.get_num_free_blocks() - 2)
+    assert pool.get_num_free_blocks() == 2
+    assert not manager.cache_endpoint(producer, final_step, in_flight=True)
+    assert pool.num_endpoint_entries == 0
+    pool.free_blocks(spare)
+    assert manager.cache_endpoint(producer, final_step, in_flight=True)
+    assert pool.num_endpoint_entries == 1
+    manager.free(producer)
+    manager.new_step_starts()
+    _, retained = manager.take_mamba_endpoint_copies()
+    pool.free_blocks(retained)

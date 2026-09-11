@@ -1009,37 +1009,41 @@ class KVCacheManager:
                 retained.append(conv_src)
                 retained.append(temporal_src)
 
-        # Keep one block spare so publishing never takes the pool's last block.
-        if self.block_pool.get_num_free_blocks() < 2:
+        # One durable block per recurrent group: a block id names the same
+        # physical page in every group (each raw KV tensor is shared by one
+        # layer of every group), so groups must not share a block. Keep one
+        # block spare so publishing never takes the pool's last block.
+        num_dst = len(mamba_managers)
+        if self.block_pool.get_num_free_blocks() < num_dst + 1:
             return False
-        dst = self.block_pool.get_new_blocks(1)[0]
+        dsts = self.block_pool.get_new_blocks(num_dst)
         state_idx = (num_tokens - 1) // mamba_block_size
-        for group_id in mamba_group_ids:
+        for group_id, dst in zip(mamba_group_ids, dsts):
             group_blocks[group_id] = (state_idx, [dst])
         entry = self.block_pool.cache_endpoint(
             parent_hash, num_tokens, tail_tokens, extra_keys, group_blocks, max_entries
         )
         if entry is None:
-            self.block_pool.free_blocks([dst])
+            self.block_pool.free_blocks(dsts)
             return False
         self.block_pool.touch(retained)
         self._pending_endpoint_copies.append(
             MambaEndpointStateCopy(
                 req_id=req_id,
-                dst_block_id=dst.block_id,
+                dst_block_ids=tuple(dst.block_id for dst in dsts),
                 from_shadow=in_flight,
                 conv_src_block_ids=tuple(conv_src_ids),
                 temporal_src_block_ids=tuple(temporal_src_ids),
                 token_bias=token_bias,
             )
         )
-        self._endpoint_retained_blocks.append(dst)
+        self._endpoint_retained_blocks.extend(dsts)
         self._endpoint_retained_blocks.extend(retained)
         if request_endpoint_cache_debug():
             logger.info(
                 "[endpoint] register req=%s L=%d committed=%d drafts=%d accepted=%d "
                 "accepted_at_endpoint=%d base=%d normalized=%s in_flight=%s "
-                "bias=%d dst=%d conv_src=%s temporal_src=%s groups=%s",
+                "bias=%d dst=%s conv_src=%s temporal_src=%s groups=%s",
                 req_id,
                 num_tokens,
                 committed,
@@ -1050,7 +1054,7 @@ class KVCacheManager:
                 normalized,
                 in_flight,
                 token_bias,
-                dst.block_id,
+                [dst.block_id for dst in dsts],
                 conv_src_ids,
                 temporal_src_ids,
                 {

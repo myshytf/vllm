@@ -489,7 +489,7 @@ class EndpointCopyRecord(NamedTuple):
     from_shadow: bool
     req_idx: int
     token_bias: int
-    dst_block_id: int
+    dst_block_ids: tuple[int, ...]
     conv_src_block_ids: tuple[int, ...]
     temporal_src_block_ids: tuple[int, ...]
 
@@ -535,7 +535,8 @@ def materialize_endpoints_torch(
             for type_idx, state in enumerate(states):
                 state_idx = layer * ctx.num_state_types + type_idx
                 src = sources[layer][type_idx]
-                dst = state[record.dst_block_id]
+                group = ctx.state_group_indices_cpu[state_idx]
+                dst = state[record.dst_block_ids[group]]
                 if ctx.state_conv_widths_cpu[state_idx] > 0:
                     _conv_window_copy(dst, src, record.token_bias, conv_dim_first)
                 else:
@@ -558,7 +559,8 @@ def verify_endpoints(
             for type_idx, state in enumerate(states):
                 state_idx = layer * ctx.num_state_types + type_idx
                 src = sources[layer][type_idx]
-                dst = state[record.dst_block_id]
+                group = ctx.state_group_indices_cpu[state_idx]
+                dst = state[record.dst_block_ids[group]]
                 if ctx.state_conv_widths_cpu[state_idx] > 0:
                     bias = record.token_bias
                     if conv_dim_first:
@@ -589,10 +591,12 @@ def verify_endpoints(
 
 
 # Per-copy int32 record of ``materialize_mamba_endpoint_kernel``:
-# [from_shadow, req_idx, token_bias, dst_block, conv_src[num_groups],
-#  temporal_src[num_groups]]. ``token_bias`` selects the conv shift and,
-# for a shadow source, the temporal shadow slot; the block-source columns are
-# resolved by the scheduler and carry the temporal slot already.
+# [from_shadow, req_idx, token_bias, reserved, dst[num_groups],
+#  conv_src[num_groups], temporal_src[num_groups]]. Every recurrent group has
+# its own destination block because block ids alias the same physical pages
+# across groups. ``token_bias`` selects the conv shift and, for a shadow
+# source, the temporal shadow slot; the block-source columns are resolved by
+# the scheduler and carry the temporal slot already.
 ENDPOINT_COPY_META_FIXED = 4
 
 
@@ -641,7 +645,11 @@ def materialize_mamba_endpoint_kernel(
     from_shadow = tl.load(meta + 0)
     req_idx = tl.load(meta + 1).to(tl.int64)
     token_bias = tl.load(meta + 2)
-    dst_block_id = tl.load(meta + 3).to(tl.int64)
+    # Block ids alias the same physical pages across cache groups (one raw
+    # tensor per layer index is shared by every group), so each recurrent
+    # group has its own destination block.
+    group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
+    dst_block_id = tl.load(meta + 4 + group_idx).to(tl.int64)
     if dst_block_id < 0:
         return
 
@@ -649,9 +657,8 @@ def materialize_mamba_endpoint_kernel(
     state_block_stride = tl.load(state_block_strides_ptr + state_idx)
     dst_addr = state_base_addr + dst_block_id * state_block_stride
 
-    group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
-    conv_src_block_id = tl.load(meta + 4 + group_idx).to(tl.int64)
-    temporal_src_block_id = tl.load(meta + 4 + NUM_GROUPS + group_idx).to(tl.int64)
+    conv_src_block_id = tl.load(meta + 4 + NUM_GROUPS + group_idx).to(tl.int64)
+    temporal_src_block_id = tl.load(meta + 4 + 2 * NUM_GROUPS + group_idx).to(tl.int64)
     slot_conv_addr = state_base_addr + conv_src_block_id * state_block_stride
     slot_temporal_addr = state_base_addr + temporal_src_block_id * state_block_stride
 
@@ -1642,7 +1649,7 @@ class MambaSpecDecodeGPUContext:
         if num_copies == 0 or not self.is_initialized:
             return
         assert copy_meta.dtype == torch.int32 and copy_meta.dim() == 2
-        assert copy_meta.shape[1] == ENDPOINT_COPY_META_FIXED + 2 * self.num_groups
+        assert copy_meta.shape[1] == ENDPOINT_COPY_META_FIXED + 3 * self.num_groups
         assert copy_meta.is_contiguous()
         assert self.shadow_base_addrs is not None
         total_states = self.num_layers * self.num_state_types
@@ -1687,7 +1694,7 @@ class MambaSpecDecodeGPUContext:
                 base = self.state_base_addrs_cpu[state_idx]
                 stride = self.state_block_strides_cpu[state_idx]
                 group = self.state_group_indices_cpu[state_idx]
-                dst = base + record.dst_block_id * stride
+                dst = base + record.dst_block_ids[group] * stride
                 if record.from_shadow:
                     shadow = self.shadow_base_addrs_cpu[state_idx]
                     conv_src = shadow + record.req_idx * stride

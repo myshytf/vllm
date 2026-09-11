@@ -302,7 +302,7 @@ class MambaHybridModelState(DefaultModelState):
             )
             return
         num_groups = ctx.num_groups
-        width = ENDPOINT_COPY_META_FIXED + 2 * num_groups
+        width = ENDPOINT_COPY_META_FIXED + 3 * num_groups
         meta = np.full((len(copies), width), -1, dtype=np.int32)
         records: list[EndpointCopyRecord] = []
         rows = 0
@@ -338,15 +338,27 @@ class MambaHybridModelState(DefaultModelState):
                 meta[rows, 0] = 0
                 meta[rows, 1] = 0
                 meta[rows, 2] = copy.token_bias
-                meta[rows, 4 : 4 + num_groups] = copy.conv_src_block_ids
-                meta[rows, 4 + num_groups : width] = copy.temporal_src_block_ids
-            meta[rows, 3] = copy.dst_block_id
+                meta[rows, 4 + num_groups : 4 + 2 * num_groups] = (
+                    copy.conv_src_block_ids
+                )
+                meta[rows, 4 + 2 * num_groups : width] = copy.temporal_src_block_ids
+            if len(copy.dst_block_ids) != num_groups:
+                logger.warning(
+                    "Request-endpoint copy for %s skipped: %d destination "
+                    "blocks for %d recurrent groups",
+                    copy.req_id,
+                    len(copy.dst_block_ids),
+                    num_groups,
+                )
+                meta[rows] = -1
+                continue
+            meta[rows, 4 : 4 + num_groups] = copy.dst_block_ids
             records.append(
                 EndpointCopyRecord(
                     from_shadow=bool(copy.from_shadow),
                     req_idx=req_idx if copy.from_shadow and req_idx is not None else 0,
                     token_bias=int(copy.token_bias),
-                    dst_block_id=int(copy.dst_block_id),
+                    dst_block_ids=tuple(int(b) for b in copy.dst_block_ids),
                     conv_src_block_ids=tuple(copy.conv_src_block_ids),
                     temporal_src_block_ids=tuple(copy.temporal_src_block_ids),
                 )
@@ -436,7 +448,7 @@ class MambaHybridModelState(DefaultModelState):
             len(records),
             total,
             len(mismatches),
-            {records[i].dst_block_id: n for i, n in sorted(by_record.items())},
+            {records[i].dst_block_ids[0]: n for i, n in sorted(by_record.items())},
             mismatches[0] if mismatches else None,
         )
 
@@ -482,13 +494,13 @@ class MambaHybridModelState(DefaultModelState):
                     f"temporal={copy.temporal_src_block_ids[0]}"
                 )
             logger.info(
-                "[endpoint] source req=%s %s bias=%d dst=%d conv=%s temporal=%s "
+                "[endpoint] source req=%s %s bias=%d dst0=%d conv=%s temporal=%s "
                 "state0=(base=%#x stride=%d) state1=(base=%#x stride=%d) "
                 "shape0=%s stride0=%s shape1=%s stride1=%s",
                 copy.req_id,
                 src_desc,
                 copy.token_bias,
-                copy.dst_block_id,
+                copy.dst_block_ids[0],
                 conv_sig,
                 temporal_sig,
                 base0,
