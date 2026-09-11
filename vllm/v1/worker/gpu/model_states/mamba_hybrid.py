@@ -457,7 +457,7 @@ class MambaHybridModelState(DefaultModelState):
         if states is None or len(states) < 2 or not ctx.is_initialized:
             return
         torch.accelerator.synchronize()
-        strides = ctx.state_block_strides_cpu[:2]
+        strides = ctx.shadow_page_strides_cpu[:2]
         base0 = int(ctx.state_base_addrs[0].item())
         base1 = int(ctx.state_base_addrs[1].item())
         logger.info(

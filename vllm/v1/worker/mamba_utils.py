@@ -414,6 +414,7 @@ def _snapshot_mamba_state_to_shadow(
     state_base_addrs_ptr,
     state_block_strides_ptr,
     shadow_base_addrs_ptr,
+    shadow_page_strides_ptr,
     state_elem_sizes_ptr,
     state_inner_sizes_ptr,
     state_conv_widths_ptr,
@@ -425,8 +426,9 @@ def _snapshot_mamba_state_to_shadow(
     CONV_STATE_DIM_FIRST: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
 ):
-    """Copy a request's committed state into its shadow pages, block-strided
-    pages outside the block tables that only this snapshot writes.
+    """Copy a request's committed state into its shadow pages, compact pages
+    (one state's data bytes each) outside the block tables that only this
+    snapshot writes.
 
     The conv window of ``src_col`` is copied unshifted (the materialization
     applies the shift), and the temporal states of the columns ``src_col +
@@ -442,11 +444,12 @@ def _snapshot_mamba_state_to_shadow(
     block_table_typed = group_base_addr.to(tl.pointer_type(tl.int32))
     block_table_base = block_table_typed + bt_row_idx * block_table_stride_req
     shadow_base_addr = tl.load(shadow_base_addrs_ptr + state_idx)
+    shadow_page_stride = tl.load(shadow_page_strides_ptr + state_idx)
 
     if conv_width > 0:
         conv_src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
         conv_src_addr = state_base_addr + conv_src_block_id * state_block_stride
-        dst_addr = shadow_base_addr + shadow_slot.to(tl.int64) * state_block_stride
+        dst_addr = shadow_base_addr + shadow_slot.to(tl.int64) * shadow_page_stride
         _copy_mamba_state_addrs(
             state_idx,
             conv_src_addr,
@@ -472,7 +475,7 @@ def _snapshot_mamba_state_to_shadow(
     for t in range(0, token_bias + 1):
         src_block_id = tl.load(block_table_base + src_col + t).to(tl.int64)
         src_addr = state_base_addr + src_block_id * state_block_stride
-        dst_addr = shadow_base_addr + (slot_base + t) * state_block_stride
+        dst_addr = shadow_base_addr + (slot_base + t) * shadow_page_stride
         _memcpy_u64_tiled(
             src_addr,
             dst_addr,
@@ -605,6 +608,7 @@ def materialize_mamba_endpoint_kernel(
     copy_meta_ptr,  # int32 [num_copies, copy_meta_stride]
     copy_meta_stride: tl.int64,
     shadow_base_addrs_ptr,  # int64 [total_states]; 0 when no shadow exists
+    shadow_page_strides_ptr,  # int64 [total_states]; bytes per shadow page
     shadow_temporal_slots,  # temporal shadow slots per request
     state_base_addrs_ptr,
     state_block_strides_ptr,
@@ -665,11 +669,12 @@ def materialize_mamba_endpoint_kernel(
     # Shadow layout: one unshifted conv page per request; temporal pages
     # ``req_idx * shadow_temporal_slots + t`` for accepted-slot ``t``.
     shadow_base_addr = tl.load(shadow_base_addrs_ptr + state_idx)
-    shadow_conv_addr = shadow_base_addr + req_idx * state_block_stride
+    shadow_page_stride = tl.load(shadow_page_strides_ptr + state_idx)
+    shadow_conv_addr = shadow_base_addr + req_idx * shadow_page_stride
     shadow_temporal_addr = (
         shadow_base_addr
         + (req_idx * shadow_temporal_slots.to(tl.int64) + token_bias.to(tl.int64))
-        * state_block_stride
+        * shadow_page_stride
     )
 
     use_shadow = from_shadow != 0
@@ -917,6 +922,7 @@ def precopy_mamba_align_fused_kernel(
     shadow_base_addrs_ptr=None,
     shadow_temporal_slots=1,
     HAS_SHADOW: tl.constexpr = False,
+    shadow_page_strides_ptr=None,
 ):
     """Pre-copy mamba "align" state across block boundaries.
 
@@ -964,6 +970,7 @@ def precopy_mamba_align_fused_kernel(
             state_base_addrs_ptr,
             state_block_strides_ptr,
             shadow_base_addrs_ptr,
+            shadow_page_strides_ptr,
             state_elem_sizes_ptr,
             state_inner_sizes_ptr,
             state_conv_widths_ptr,
@@ -1149,6 +1156,10 @@ class MambaSpecDecodeGPUContext:
     # read by ``materialize_mamba_endpoint_kernel``. ``shadow_base_addrs`` is
     # all zeros until ``ensure_endpoint_shadow`` allocates the slots.
     shadow_base_addrs: torch.Tensor | None = None
+    # Bytes per shadow page per state: the state's data bytes per block
+    # rounded up to 64, smaller than the pool page stride (which pads every
+    # state to the page shared by all groups' layers).
+    shadow_page_strides: torch.Tensor | None = None
     shadow_buffers: list[torch.Tensor] | None = None
     shadow_num_slots: int = 0
     # Temporal shadow pages per request: one per speculative state slot, so a
@@ -1162,6 +1173,7 @@ class MambaSpecDecodeGPUContext:
     state_group_indices_cpu: list[int] = dataclasses.field(default_factory=list)
     state_base_addrs_cpu: list[int] = dataclasses.field(default_factory=list)
     shadow_base_addrs_cpu: list[int] = dataclasses.field(default_factory=list)
+    shadow_page_strides_cpu: list[int] = dataclasses.field(default_factory=list)
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
@@ -1239,45 +1251,70 @@ class MambaSpecDecodeGPUContext:
             shadow_base_addrs=torch.zeros(
                 total_states, dtype=torch.int64, device=device
             ),
+            shadow_page_strides=torch.zeros(
+                total_states, dtype=torch.int64, device=device
+            ),
             is_initialized=False,
         )
+
+    def state_page_bytes(self, state_idx: int) -> int:
+        """Data bytes of one block of state ``state_idx`` (conv window or
+        temporal state), without the pool page padding."""
+        elem = int(self.state_elem_sizes[state_idx].item())
+        inner = int(self.state_inner_sizes[state_idx].item())
+        conv_width = int(self.state_conv_widths[state_idx].item())
+        if conv_width > 0 and is_conv_state_dim_first():
+            rows = int(self.state_dim_row_count[state_idx].item())
+            return rows * conv_width * elem
+        if conv_width > 0:
+            return conv_width * inner * elem
+        return inner * elem
 
     def ensure_endpoint_shadow(self, num_slots: int) -> None:
         """Allocate the request-endpoint shadow slots (idempotent).
 
-        Each (layer, state type) gets ``num_slots`` pages with the state
-        tensor's block stride, so the copy kernels address a slot exactly like
-        a pool block. Must run after ``initialize_from_forward_context``.
+        Each (layer, state type) gets ``num_slots`` compact pages (temporal
+        states: ``num_slots`` × temporal slots) of the state's data bytes
+        rounded up to 64, so the copy kernels address a shadow page like a
+        pool block with the state's own page stride. Must run after
+        ``initialize_from_forward_context``.
         """
         if self.shadow_buffers is not None:
             return
         assert self.is_initialized, "state metadata must be populated first"
         assert self.shadow_base_addrs is not None
+        assert self.shadow_page_strides is not None
         device = self.shadow_base_addrs.device
-        strides = self.state_block_strides.tolist()
         conv_widths = self.state_conv_widths.tolist()
         temporal_slots = 1
         if self.aligned_state_indices is not None:
             temporal_slots = int(self.aligned_state_indices.shape[2])
         buffers: list[torch.Tensor] = []
         addrs: list[int] = []
+        strides: list[int] = []
         total_bytes = 0
-        for stride, conv_width in zip(strides, conv_widths):
+        for state_idx, conv_width in enumerate(conv_widths):
             pages = num_slots * (1 if conv_width > 0 else temporal_slots)
-            nbytes = int(stride) * pages
+            stride = (self.state_page_bytes(state_idx) + 63) // 64 * 64
+            nbytes = stride * pages
             # Slots are zero-initialized so a never-written slot reads as an
             # all-zero state rather than as stale device memory.
             buf = torch.zeros(max(nbytes, 1), dtype=torch.uint8, device=device)
             buffers.append(buf)
             addrs.append(buf.data_ptr())
+            strides.append(stride)
             total_bytes += nbytes
         self.shadow_base_addrs.copy_(
             torch.tensor(addrs, dtype=torch.int64, device=device)
         )
+        self.shadow_page_strides.copy_(
+            torch.tensor(strides, dtype=torch.int64, device=device)
+        )
+        self.shadow_base_addrs_cpu = list(addrs)
+        self.shadow_page_strides_cpu = list(strides)
         self.shadow_buffers = buffers
         self.shadow_num_slots = num_slots
         self.shadow_temporal_slots = temporal_slots
-        self.shadow_base_addrs_cpu = [int(a) for a in addrs]
         logger.info(
             "Request-endpoint recurrent-state shadow: %d slot(s) x %d state(s), "
             "%d temporal page(s) per slot, %.1f MiB",
@@ -1297,7 +1334,7 @@ class MambaSpecDecodeGPUContext:
         """Shadow page ``page`` of state ``state_idx`` viewed as one block of
         ``like`` (the state tensor whose blocks the shadow mirrors)."""
         assert self.shadow_buffers is not None
-        stride = self.state_block_strides_cpu[state_idx]
+        stride = self.shadow_page_strides_cpu[state_idx]
         nbytes = like[0].numel() * like.element_size()
         raw = self.shadow_buffers[state_idx][page * stride : page * stride + nbytes]
         return raw.view(like.dtype).view(like.shape[1:])
@@ -1634,6 +1671,7 @@ class MambaSpecDecodeGPUContext:
             shadow_base_addrs_ptr=self.shadow_base_addrs,
             shadow_temporal_slots=self.shadow_temporal_slots,
             HAS_SHADOW=has_shadow,
+            shadow_page_strides_ptr=self.shadow_page_strides,
         )
 
     def run_endpoint_materialize(
@@ -1652,6 +1690,7 @@ class MambaSpecDecodeGPUContext:
         assert copy_meta.shape[1] == ENDPOINT_COPY_META_FIXED + 3 * self.num_groups
         assert copy_meta.is_contiguous()
         assert self.shadow_base_addrs is not None
+        assert self.shadow_page_strides is not None
         total_states = self.num_layers * self.num_state_types
         if trace is not None:
             assert trace.dtype == torch.int64 and trace.is_contiguous()
@@ -1661,6 +1700,7 @@ class MambaSpecDecodeGPUContext:
             copy_meta,
             copy_meta.stride(0),
             self.shadow_base_addrs,
+            self.shadow_page_strides,
             self.shadow_temporal_slots,
             self.state_base_addrs,
             self.state_block_strides,
@@ -1697,14 +1737,15 @@ class MambaSpecDecodeGPUContext:
                 dst = base + record.dst_block_ids[group] * stride
                 if record.from_shadow:
                     shadow = self.shadow_base_addrs_cpu[state_idx]
-                    conv_src = shadow + record.req_idx * stride
+                    sstride = self.shadow_page_strides_cpu[state_idx]
+                    conv_src = shadow + record.req_idx * sstride
                     temporal_src = (
                         shadow
                         + (
                             record.req_idx * self.shadow_temporal_slots
                             + record.token_bias
                         )
-                        * stride
+                        * sstride
                     )
                 else:
                     conv_src = base + record.conv_src_block_ids[group] * stride

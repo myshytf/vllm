@@ -95,7 +95,7 @@ def _build_shadow(convs, ssms, device):
     """Per-state shadow pages with the state tensor's block stride: one conv
     page per request slot, ``TEMPORAL_SLOTS`` temporal pages per request slot;
     viewed with the state's own shape for comparison."""
-    buffers, views, addrs = [], [], []
+    buffers, views, addrs, strides = [], [], [], []
     for layer in range(NUM_LAYERS):
         for state, pages in (
             (convs[layer], MAX_REQS),
@@ -105,8 +105,14 @@ def _build_shadow(convs, ssms, device):
             buf = torch.zeros(pages * stride, dtype=torch.uint8, device=device)
             buffers.append(buf)
             addrs.append(buf.data_ptr())
+            strides.append(stride)
             views.append(buf.view(state.dtype).view(pages, *state.shape[1:]))
-    return buffers, views, torch.tensor(addrs, dtype=torch.int64, device=device)
+    return (
+        buffers,
+        views,
+        torch.tensor(addrs, dtype=torch.int64, device=device),
+        torch.tensor(strides, dtype=torch.int64, device=device),
+    )
 
 
 def _normalized(conv, ssm, bt, req, src_col, bias, conv_dim_first):
@@ -162,7 +168,7 @@ def test_snapshot_then_materialize_matches_the_copy_specs(
     base, blk_stride, elem, inner, width, group, drc, drs = _build_meta(
         convs, ssms, device, conv_state_dim_first
     )
-    _, shadow_views, shadow_addrs = _build_shadow(convs, ssms, device)
+    _, shadow_views, shadow_addrs, shadow_strides = _build_shadow(convs, ssms, device)
     bt_ptrs = torch.tensor([bt_batch.data_ptr()], dtype=torch.int64, device=device)
 
     grid = (num_reqs, NUM_LAYERS * 2, temporal_tiles)
@@ -189,6 +195,7 @@ def test_snapshot_then_materialize_matches_the_copy_specs(
         shadow_base_addrs_ptr=shadow_addrs,
         shadow_temporal_slots=TEMPORAL_SLOTS,
         HAS_SHADOW=True,
+        shadow_page_strides_ptr=shadow_strides,
     )
     torch.accelerator.synchronize()
 
@@ -255,6 +262,7 @@ def test_snapshot_then_materialize_matches_the_copy_specs(
         meta,
         meta.stride(0),
         shadow_addrs,
+        shadow_strides,
         TEMPORAL_SLOTS,
         base,
         blk_stride,
