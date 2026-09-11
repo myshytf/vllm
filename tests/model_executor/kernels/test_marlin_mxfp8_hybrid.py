@@ -65,3 +65,41 @@ def test_unrepack_matches_reference(size_n, size_k):
     full = reconstruct_bf16_weight(marlin_q, marlin_s, size_n, size_k, torch.bfloat16)
     ref = weight.to(torch.bfloat16).view(size_n, size_k // 32, 32) * s_ref.unsqueeze(-1)
     assert torch.equal(full, ref.view(size_n, size_k))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs the CUDA repack")
+@pytest.mark.parametrize("size_n,size_k", [(256, 512), (1408, 7168), (7168, 704)])
+def test_triton_reconstruction_matches_torch_on_cuda_repack(size_n, size_k):
+    from vllm.model_executor.kernels.linear.mxfp8.marlin_hybrid import (
+        reconstruct_bf16_weight_torch,
+        reconstruct_bf16_weight_triton,
+    )
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+        prepare_mxfp8_layer_for_marlin,
+    )
+
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    weight = (torch.randn(size_n, size_k, device=dev) / 4).to(torch.float8_e4m3fn)
+    scales = torch.randint(
+        118, 132, (size_n, size_k // 32), dtype=torch.uint8, device=dev
+    )
+    ref = (
+        weight.to(torch.bfloat16).view(size_n, size_k // 32, 32)
+        * scales.view(torch.float8_e8m0fnu).to(torch.bfloat16).unsqueeze(-1)
+    ).view(size_n, size_k)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(scales.clone(), requires_grad=False)
+    layer.output_size_per_partition = size_n
+    layer.input_size_per_partition = size_k
+    prepare_mxfp8_layer_for_marlin(layer)
+
+    w_torch = reconstruct_bf16_weight_torch(
+        layer.weight, layer.weight_scale, size_n, size_k, torch.bfloat16
+    )
+    w_triton = reconstruct_bf16_weight_triton(
+        layer.weight, layer.weight_scale, size_n, size_k, torch.bfloat16
+    )
+    assert torch.equal(w_torch, ref)
+    assert torch.equal(w_triton, ref)

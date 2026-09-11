@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_MXFP8_LINEAR_KERNEL: str = ""
     VLLM_MXFP8_MARLIN_LARGE_M_THRESHOLD: int = 128
+    VLLM_MXFP8_HYBRID_RECONSTRUCT: str = "triton"
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
     VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE: int = 0
@@ -1194,6 +1195,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # path (weights reconstructed from the Marlin payload) instead of Marlin.
     "VLLM_MXFP8_MARLIN_LARGE_M_THRESHOLD": lambda: int(
         os.getenv("VLLM_MXFP8_MARLIN_LARGE_M_THRESHOLD", "128")
+    ),
+    # How the hybrid kernel reconstructs BF16 weights from the Marlin payload:
+    # "triton" (one fused gather/dequant kernel) or "torch" (reference ops).
+    "VLLM_MXFP8_HYBRID_RECONSTRUCT": lambda: (
+        os.getenv("VLLM_MXFP8_HYBRID_RECONSTRUCT", "triton").strip().lower()
     ),
     # Compute DSpark draft-proposal logits with a rowwise-fp8 copy of the
     # shared target lm_head. Verification is unchanged, so accepted outputs

@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
     get_weight_perm,
 )
+from vllm.triton_utils import tl, triton
 
 from .marlin import MarlinMxfp8LinearKernel
 
@@ -88,6 +89,119 @@ def unrepack_marlin_mxfp8_scales(
     return s.t()[:size_n, : size_k // MXFP8_GROUP].contiguous()
 
 
+def reconstruct_bf16_weight_torch(
+    marlin_qweight: torch.Tensor,
+    marlin_scales: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Exact ``[size_n, size_k]`` weight in ``dtype`` from the payload (torch ops)."""
+    w = unrepack_marlin_fp8_weight(marlin_qweight, size_n, size_k).to(dtype)
+    s = unrepack_marlin_mxfp8_scales(marlin_scales, size_n, size_k, dtype)
+    # power-of-two scales: the product is exact in bf16/fp16 within range
+    return (w.view(size_n, size_k // MXFP8_GROUP, MXFP8_GROUP) * s.unsqueeze(-1)).view(
+        size_n, size_k
+    )
+
+
+@functools.cache
+def _scale_inverse_table(device: torch.device) -> torch.Tensor:
+    """64-entry table: original n_local -> position inside a Marlin 64-scale chunk.
+
+    Inverts ``marlin_permute_scales`` (scale_perm over 64 columns) followed by
+    ``mxfp8_marlin_process_scales`` (the [0, 2, 1, 3] swap inside groups of 4).
+    """
+    scale_perm, _ = get_scale_perms()
+    inv = torch.argsort(torch.tensor(scale_perm))  # orig n -> position after perm
+    swap = torch.tensor([0, 2, 1, 3])
+    pos = (inv // 4) * 4 + swap[inv % 4]
+    return pos.to(dtype=torch.int32, device=device)
+
+
+@triton.jit
+def _marlin_fp8_unrepack_dequant_kernel(
+    packed_ptr,
+    inv_ptr,
+    scale_pos_ptr,
+    marlin_scale_ptr,
+    out_ptr,
+    padded_n,
+    size_n,
+    size_k,
+    K_GROUPS: tl.constexpr,
+    TILE_ELEMS: tl.constexpr,
+):
+    """Program = K_GROUPS consecutive 16-row k groups x one 64-column n group.
+
+    Every 16 x 64 Marlin tile is a contiguous 1 KB span of the packed payload;
+    lanes are ordered n-major / k-minor so that each n row stores 16*K_GROUPS
+    contiguous BF16 values. Scales are gathered from the Marlin scale layout
+    in-kernel (one e8m0 byte per n, per 32-wide k group).
+    """
+    kg = tl.program_id(0)
+    nc = tl.program_id(1)
+    lane = tl.arange(0, TILE_ELEMS)
+    n_local = lane // 16
+    k_in = lane % 16
+    # tile-internal index of (n_local, k_in): [4 n-tiles][16 k][16 n]
+    g = (n_local // 16) * 256 + k_in * 16 + (n_local % 16)
+    src = tl.load(inv_ptr + g)
+    n_global = nc * 64 + n_local
+    n_mask = n_global < size_n
+    scale_pos = tl.load(scale_pos_ptr + n_local)
+    for i in tl.static_range(K_GROUPS):
+        kr = kg * K_GROUPS + i
+        tile_base = kr.to(tl.int64) * (padded_n * 16) + nc * TILE_ELEMS
+        raw = tl.load(packed_ptr + tile_base + src)
+        k_global = kr * 16 + k_in
+        # scale row = 32-wide k group; 16 | 32 so it is constant per tile
+        s_row = (kr // 2).to(tl.int64) * padded_n + nc * 64
+        e8m0 = tl.load(marlin_scale_ptr + s_row + scale_pos, mask=n_mask, other=127)
+        scale = tl.exp2(e8m0.to(tl.float32) - 127.0)
+        val = raw.to(tl.float8e4nv, bitcast=True).to(tl.float32) * scale
+        mask = n_mask & (k_global < size_k)
+        tl.store(
+            out_ptr + n_global.to(tl.int64) * size_k + k_global,
+            val.to(tl.bfloat16),
+            mask=mask,
+        )
+
+
+def reconstruct_bf16_weight_triton(
+    marlin_qweight: torch.Tensor,
+    marlin_scales: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Exact ``[size_n, size_k]`` weight in ``dtype`` with one fused gather kernel."""
+    if dtype != torch.bfloat16:
+        return reconstruct_bf16_weight_torch(
+            marlin_qweight, marlin_scales, size_n, size_k, dtype
+        )
+    padded_n, padded_k = marlin_repacked_nk(marlin_qweight, num_bits=8)
+    inv_weight, _ = _inverse_perms(marlin_qweight.device)
+    out = torch.empty(size_n, size_k, dtype=dtype, device=marlin_qweight.device)
+    packed = marlin_qweight.contiguous().view(torch.uint8).view(-1)
+    scales_u8 = marlin_scales.contiguous().view(torch.uint8).view(-1)
+    k_groups = 4 if (padded_k // GPTQ_MARLIN_TILE) % 4 == 0 else 2
+    grid = (padded_k // GPTQ_MARLIN_TILE // k_groups, padded_n // 64)
+    _marlin_fp8_unrepack_dequant_kernel[grid](
+        packed,
+        inv_weight.to(torch.int32),
+        _scale_inverse_table(marlin_qweight.device),
+        scales_u8,
+        out,
+        padded_n,
+        size_n,
+        size_k,
+        K_GROUPS=k_groups,
+        TILE_ELEMS=1024,
+    )
+    return out
+
+
 def reconstruct_bf16_weight(
     marlin_qweight: torch.Tensor,
     marlin_scales: torch.Tensor,
@@ -96,11 +210,12 @@ def reconstruct_bf16_weight(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     """Exact ``[size_n, size_k]`` weight in ``dtype`` from the Marlin payload."""
-    w = unrepack_marlin_fp8_weight(marlin_qweight, size_n, size_k).to(dtype)
-    s = unrepack_marlin_mxfp8_scales(marlin_scales, size_n, size_k, dtype)
-    # power-of-two scales: the product is exact in bf16/fp16 within range
-    return (w.view(size_n, size_k // MXFP8_GROUP, MXFP8_GROUP) * s.unsqueeze(-1)).view(
-        size_n, size_k
+    if envs.VLLM_MXFP8_HYBRID_RECONSTRUCT == "triton":
+        return reconstruct_bf16_weight_triton(
+            marlin_qweight, marlin_scales, size_n, size_k, dtype
+        )
+    return reconstruct_bf16_weight_torch(
+        marlin_qweight, marlin_scales, size_n, size_k, dtype
     )
 
 
