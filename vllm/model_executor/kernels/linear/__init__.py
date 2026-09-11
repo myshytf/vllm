@@ -120,6 +120,9 @@ from vllm.model_executor.kernels.linear.mxfp8.humming import (
 from vllm.model_executor.kernels.linear.mxfp8.marlin import (
     MarlinMxfp8LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp8.marlin_hybrid import (
+    MarlinMxfp8HybridLinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
     RocmDotScaledMxfp8LinearKernel,
 )
@@ -288,6 +291,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         MarlinFP8ScaledMMLinearKernel,
         MarlinLinearKernel,
         MarlinMxfp8LinearKernel,
+        MarlinMxfp8HybridLinearKernel,
         MarlinNvFp4LinearKernel,
         MarlinMxFp4LinearKernel,
     },
@@ -505,6 +509,7 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
+        MarlinMxfp8HybridLinearKernel,
         EmulationMxfp8LinearKernel,
         HummingMxfp8LinearKernel,
     ],
