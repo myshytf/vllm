@@ -829,3 +829,42 @@ def test_b12x_block_fp8_custom_op_body_uses_forward_context(monkeypatch) -> None
     assert called_packed is packed
     assert called_bias is bias
     torch.testing.assert_close(output, torch.full_like(output, 17.0))
+
+
+def test_mxfp8_kernel_env_override_pins_marlin(
+    monkeypatch, default_vllm_config
+) -> None:
+    """VLLM_MXFP8_LINEAR_KERNEL pins the kernel; --linear-backend stays b12x."""
+    import vllm.model_executor.kernels.linear as linear_mod
+    from vllm.model_executor.kernels.linear.mxfp8.marlin import MarlinMxfp8LinearKernel
+
+    monkeypatch.setattr(linear_mod.current_platform, "_enum", PlatformEnum.CUDA)
+    monkeypatch.setattr(linear_mod, "_get_linear_backend", lambda: "b12x")
+    monkeypatch.setenv("VLLM_MXFP8_LINEAR_KERNEL", "MarlinMxfp8LinearKernel")
+    monkeypatch.setattr(
+        MarlinMxfp8LinearKernel,
+        "is_supported",
+        classmethod(lambda cls, compute_capability=None: (True, None)),
+    )
+    monkeypatch.setattr(
+        MarlinMxfp8LinearKernel,
+        "can_implement",
+        classmethod(lambda cls, config: (True, None)),
+    )
+
+    kernel = init_mxfp8_linear_kernel()
+
+    assert isinstance(kernel, MarlinMxfp8LinearKernel)
+
+
+def test_mxfp8_kernel_env_override_rejects_unknown_name(
+    monkeypatch, default_vllm_config
+) -> None:
+    import vllm.model_executor.kernels.linear as linear_mod
+
+    monkeypatch.setattr(linear_mod.current_platform, "_enum", PlatformEnum.CUDA)
+    monkeypatch.setattr(linear_mod, "_get_linear_backend", lambda: "b12x")
+    monkeypatch.setenv("VLLM_MXFP8_LINEAR_KERNEL", "NoSuchMxfp8Kernel")
+
+    with pytest.raises(ValueError, match="VLLM_MXFP8_LINEAR_KERNEL"):
+        init_mxfp8_linear_kernel()

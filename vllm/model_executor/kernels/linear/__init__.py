@@ -120,6 +120,9 @@ from vllm.model_executor.kernels.linear.mxfp8.humming import (
 from vllm.model_executor.kernels.linear.mxfp8.marlin import (
     MarlinMxfp8LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp8.marlin_hybrid import (
+    MarlinMxfp8HybridLinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
     RocmDotScaledMxfp8LinearKernel,
 )
@@ -288,6 +291,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         MarlinFP8ScaledMMLinearKernel,
         MarlinLinearKernel,
         MarlinMxfp8LinearKernel,
+        MarlinMxfp8HybridLinearKernel,
         MarlinNvFp4LinearKernel,
         MarlinMxFp4LinearKernel,
     },
@@ -505,6 +509,7 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
         FlashInferCutedslMxfp8LinearKernel,
         FlashInferCutlassMxfp8LinearKernel,
         MarlinMxfp8LinearKernel,
+        MarlinMxfp8HybridLinearKernel,
         EmulationMxfp8LinearKernel,
         HummingMxfp8LinearKernel,
     ],
@@ -872,6 +877,31 @@ def init_mxfp8_linear_kernel() -> Mxfp8LinearKernel:
         possible = [B12xMxfp8LinearKernel]
     else:
         possible = _resolve_backend_kernels(possible, "MXFP8")
+
+    # Scoped override: VLLM_MXFP8_LINEAR_KERNEL names one MXFP8 kernel class
+    # (e.g. MarlinMxfp8LinearKernel for W8A16 execution of MXFP8 dense linears)
+    # and pins the MXFP8 selection to it without changing --linear-backend, so
+    # every other kernel choice that keys off the linear backend stays as is.
+    # The named kernel still has to pass is_supported() and can_implement().
+    import os as _os
+
+    mxfp8_kernel_override = _os.environ.get("VLLM_MXFP8_LINEAR_KERNEL", "").strip()
+    if mxfp8_kernel_override:
+        override_pool = _POSSIBLE_MXFP8_KERNELS.get(platform, [])
+        matches = [k for k in override_pool if k.__name__ == mxfp8_kernel_override]
+        if not matches:
+            raise ValueError(
+                f"VLLM_MXFP8_LINEAR_KERNEL={mxfp8_kernel_override!r} names no "
+                "MXFP8 kernel for this platform; known: "
+                f"{[k.__name__ for k in override_pool]}"
+            )
+        logger.info_once(
+            "VLLM_MXFP8_LINEAR_KERNEL pins the MXFP8 GEMM kernel to %s "
+            "(--linear-backend=%s left unchanged for every other layer type)",
+            mxfp8_kernel_override,
+            linear_backend,
+        )
+        possible = matches
 
     failure_reasons = []
     for kernel_cls in possible:
