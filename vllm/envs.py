@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     VLLM_NVFP4_MLA_DYNAMIC_SCALE: bool = False
     VLLM_NVFP4_MLA_SCALES_FILE: str = ""
     VLLM_B12X_ABSORB_BMM: bool = False
+    VLLM_MXFP8_LINEAR_KERNEL: str = ""
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_MLA_CHUNKED_PREFILL_WORKSPACE_SIZE: int = 0
     VLLM_MLA_INTERNAL_CONTEXT_WORKSPACE_SIZE: int = 0
@@ -1181,6 +1182,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Serve MLA absorbed projections directly from the B12X MXFP8 pack.
     "VLLM_B12X_ABSORB_BMM": lambda: bool(int(os.getenv("VLLM_B12X_ABSORB_BMM", "0"))),
+    # Pin the MXFP8 dense-GEMM kernel by class name (e.g. MarlinMxfp8LinearKernel
+    # for W8A16 execution of MXFP8 linears) without changing --linear-backend.
+    # Empty keeps normal selection. Read directly from the environment at
+    # kernel-selection time in vllm/model_executor/kernels/linear/__init__.py.
+    "VLLM_MXFP8_LINEAR_KERNEL": lambda: os.getenv(
+        "VLLM_MXFP8_LINEAR_KERNEL", ""
+    ).strip(),
     # Compute DSpark draft-proposal logits with a rowwise-fp8 copy of the
     # shared target lm_head. Verification is unchanged, so accepted outputs
     # retain target-model semantics. Requires fp8 tensor cores (SM89+).
