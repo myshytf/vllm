@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlockCopy,
     MambaEndpointStateCopy,
     generate_block_hash_extra_keys,
+    request_endpoint_cache_debug,
     request_endpoint_cache_enabled,
     request_endpoint_cache_max_entries,
 )
@@ -1034,6 +1035,29 @@ class KVCacheManager:
         )
         self._endpoint_retained_blocks.append(dst)
         self._endpoint_retained_blocks.extend(retained)
+        if request_endpoint_cache_debug():
+            logger.info(
+                "[endpoint] register req=%s L=%d committed=%d drafts=%d accepted=%d "
+                "accepted_at_endpoint=%d base=%d normalized=%s in_flight=%s "
+                "bias=%d dst=%d conv_src=%s temporal_src=%s groups=%s",
+                req_id,
+                num_tokens,
+                committed,
+                num_draft_tokens,
+                num_accepted,
+                accepted_at_endpoint,
+                base,
+                normalized,
+                in_flight,
+                token_bias,
+                dst.block_id,
+                conv_src_ids,
+                temporal_src_ids,
+                {
+                    gid: (first, [b.block_id for b in blocks])
+                    for gid, (first, blocks) in group_blocks.items()
+                },
+            )
         return True
 
     def take_mamba_endpoint_copies(
@@ -1091,6 +1115,17 @@ class KVCacheManager:
                     continue
                 blocks = self._endpoint_hit_blocks(entry, block_hashes)
                 if blocks is not None:
+                    if request_endpoint_cache_debug():
+                        logger.info(
+                            "[endpoint] hit req=%s L=%d parent_idx=%d prompt=%d "
+                            "aligned_hit=%d blocks=%s",
+                            request.request_id,
+                            num_tokens,
+                            parent_idx,
+                            request.num_tokens,
+                            min_hit_length,
+                            [[b.block_id for b in group] for group in blocks],
+                        )
                     return blocks, num_tokens
         return None
 

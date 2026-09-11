@@ -217,13 +217,24 @@ def request_endpoint_cache_enabled() -> bool:
     """Whether finished requests publish request-endpoint cache entries.
 
     Gated by ``VLLM_K3_REQUEST_ENDPOINT_CACHE`` and switched off, without a
-    restart, by the file named in ``VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE``
-    (the draft must attend over restored KV for an end position to be usable).
+    restart, by the file named in ``VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE``
+    or the one in ``VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE`` (the draft
+    must attend over restored KV for an end position to be usable).
     """
     if not envs.VLLM_K3_REQUEST_ENDPOINT_CACHE:
         return False
-    disable_file = envs.VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE
-    return not (disable_file and os.path.exists(disable_file))
+    for disable_file in (
+        envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE,
+        envs.VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE,
+    ):
+        if disable_file and os.path.exists(disable_file):
+            return False
+    return True
+
+
+def request_endpoint_cache_debug() -> bool:
+    """Whether endpoint registration, hits and worker copies are logged."""
+    return bool(envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG)
 
 
 def request_endpoint_cache_max_entries() -> int:

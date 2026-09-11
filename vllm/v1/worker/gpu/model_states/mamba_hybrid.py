@@ -10,10 +10,12 @@ import torch.nn as nn
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.core.kv_cache_utils import request_endpoint_cache_debug
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
@@ -30,6 +32,29 @@ from vllm.v1.worker.mamba_utils import (
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _page_sig(tensor: torch.Tensor, block: int) -> str:
+    """A cheap fingerprint of one block page for endpoint debugging."""
+    page = tensor[block].float()
+    flat = page.flatten()
+    return (
+        f"sum={page.sum().item():.6e} abs={page.abs().sum().item():.6e} "
+        f"head={[round(v, 5) for v in flat[:3].tolist()]} "
+        f"tail={[round(v, 5) for v in flat[-3:].tolist()]}"
+    )
+
+
+def _bytes_sig(raw: torch.Tensor, dtype: torch.dtype) -> str:
+    """Fingerprint of a raw (uint8) shadow page viewed as ``dtype``."""
+    elem = torch.empty((), dtype=dtype).element_size()
+    usable = raw.numel() // elem * elem
+    page = raw[:usable].view(dtype).float()
+    return (
+        f"sum={page.sum().item():.6e} abs={page.abs().sum().item():.6e} "
+        f"head={[round(v, 5) for v in page[:3].tolist()]} "
+        f"tail={[round(v, 5) for v in page[-3:].tolist()]}"
+    )
 
 
 @dataclass
@@ -130,7 +155,19 @@ class MambaHybridModelState(DefaultModelState):
             )
             self._mamba_group_ids = group_ids
             self._mamba_spec = specs[0]
+            self._first_mamba_layer_name = kv_cache_config.kv_cache_groups[
+                group_ids[0]
+            ].layer_names[0]
         return self._mamba_group_ids, self._mamba_spec
+
+    def _debug_mamba_states(self) -> list[torch.Tensor] | None:
+        """The first recurrent layer's ``[conv_state, temporal_state]``."""
+        name = getattr(self, "_first_mamba_layer_name", None)
+        if name is None:
+            return None
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        attention = forward_context.get(name)
+        return getattr(attention, "kv_cache", None)
 
     def _ensure_align_ctx(
         self,
@@ -287,8 +324,69 @@ class MambaHybridModelState(DefaultModelState):
             rows += 1
         if rows == 0:
             return
+        debug = request_endpoint_cache_debug() and get_tensor_model_parallel_rank() == 0
+        if debug:
+            self._debug_log_endpoint_sources(copies, req_id_to_index, ctx)
         copy_meta = torch.from_numpy(meta[:rows]).to(self.device)
         ctx.run_endpoint_materialize(copy_meta)
+        if debug:
+            torch.cuda.synchronize()
+            states = self._debug_mamba_states()
+            for copy in copies:
+                if states is None or len(states) < 2:
+                    break
+                logger.info(
+                    "[endpoint] materialized req=%s dst=%d conv=%s temporal=%s",
+                    copy.req_id,
+                    copy.dst_block_id,
+                    _page_sig(states[0], copy.dst_block_id),
+                    _page_sig(states[1], copy.dst_block_id),
+                )
+
+    def _debug_log_endpoint_sources(self, copies, req_id_to_index, ctx) -> None:
+        states = self._debug_mamba_states()
+        if states is None or len(states) < 2 or not ctx.is_initialized:
+            return
+        torch.cuda.synchronize()
+        strides = ctx.state_block_strides[:2].tolist()
+        for copy in copies:
+            if copy.from_shadow:
+                req_idx = req_id_to_index.get(copy.req_id)
+                if req_idx is None or not ctx.has_endpoint_shadow:
+                    continue
+                bufs = ctx.shadow_buffers
+                conv_page = bufs[0][req_idx * strides[0] : (req_idx + 1) * strides[0]]
+                slot = req_idx * ctx.shadow_temporal_slots + copy.token_bias
+                temporal_page = bufs[1][slot * strides[1] : (slot + 1) * strides[1]]
+                conv_sig = _bytes_sig(conv_page, states[0].dtype)
+                temporal_sig = _bytes_sig(temporal_page, states[1].dtype)
+                src_desc = f"shadow slot={req_idx} temporal_slot={slot}"
+            else:
+                conv_sig = _page_sig(states[0], copy.conv_src_block_ids[0])
+                temporal_sig = _page_sig(states[1], copy.temporal_src_block_ids[0])
+                src_desc = (
+                    f"blocks conv={copy.conv_src_block_ids[0]} "
+                    f"temporal={copy.temporal_src_block_ids[0]}"
+                )
+            logger.info(
+                "[endpoint] source req=%s %s bias=%d dst=%d conv=%s temporal=%s "
+                "state0=(base=%#x stride=%d) state1=(base=%#x stride=%d) "
+                "shape0=%s stride0=%s shape1=%s stride1=%s",
+                copy.req_id,
+                src_desc,
+                copy.token_bias,
+                copy.dst_block_id,
+                conv_sig,
+                temporal_sig,
+                int(ctx.state_base_addrs[0].item()),
+                int(strides[0]),
+                int(ctx.state_base_addrs[1].item()),
+                int(strides[1]),
+                tuple(states[0].shape),
+                tuple(states[0].stride()),
+                tuple(states[1].shape),
+                tuple(states[1].stride()),
+            )
 
     def prepare_attn(
         self,

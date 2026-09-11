@@ -1402,6 +1402,44 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_cache_block_copies,
                 kv_cache_groups=self.kv_caches_by_group,
             )
+            self._debug_log_recurrent_cow(scheduler_output.kv_cache_block_copies)
+
+    def _debug_log_recurrent_cow(self, copies) -> None:
+        """Endpoint-cache debugging: fingerprint the first recurrent group's
+        copy-on-write source and destination pages after the copies ran."""
+        from vllm.v1.core.kv_cache_utils import request_endpoint_cache_debug
+
+        if not request_endpoint_cache_debug() or self.parallel_config.rank != 0:
+            return
+        from vllm.v1.kv_cache_interface import MambaSpec
+        from vllm.v1.worker.gpu.model_states.mamba_hybrid import _page_sig
+
+        groups = self.kv_cache_config.kv_cache_groups
+        first_mamba = next(
+            (i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)),
+            None,
+        )
+        if first_mamba is None:
+            return
+        entries = self.kv_caches_by_group[first_mamba]
+        if not entries or not isinstance(entries[0], (list, tuple)):
+            return
+        conv_state, temporal_state = entries[0][0], entries[0][1]
+        torch.cuda.synchronize()
+        for copy in copies:
+            if copy.kv_cache_group_id != first_mamba:
+                continue
+            logger.info(
+                "[endpoint] cow group=%d src=%d dst=%d src_conv=%s dst_conv=%s "
+                "src_temporal=%s dst_temporal=%s",
+                first_mamba,
+                copy.src_block_id,
+                copy.dst_block_id,
+                _page_sig(conv_state, copy.src_block_id),
+                _page_sig(conv_state, copy.dst_block_id),
+                _page_sig(temporal_state, copy.src_block_id),
+                _page_sig(temporal_state, copy.dst_block_id),
+            )
 
     def prepare_inputs(
         self,

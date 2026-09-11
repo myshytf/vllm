@@ -266,6 +266,8 @@ if TYPE_CHECKING:
     VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE: str = ""
     VLLM_K3_REQUEST_ENDPOINT_CACHE: bool = False
     VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES: int = 8
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE: str = ""
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG: bool = False
     VLLM_K3_DCP_GATHER_DMA_MIN_ROWS: int = 2048
     VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE: str = ""
     VLLM_DEEP_GEMM_WARMUP: Literal[
@@ -2606,6 +2608,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the KV capacity the endpoint cache can hold back from attention pages.
     "VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES": lambda: int(
         os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES", "8")
+    ),
+    # File whose presence switches request-endpoint registration and lookup
+    # off without a restart (independent of the draft-reuse disable file,
+    # which also applies because the feature needs draft reuse).
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE": lambda: os.getenv(
+        "VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE", ""
+    ),
+    # Log endpoint registration/hit geometry and, on the worker, checksums of
+    # the recurrent-state pages read and written by the endpoint copies.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG", "0"))
     ),
     # Windows with fewer padded local rows than this use the push kernel
     # instead of the copy-engine publisher (one launch and one rendezvous
