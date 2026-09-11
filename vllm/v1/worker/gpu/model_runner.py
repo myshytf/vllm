@@ -1276,6 +1276,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
+        # Finished requests' end states are read from their (still mapped)
+        # request slots, so materialize them before the slots are recycled.
+        if scheduler_output.mamba_endpoint_copies:
+            self.model_state.materialize_request_endpoints(
+                scheduler_output.mamba_endpoint_copies,
+                self.req_states.req_id_to_index,
+            )
         finished_req_ids = scheduler_output.finished_req_ids
         if self.pooling_runner is not None:
             # Preempted docs keep their query-use reservation until rescheduled.
@@ -1394,6 +1401,49 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
                 kv_cache_groups=self.kv_caches_by_group,
+            )
+            self._debug_log_recurrent_cow(scheduler_output.kv_cache_block_copies)
+
+    def _debug_log_recurrent_cow(self, copies) -> None:
+        """Endpoint-cache debugging: fingerprint the first recurrent layer's
+        copy-on-write source and destination pages after the copies ran."""
+        from vllm.v1.core.kv_cache_utils import request_endpoint_cache_debug
+
+        if not request_endpoint_cache_debug() or self.parallel_config.rank != 0:
+            return
+        from vllm.v1.kv_cache_interface import MambaSpec
+        from vllm.v1.worker.gpu.model_states.mamba_hybrid import _page_sig
+
+        groups = self.kv_cache_config.kv_cache_groups
+        first_mamba = next(
+            (i for i, g in enumerate(groups) if isinstance(g.kv_cache_spec, MambaSpec)),
+            None,
+        )
+        if first_mamba is None:
+            return
+        # The group entries are whole-page byte views; the layer holds the
+        # typed conv and temporal views of the same pages.
+        layer = self.compilation_config.static_forward_context.get(
+            groups[first_mamba].layer_names[0]
+        )
+        states = getattr(layer, "kv_cache", None)
+        if states is None or len(states) < 2:
+            return
+        conv_state, temporal_state = states[0], states[1]
+        torch.accelerator.synchronize()
+        for copy in copies:
+            if copy.kv_cache_group_id != first_mamba:
+                continue
+            logger.info(
+                "[endpoint] cow group=%d src=%d dst=%d src_conv=%s dst_conv=%s "
+                "src_temporal=%s dst_temporal=%s",
+                first_mamba,
+                copy.src_block_id,
+                copy.dst_block_id,
+                _page_sig(conv_state, copy.src_block_id),
+                _page_sig(conv_state, copy.dst_block_id),
+                _page_sig(temporal_state, copy.src_block_id),
+                _page_sig(temporal_state, copy.dst_block_id),
             )
 
     def prepare_inputs(

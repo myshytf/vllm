@@ -264,6 +264,12 @@ if TYPE_CHECKING:
     VLLM_K3_DCP_GATHER_PACKED: bool = False
     VLLM_K3_DRAFT_REUSE_RESTORED_KV: bool = False
     VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE: str = ""
+    VLLM_K3_REQUEST_ENDPOINT_CACHE: bool = False
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES: int = 8
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE: str = ""
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG: bool = False
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY: bool = False
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE: str = ""
     VLLM_K3_DCP_GATHER_DMA_MIN_ROWS: int = 2048
     VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE: str = ""
     VLLM_DEEP_GEMM_WARMUP: Literal[
@@ -2590,6 +2596,40 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # geometry chosen at start-up is unaffected.
     "VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE": lambda: os.getenv(
         "VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE", ""
+    ),
+    # Publish every finished request's end state (attention pages, draft
+    # pages and a normalized recurrent state) under a request-endpoint
+    # prefix-cache entry, so the next turn that extends the same sequence
+    # resumes at the last computed token instead of the last hash boundary.
+    # Requires the DFlash draft to reuse restored KV; shares its disable file.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE": lambda: bool(
+        int(os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE", "0"))
+    ),
+    # Upper bound on live request-endpoint entries. Each entry pins one
+    # block id of the shared pool for its recurrent state, so the bound caps
+    # the KV capacity the endpoint cache can hold back from attention pages.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES": lambda: int(
+        os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES", "8")
+    ),
+    # File whose presence switches request-endpoint registration and lookup
+    # off without a restart (independent of the draft-reuse disable file,
+    # which also applies because the feature needs draft reuse).
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE": lambda: os.getenv(
+        "VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE", ""
+    ),
+    # Log endpoint registration/hit geometry and, on the worker, checksums of
+    # the recurrent-state pages read and written by the endpoint copies.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG", "0"))
+    ),
+    # Materialize request-endpoint recurrent states with per-state torch
+    # copies instead of the fused Triton kernel (same results; a fallback
+    # and reference path). The file, when named, enables it while present.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY": lambda: bool(
+        int(os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY", "0"))
+    ),
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE": lambda: os.getenv(
+        "VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE", ""
     ),
     # Windows with fewer padded local rows than this use the push kernel
     # instead of the copy-engine publisher (one launch and one rendezvous
