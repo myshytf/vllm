@@ -178,6 +178,148 @@ def _memcpy_u64_tiled(
 
 
 @triton.jit
+def _copy_mamba_state_addrs(
+    state_idx,
+    conv_src_addr,
+    temporal_src_addr,
+    dst_addr,
+    token_bias,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    # DS conv row metadata. Zero keeps the single-region copy path.
+    state_dim_row_count_ptr,
+    state_dim_row_stride_ptr,
+    tile_idx,
+    COPY_BLOCK_SIZE: tl.constexpr,
+    CONV_STATE_DIM_FIRST: tl.constexpr,
+    TEMPORAL_TILES: tl.constexpr,
+):
+    """Copy one (layer, state-type) mamba state between resolved block
+    addresses (V1 ``get_conv_copy_spec`` / ``get_temporal_copy_spec``
+    semantics):
+    - conv state (conv_width > 0): shift the window by ``token_bias`` tokens,
+      ``conv_src[token_bias:] -> dst[:conv_width - token_bias]``
+    - temporal state: ``temporal_src -> dst`` (the caller resolves the
+      accepted speculative column into ``temporal_src_addr``)
+
+    ``tile_idx`` in ``[0, TEMPORAL_TILES)`` partitions the temporal state's
+    u64 range into ``TEMPORAL_TILES`` contiguous, COPY_BLOCK_SIZE-aligned
+    slices, giving more CTAs to fill the SMs at small batch (multi-MiB
+    temporal copies otherwise leave the GPU under-filled). Conv states are
+    small; only ``tile_idx == 0`` copies them. ``TEMPORAL_TILES == 1`` and
+    ``tile_idx == 0`` reproduces the untiled behavior.
+    """
+    state_elem_size = tl.load(state_elem_sizes_ptr + state_idx)
+    state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
+    conv_width = tl.load(state_conv_widths_ptr + state_idx)
+
+    is_conv_state = conv_width > 0
+
+    if CONV_STATE_DIM_FIRST and is_conv_state:
+        # Conv states are small; only tile 0 does the copy. Higher tiles
+        # early-return so they contribute nothing beyond a bounds check.
+        if tile_idx > 0:
+            return
+        # DS conv layout: state_len is the slide axis; copy per dim row.
+        dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
+        row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
+        offsets = tl.arange(0, COPY_BLOCK_SIZE)
+
+        # Stable row-to-lane ownership makes left shifts memmove-safe while
+        # exposing the dimension rows in parallel. All addresses retain
+        # state_elem_size alignment: tensor strides and token offsets are
+        # measured in whole elements before conversion to bytes.
+        num_dst_tokens = conv_width - token_bias
+        for token_idx in range(0, num_dst_tokens):
+            for row_base in range(0, dim_rows, COPY_BLOCK_SIZE):
+                rows = row_base + offsets
+                mask = rows < dim_rows
+                src_byte_addr = (
+                    conv_src_addr
+                    + rows * row_stride
+                    + (token_idx + token_bias) * state_elem_size
+                )
+                dst_byte_addr = (
+                    dst_addr + rows * row_stride + token_idx * state_elem_size
+                )
+                if state_elem_size == 2:
+                    src_u16 = src_byte_addr.to(tl.pointer_type(tl.uint16))
+                    dst_u16 = dst_byte_addr.to(tl.pointer_type(tl.uint16))
+                    data_u16 = tl.load(src_u16, mask=mask)
+                    tl.store(dst_u16, data_u16, mask=mask)
+                elif state_elem_size == 4:
+                    src_u32 = src_byte_addr.to(tl.pointer_type(tl.uint32))
+                    dst_u32 = dst_byte_addr.to(tl.pointer_type(tl.uint32))
+                    data_u32 = tl.load(src_u32, mask=mask)
+                    tl.store(dst_u32, data_u32, mask=mask)
+                else:
+                    for byte_idx in range(0, state_elem_size):
+                        src_u8 = (src_byte_addr + byte_idx).to(
+                            tl.pointer_type(tl.uint8)
+                        )
+                        dst_u8 = (dst_byte_addr + byte_idx).to(
+                            tl.pointer_type(tl.uint8)
+                        )
+                        data_u8 = tl.load(src_u8, mask=mask)
+                        tl.store(dst_u8, data_u8, mask=mask)
+        return
+
+    if is_conv_state:
+        if tile_idx > 0:
+            return
+        # SD conv: copy conv_src[token_bias:] -> dst[:conv_width - token_bias]
+        token_bytes = state_inner_size * state_elem_size
+        num_dst_tokens = conv_width - token_bias
+
+        # Distinct blocks and exact self-copies cannot have a destructive
+        # overlap, so retain the u64-vectorized single-CTA copy.
+        if conv_src_addr != dst_addr or token_bias == 0:
+            src_addr = conv_src_addr + token_bias.to(tl.int64) * token_bytes
+            copy_size = num_dst_tokens.to(tl.int64) * token_bytes
+            _memcpy_u64_tiled(
+                src_addr,
+                dst_addr,
+                copy_size,
+                tile_idx,
+                COPY_BLOCK_SIZE=COPY_BLOCK_SIZE,
+                NUM_TILES=1,
+            )
+            return
+
+        # Copy tokens from low to high. Each token-sized source and destination
+        # region is disjoint, so same-block left shifts are memmove-safe
+        # without a barrier.
+        for token_idx in range(0, num_dst_tokens):
+            src_token = conv_src_addr + (token_idx + token_bias) * token_bytes
+            dst_token = dst_addr + token_idx * token_bytes
+            _memcpy_u64_tiled(
+                src_token,
+                dst_token,
+                token_bytes,
+                tile_idx,
+                COPY_BLOCK_SIZE=COPY_BLOCK_SIZE,
+                NUM_TILES=1,
+            )
+        return
+
+    # Temporal state: temporal_src -> dst. Body u64 range is partitioned
+    # across TEMPORAL_TILES CTAs to keep the SMs filled at small batch.
+    # Use natural block data size (inner_size * elem_size), NOT
+    # state_block_stride which is the page stride and can exceed the
+    # actual data when the state tensor uses as_strided page padding.
+    copy_size = state_inner_size * state_elem_size
+    _memcpy_u64_tiled(
+        temporal_src_addr,
+        dst_addr,
+        copy_size,
+        tile_idx,
+        COPY_BLOCK_SIZE=COPY_BLOCK_SIZE,
+        NUM_TILES=TEMPORAL_TILES,
+    )
+
+
+@triton.jit
 def _copy_mamba_state_block(
     state_idx,
     bt_row_idx,
@@ -212,20 +354,11 @@ def _copy_mamba_state_block(
       ``state[bt[src_col + token_bias]] -> state[bt[dst_col]]``
 
     The caller owns the decision logic (which columns, whether to copy); this
-    device function only performs the byte copy for the given metadata slot.
-
-    ``tile_idx`` in ``[0, TEMPORAL_TILES)`` partitions the temporal state's
-    u64 range into ``TEMPORAL_TILES`` contiguous, COPY_BLOCK_SIZE-aligned
-    slices, giving more CTAs to fill the SMs at small batch (multi-MiB
-    temporal copies otherwise leave the GPU under-filled). Conv states are
-    small; only ``tile_idx == 0`` copies them. ``TEMPORAL_TILES == 1`` and
-    ``tile_idx == 0`` reproduces the untiled behavior.
+    device function resolves the block-table columns to addresses and
+    delegates the byte copy to ``_copy_mamba_state_addrs``.
     """
     state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
     state_block_stride = tl.load(state_block_strides_ptr + state_idx)
-    state_elem_size = tl.load(state_elem_sizes_ptr + state_idx)
-    state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
-    conv_width = tl.load(state_conv_widths_ptr + state_idx)
 
     # Load the group index for this state, then index into the correct
     # group's block table. Each mamba group has independently allocated
@@ -240,118 +373,207 @@ def _copy_mamba_state_block(
     # and Triton would otherwise do the multiply in int32 and wrap.
     dest_block_id = tl.load(block_table_base + dst_col).to(tl.int64)
     dst_addr = state_base_addr + dest_block_id * state_block_stride
+    # The conv window lives in the source column; the accepted temporal state
+    # in the column ``token_bias`` slots after it (same row, in range for
+    # every state of the request).
+    conv_src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
+    temporal_src_block_id = tl.load(block_table_base + src_col + token_bias).to(
+        tl.int64
+    )
+    conv_src_addr = state_base_addr + conv_src_block_id * state_block_stride
+    temporal_src_addr = state_base_addr + temporal_src_block_id * state_block_stride
 
-    is_conv_state = conv_width > 0
-
-    if CONV_STATE_DIM_FIRST and is_conv_state:
-        # Conv states are small; only tile 0 does the copy. Higher tiles
-        # early-return so they contribute nothing beyond a bounds check.
-        if tile_idx > 0:
-            return
-        # DS conv layout: state_len is the slide axis; copy per dim row.
-        src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
-        dim_rows = tl.load(state_dim_row_count_ptr + state_idx)
-        row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
-        src_block_addr = state_base_addr + src_block_id * state_block_stride
-        offsets = tl.arange(0, COPY_BLOCK_SIZE)
-
-        # Stable row-to-lane ownership makes left shifts memmove-safe while
-        # exposing the dimension rows in parallel. All addresses retain
-        # state_elem_size alignment: tensor strides and token offsets are
-        # measured in whole elements before conversion to bytes.
-        num_dst_tokens = conv_width - token_bias
-        for token_idx in range(0, num_dst_tokens):
-            for row_base in range(0, dim_rows, COPY_BLOCK_SIZE):
-                rows = row_base + offsets
-                mask = rows < dim_rows
-                src_byte_addr = (
-                    src_block_addr
-                    + rows * row_stride
-                    + (token_idx + token_bias) * state_elem_size
-                )
-                dst_byte_addr = (
-                    dst_addr + rows * row_stride + token_idx * state_elem_size
-                )
-                if state_elem_size == 2:
-                    src_u16 = src_byte_addr.to(tl.pointer_type(tl.uint16))
-                    dst_u16 = dst_byte_addr.to(tl.pointer_type(tl.uint16))
-                    data_u16 = tl.load(src_u16, mask=mask)
-                    tl.store(dst_u16, data_u16, mask=mask)
-                elif state_elem_size == 4:
-                    src_u32 = src_byte_addr.to(tl.pointer_type(tl.uint32))
-                    dst_u32 = dst_byte_addr.to(tl.pointer_type(tl.uint32))
-                    data_u32 = tl.load(src_u32, mask=mask)
-                    tl.store(dst_u32, data_u32, mask=mask)
-                else:
-                    for byte_idx in range(0, state_elem_size):
-                        src_u8 = (src_byte_addr + byte_idx).to(
-                            tl.pointer_type(tl.uint8)
-                        )
-                        dst_u8 = (dst_byte_addr + byte_idx).to(
-                            tl.pointer_type(tl.uint8)
-                        )
-                        data_u8 = tl.load(src_u8, mask=mask)
-                        tl.store(dst_u8, data_u8, mask=mask)
-        return
-
-    if is_conv_state:
-        if tile_idx > 0:
-            return
-        # SD conv: copy
-        #   state[bt[src_col], token_bias:] ->
-        #   state[bt[dst_col], :conv_width - token_bias]
-        src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
-        src_block_addr = state_base_addr + src_block_id * state_block_stride
-        token_bytes = state_inner_size * state_elem_size
-        num_dst_tokens = conv_width - token_bias
-
-        # Distinct blocks and exact self-copies cannot have a destructive
-        # overlap, so retain the u64-vectorized single-CTA copy.
-        if src_block_id != dest_block_id or token_bias == 0:
-            src_addr = src_block_addr + token_bias.to(tl.int64) * token_bytes
-            copy_size = num_dst_tokens.to(tl.int64) * token_bytes
-            _memcpy_u64_tiled(
-                src_addr,
-                dst_addr,
-                copy_size,
-                tile_idx,
-                COPY_BLOCK_SIZE=COPY_BLOCK_SIZE,
-                NUM_TILES=1,
-            )
-            return
-
-        # Copy tokens from low to high. Each token-sized source and destination
-        # region is disjoint, so same-block left shifts are memmove-safe
-        # without a barrier.
-        for token_idx in range(0, num_dst_tokens):
-            src_token = src_block_addr + (token_idx + token_bias) * token_bytes
-            dst_token = dst_addr + token_idx * token_bytes
-            _memcpy_u64_tiled(
-                src_token,
-                dst_token,
-                token_bytes,
-                tile_idx,
-                COPY_BLOCK_SIZE=COPY_BLOCK_SIZE,
-                NUM_TILES=1,
-            )
-        return
-
-    # Temporal state: copy state[bt[src_col + token_bias]] -> state[bt[dst_col]]
-    # Body u64 range is partitioned across TEMPORAL_TILES CTAs to keep the
-    # SMs filled at small batch.
-    actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
-    src_addr = state_base_addr + actual_src_block_id * state_block_stride
-    # Use natural block data size (inner_size * elem_size), NOT
-    # state_block_stride which is the page stride and can exceed the
-    # actual data when the state tensor uses as_strided page padding.
-    copy_size = state_inner_size * state_elem_size
-    _memcpy_u64_tiled(
-        src_addr,
+    _copy_mamba_state_addrs(
+        state_idx,
+        conv_src_addr,
+        temporal_src_addr,
         dst_addr,
-        copy_size,
+        token_bias,
+        state_elem_sizes_ptr,
+        state_inner_sizes_ptr,
+        state_conv_widths_ptr,
+        state_dim_row_count_ptr,
+        state_dim_row_stride_ptr,
         tile_idx,
-        COPY_BLOCK_SIZE=COPY_BLOCK_SIZE,
-        NUM_TILES=TEMPORAL_TILES,
+        COPY_BLOCK_SIZE,
+        CONV_STATE_DIM_FIRST,
+        TEMPORAL_TILES,
+    )
+
+
+@triton.jit
+def _snapshot_mamba_state_to_shadow(
+    state_idx,
+    bt_row_idx,
+    src_col,
+    token_bias,
+    shadow_slot,
+    shadow_temporal_slots,
+    block_table_ptrs_ptr,
+    block_table_stride_req,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    shadow_base_addrs_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    state_dim_row_count_ptr,
+    state_dim_row_stride_ptr,
+    tile_idx,
+    COPY_BLOCK_SIZE: tl.constexpr,
+    CONV_STATE_DIM_FIRST: tl.constexpr,
+    TEMPORAL_TILES: tl.constexpr,
+):
+    """Copy a request's committed state into its shadow pages, block-strided
+    pages outside the block tables that only this snapshot writes.
+
+    The conv window of ``src_col`` is copied unshifted (the materialization
+    applies the shift), and the temporal states of the columns ``src_col +
+    t`` for ``t`` in ``[0, token_bias]`` land in the request's temporal
+    shadow slots ``t``, so any acceptance count up to the committed one can
+    be materialized later (a stop inside the accepted tokens keeps fewer).
+    """
+    state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
+    state_block_stride = tl.load(state_block_strides_ptr + state_idx)
+    conv_width = tl.load(state_conv_widths_ptr + state_idx)
+    group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
+    group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
+    block_table_typed = group_base_addr.to(tl.pointer_type(tl.int32))
+    block_table_base = block_table_typed + bt_row_idx * block_table_stride_req
+    shadow_base_addr = tl.load(shadow_base_addrs_ptr + state_idx)
+
+    if conv_width > 0:
+        conv_src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
+        conv_src_addr = state_base_addr + conv_src_block_id * state_block_stride
+        dst_addr = shadow_base_addr + shadow_slot.to(tl.int64) * state_block_stride
+        _copy_mamba_state_addrs(
+            state_idx,
+            conv_src_addr,
+            conv_src_addr,
+            dst_addr,
+            token_bias - token_bias,
+            state_elem_sizes_ptr,
+            state_inner_sizes_ptr,
+            state_conv_widths_ptr,
+            state_dim_row_count_ptr,
+            state_dim_row_stride_ptr,
+            tile_idx,
+            COPY_BLOCK_SIZE,
+            CONV_STATE_DIM_FIRST,
+            TEMPORAL_TILES,
+        )
+        return
+
+    state_elem_size = tl.load(state_elem_sizes_ptr + state_idx)
+    state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
+    copy_size = state_inner_size * state_elem_size
+    slot_base = shadow_slot.to(tl.int64) * shadow_temporal_slots.to(tl.int64)
+    for t in range(0, token_bias + 1):
+        src_block_id = tl.load(block_table_base + src_col + t).to(tl.int64)
+        src_addr = state_base_addr + src_block_id * state_block_stride
+        dst_addr = shadow_base_addr + (slot_base + t) * state_block_stride
+        _memcpy_u64_tiled(
+            src_addr,
+            dst_addr,
+            copy_size,
+            tile_idx,
+            COPY_BLOCK_SIZE=COPY_BLOCK_SIZE,
+            NUM_TILES=TEMPORAL_TILES,
+        )
+
+
+# Per-copy int32 record of ``materialize_mamba_endpoint_kernel``:
+# [from_shadow, req_idx, token_bias, dst_block, conv_src[num_groups],
+#  temporal_src[num_groups]]. ``token_bias`` selects the conv shift and,
+# for a shadow source, the temporal shadow slot; the block-source columns are
+# resolved by the scheduler and carry the temporal slot already.
+ENDPOINT_COPY_META_FIXED = 4
+
+
+@triton.jit(do_not_specialize=["num_copies"])
+def materialize_mamba_endpoint_kernel(
+    copy_meta_ptr,  # int32 [num_copies, copy_meta_stride]
+    copy_meta_stride: tl.int64,
+    shadow_base_addrs_ptr,  # int64 [total_states]; 0 when no shadow exists
+    shadow_temporal_slots,  # temporal shadow slots per request
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    state_dim_row_count_ptr,
+    state_dim_row_stride_ptr,
+    num_copies,
+    NUM_GROUPS: tl.constexpr,
+    COPY_BLOCK_SIZE: tl.constexpr,
+    CONV_STATE_DIM_FIRST: tl.constexpr,
+    TEMPORAL_TILES: tl.constexpr = 1,
+):
+    """Write finished requests' committed recurrent states into pool blocks.
+
+    Grid: (num_copies, num_layers * num_state_types [, TEMPORAL_TILES]). A
+    record reads either the request's shadow pages (``from_shadow``: the
+    unshifted conv window shifted here by ``token_bias`` and temporal shadow
+    slot ``token_bias``) or its own blocks per recurrent group (the conv
+    window of ``conv_src`` shifted by ``token_bias`` and the temporal slot
+    ``temporal_src``), and writes the destination block's page of every
+    recurrent cache group.
+    """
+    copy_idx = tl.program_id(0)
+    state_idx = tl.program_id(1)
+    tile_idx = tl.program_id(2)
+    if copy_idx >= num_copies:
+        return
+
+    meta = copy_meta_ptr + copy_idx * copy_meta_stride
+    from_shadow = tl.load(meta + 0)
+    req_idx = tl.load(meta + 1).to(tl.int64)
+    token_bias = tl.load(meta + 2)
+    dst_block_id = tl.load(meta + 3).to(tl.int64)
+    if dst_block_id < 0:
+        return
+
+    state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
+    state_block_stride = tl.load(state_block_strides_ptr + state_idx)
+    dst_addr = state_base_addr + dst_block_id * state_block_stride
+
+    group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
+    conv_src_block_id = tl.load(meta + 4 + group_idx).to(tl.int64)
+    temporal_src_block_id = tl.load(meta + 4 + NUM_GROUPS + group_idx).to(tl.int64)
+    slot_conv_addr = state_base_addr + conv_src_block_id * state_block_stride
+    slot_temporal_addr = state_base_addr + temporal_src_block_id * state_block_stride
+
+    # Shadow layout: one unshifted conv page per request; temporal pages
+    # ``req_idx * shadow_temporal_slots + t`` for accepted-slot ``t``.
+    shadow_base_addr = tl.load(shadow_base_addrs_ptr + state_idx)
+    shadow_conv_addr = shadow_base_addr + req_idx * state_block_stride
+    shadow_temporal_addr = (
+        shadow_base_addr
+        + (req_idx * shadow_temporal_slots.to(tl.int64) + token_bias.to(tl.int64))
+        * state_block_stride
+    )
+
+    use_shadow = from_shadow != 0
+    conv_src_addr = tl.where(use_shadow, shadow_conv_addr, slot_conv_addr)
+    temporal_src_addr = tl.where(use_shadow, shadow_temporal_addr, slot_temporal_addr)
+
+    _copy_mamba_state_addrs(
+        state_idx,
+        conv_src_addr,
+        temporal_src_addr,
+        dst_addr,
+        token_bias,
+        state_elem_sizes_ptr,
+        state_inner_sizes_ptr,
+        state_conv_widths_ptr,
+        state_dim_row_count_ptr,
+        state_dim_row_stride_ptr,
+        tile_idx,
+        COPY_BLOCK_SIZE,
+        CONV_STATE_DIM_FIRST,
+        TEMPORAL_TILES,
     )
 
 
@@ -564,6 +786,13 @@ def precopy_mamba_align_fused_kernel(
     # TEMPORAL_TILES: see postprocess_mamba_fused_kernel. Default 1 preserves
     # the 2D-grid contract; > 1 requires a 3D grid.
     TEMPORAL_TILES: tl.constexpr = 1,
+    # Request-endpoint shadow: before the boundary decision, copy every
+    # request's committed state into its shadow slot (indexed by req_idx) so
+    # a request that finishes this step keeps a readable state even though
+    # this step overwrites its state slots.
+    shadow_base_addrs_ptr=None,
+    shadow_temporal_slots=1,
+    HAS_SHADOW: tl.constexpr = False,
 ):
     """Pre-copy mamba "align" state across block boundaries.
 
@@ -593,13 +822,42 @@ def precopy_mamba_align_fused_kernel(
 
     src_col = tl.load(src_col_ptr + req_idx)
     dst_col = tl.load(mamba_state_idx_ptr + req_idx)
-    # Fresh state, or still writing the same block: kernels locate the initial
-    # state in-block via num_accepted (preserved when no boundary is crossed),
-    # so there is nothing to copy.
-    if src_col < 0 or src_col == dst_col:
+    # Fresh state: nothing committed yet.
+    if src_col < 0:
         return
 
     token_bias = tl.load(token_bias_ptr + req_idx)
+    if HAS_SHADOW:
+        _snapshot_mamba_state_to_shadow(
+            state_idx,
+            batch_idx,
+            src_col,
+            token_bias,
+            req_idx,
+            shadow_temporal_slots,
+            block_table_ptrs_ptr,
+            block_table_stride_req,
+            state_base_addrs_ptr,
+            state_block_strides_ptr,
+            shadow_base_addrs_ptr,
+            state_elem_sizes_ptr,
+            state_inner_sizes_ptr,
+            state_conv_widths_ptr,
+            state_group_indices_ptr,
+            state_dim_row_count_ptr,
+            state_dim_row_stride_ptr,
+            tile_idx,
+            COPY_BLOCK_SIZE,
+            CONV_STATE_DIM_FIRST,
+            TEMPORAL_TILES,
+        )
+
+    # Still writing the same block: kernels locate the initial state in-block
+    # via num_accepted (preserved when no boundary is crossed), so there is
+    # nothing to migrate.
+    if src_col == dst_col:
+        return
+
     _copy_mamba_state_block(
         state_idx,
         batch_idx,
@@ -762,6 +1020,17 @@ class MambaSpecDecodeGPUContext:
     precopy_src_col_buf: CpuGpuBuffer | None = None
     precopy_token_bias_buf: CpuGpuBuffer | None = None
 
+    # Request-endpoint shadow: one block-strided slot per request state index
+    # for every (layer, state type), written by the fused pre-copy launch and
+    # read by ``materialize_mamba_endpoint_kernel``. ``shadow_base_addrs`` is
+    # all zeros until ``ensure_endpoint_shadow`` allocates the slots.
+    shadow_base_addrs: torch.Tensor | None = None
+    shadow_buffers: list[torch.Tensor] | None = None
+    shadow_num_slots: int = 0
+    # Temporal shadow pages per request: one per speculative state slot, so a
+    # stop inside the accepted tokens can still be materialized.
+    shadow_temporal_slots: int = 1
+
     # Flag to track if metadata has been populated
     is_initialized: bool = False
 
@@ -835,8 +1104,59 @@ class MambaSpecDecodeGPUContext:
             num_draft_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             precopy_src_col_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             precopy_token_bias_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            shadow_base_addrs=torch.zeros(
+                total_states, dtype=torch.int64, device=device
+            ),
             is_initialized=False,
         )
+
+    def ensure_endpoint_shadow(self, num_slots: int) -> None:
+        """Allocate the request-endpoint shadow slots (idempotent).
+
+        Each (layer, state type) gets ``num_slots`` pages with the state
+        tensor's block stride, so the copy kernels address a slot exactly like
+        a pool block. Must run after ``initialize_from_forward_context``.
+        """
+        if self.shadow_buffers is not None:
+            return
+        assert self.is_initialized, "state metadata must be populated first"
+        assert self.shadow_base_addrs is not None
+        device = self.shadow_base_addrs.device
+        strides = self.state_block_strides.tolist()
+        conv_widths = self.state_conv_widths.tolist()
+        temporal_slots = 1
+        if self.aligned_state_indices is not None:
+            temporal_slots = int(self.aligned_state_indices.shape[2])
+        buffers: list[torch.Tensor] = []
+        addrs: list[int] = []
+        total_bytes = 0
+        for stride, conv_width in zip(strides, conv_widths):
+            pages = num_slots * (1 if conv_width > 0 else temporal_slots)
+            nbytes = int(stride) * pages
+            # Slots are zero-initialized so a never-written slot reads as an
+            # all-zero state rather than as stale device memory.
+            buf = torch.zeros(max(nbytes, 1), dtype=torch.uint8, device=device)
+            buffers.append(buf)
+            addrs.append(buf.data_ptr())
+            total_bytes += nbytes
+        self.shadow_base_addrs.copy_(
+            torch.tensor(addrs, dtype=torch.int64, device=device)
+        )
+        self.shadow_buffers = buffers
+        self.shadow_num_slots = num_slots
+        self.shadow_temporal_slots = temporal_slots
+        logger.info(
+            "Request-endpoint recurrent-state shadow: %d slot(s) x %d state(s), "
+            "%d temporal page(s) per slot, %.1f MiB",
+            num_slots,
+            len(strides),
+            temporal_slots,
+            total_bytes / (1 << 20),
+        )
+
+    @property
+    def has_endpoint_shadow(self) -> bool:
+        return self.shadow_buffers is not None
 
     def initialize_from_forward_context(
         self,
@@ -1086,6 +1406,7 @@ class MambaSpecDecodeGPUContext:
         src_col_gpu: torch.Tensor,
         token_bias_gpu: torch.Tensor,
         idx_mapping: torch.Tensor | None,
+        snapshot_to_shadow: bool = False,
     ) -> None:
         """Pre-copy each request's previous running block into its new window
         block before the forward pass (align boundary migration).
@@ -1097,9 +1418,15 @@ class MambaSpecDecodeGPUContext:
             token_bias_gpu: [max_reqs] accepted-token bias (num_accepted - 1).
             idx_mapping: optional [num_reqs] batch_idx -> req_state_idx.
                 None means V1 batch order already equals request state order.
+            snapshot_to_shadow: also copy every request's committed state into
+                its request-endpoint shadow slot (requires
+                ``ensure_endpoint_shadow`` and an ``idx_mapping``).
         """
         if num_reqs == 0 or not self.is_initialized:
             return
+        has_shadow = snapshot_to_shadow and self.shadow_buffers is not None
+        if has_shadow:
+            assert idx_mapping is not None, "shadow slots are indexed by req idx"
         total_states = self.num_layers * self.num_state_types
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
         precopy_mamba_align_fused_kernel[grid](
@@ -1121,6 +1448,42 @@ class MambaSpecDecodeGPUContext:
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=idx_mapping is not None,
+            TEMPORAL_TILES=_TEMPORAL_TILES,
+            shadow_base_addrs_ptr=self.shadow_base_addrs,
+            shadow_temporal_slots=self.shadow_temporal_slots,
+            HAS_SHADOW=has_shadow,
+        )
+
+    def run_endpoint_materialize(self, copy_meta: torch.Tensor) -> None:
+        """Run ``materialize_mamba_endpoint_kernel`` over ``copy_meta``, an
+        int32 ``[num_copies, ENDPOINT_COPY_META_FIXED + 2 * num_groups]``
+        device tensor of per-copy records."""
+        num_copies = int(copy_meta.shape[0])
+        if num_copies == 0 or not self.is_initialized:
+            return
+        assert copy_meta.dtype == torch.int32 and copy_meta.dim() == 2
+        assert copy_meta.shape[1] == ENDPOINT_COPY_META_FIXED + 2 * self.num_groups
+        assert copy_meta.is_contiguous()
+        assert self.shadow_base_addrs is not None
+        total_states = self.num_layers * self.num_state_types
+        grid = (num_copies, total_states, _TEMPORAL_TILES)
+        materialize_mamba_endpoint_kernel[grid](
+            copy_meta,
+            copy_meta.stride(0),
+            self.shadow_base_addrs,
+            self.shadow_temporal_slots,
+            self.state_base_addrs,
+            self.state_block_strides,
+            self.state_elem_sizes,
+            self.state_inner_sizes,
+            self.state_conv_widths,
+            self.state_group_indices,
+            self.state_dim_row_count,
+            self.state_dim_row_stride,
+            num_copies,
+            NUM_GROUPS=self.num_groups,
+            COPY_BLOCK_SIZE=1024,
+            CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
 

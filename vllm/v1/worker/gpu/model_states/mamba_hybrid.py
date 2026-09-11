@@ -7,8 +7,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
@@ -21,10 +23,13 @@ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.mamba_utils import (
+    ENDPOINT_COPY_META_FIXED,
     MambaSpecDecodeGPUContext,
     preprocess_mamba_align_fused_kernel,
 )
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -91,6 +96,10 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
+            # Request-endpoint cache: keep every request's committed state in
+            # a shadow slot so a finished request's state survives the step
+            # that was already in flight when it finished.
+            self._endpoint_shadow = bool(envs.VLLM_K3_REQUEST_ENDPOINT_CACHE)
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -157,6 +166,8 @@ class MambaHybridModelState(DefaultModelState):
                 self.model.get_mamba_state_copy_func(),
                 [block_tables[gid] for gid in mamba_group_ids],
             )
+        if self._endpoint_shadow and not ctx.has_endpoint_shadow:
+            ctx.ensure_endpoint_shadow(self.max_num_reqs)
         return ctx
 
     def preprocess_state(
@@ -206,7 +217,78 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_src_col_gpu,
             self._mamba_src_off_gpu,
             input_batch.idx_mapping,
+            snapshot_to_shadow=self._endpoint_shadow,
         )
+
+    def materialize_request_endpoints(
+        self,
+        copies: list[Any],
+        req_id_to_index: dict[str, int],
+    ) -> None:
+        """Write finished requests' committed states into pool blocks.
+
+        Each ``MambaEndpointStateCopy`` names the destination block and either
+        the request's shadow pages (``from_shadow``; ``token_bias`` selects the
+        conv shift and the temporal slot) or its own state blocks per
+        recurrent group. Runs on the current stream before the finished
+        requests' slots are recycled, so it is ordered after the in-flight
+        step that may have overwritten their state slots and before any
+        consumer's copy-on-write of the destination block.
+        """
+        if not copies or not self._align_mode:
+            return
+        ctx = self._mamba_ctx
+        if ctx is None or not ctx.is_initialized:
+            logger.warning_once(
+                "Request-endpoint copies arrived before the recurrent-state "
+                "context was initialized; %d entr(ies) stay unmaterialized.",
+                len(copies),
+            )
+            return
+        num_groups = ctx.num_groups
+        width = ENDPOINT_COPY_META_FIXED + 2 * num_groups
+        meta = np.full((len(copies), width), -1, dtype=np.int32)
+        rows = 0
+        for copy in copies:
+            req_idx = req_id_to_index.get(copy.req_id)
+            if copy.from_shadow:
+                if req_idx is None or not ctx.has_endpoint_shadow:
+                    logger.warning(
+                        "Request-endpoint copy for %s skipped: shadow source "
+                        "unavailable (slot=%s, shadow=%s)",
+                        copy.req_id,
+                        req_idx,
+                        ctx.has_endpoint_shadow,
+                    )
+                    continue
+                meta[rows, 0] = 1
+                meta[rows, 1] = req_idx
+                meta[rows, 2] = copy.token_bias
+            else:
+                if (
+                    len(copy.conv_src_block_ids) != num_groups
+                    or len(copy.temporal_src_block_ids) != num_groups
+                ):
+                    logger.warning(
+                        "Request-endpoint copy for %s skipped: %d/%d source "
+                        "blocks for %d recurrent groups",
+                        copy.req_id,
+                        len(copy.conv_src_block_ids),
+                        len(copy.temporal_src_block_ids),
+                        num_groups,
+                    )
+                    continue
+                meta[rows, 0] = 0
+                meta[rows, 1] = 0
+                meta[rows, 2] = copy.token_bias
+                meta[rows, 4 : 4 + num_groups] = copy.conv_src_block_ids
+                meta[rows, 4 + num_groups : width] = copy.temporal_src_block_ids
+            meta[rows, 3] = copy.dst_block_id
+            rows += 1
+        if rows == 0:
+            return
+        copy_meta = torch.from_numpy(meta[:rows]).to(self.device)
+        ctx.run_endpoint_materialize(copy_meta)
 
     def prepare_attn(
         self,
