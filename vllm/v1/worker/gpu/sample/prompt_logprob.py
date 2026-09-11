@@ -27,6 +27,28 @@ def _should_capture_kld_batch(req_ids: list[str]) -> bool:
     return not all(req_id.startswith(synthetic_prefixes) for req_id in req_ids)
 
 
+def _kld_capture_batch_is_exclusive(
+    req_ids: list[str], num_prompt_logprob_reqs: int
+) -> bool:
+    """True when the batch holds exactly one request and it wants prompt logprobs.
+
+    The capture writes one request's prefill logits per chunk file, so a batch
+    that mixes the capture request with other requests cannot be attributed.
+    Such a batch is skipped with a warning instead of failing the worker: the
+    capture tool detects the missing rows and fails closed, while the serving
+    engine stays alive.
+    """
+    if len(req_ids) == 1 and num_prompt_logprob_reqs == 1:
+        return True
+    logger.warning(
+        "VLLM_KLD_CAPTURE_DIR: skipping logit capture for a batch of %d requests "
+        "(%d with prompt logprobs); captures need an otherwise idle engine",
+        len(req_ids),
+        num_prompt_logprob_reqs,
+    )
+    return False
+
+
 def _maybe_capture_kld_prompt_logits(
     logits: torch.Tensor,
     *,
@@ -167,12 +189,11 @@ class PromptLogprobsWorker:
         query_start_loc_np = input_batch.query_start_loc_np
 
         logits_capture: Callable[[torch.Tensor, int], None] | None = None
-        if _should_capture_kld_batch(input_batch.req_ids):
-            if len(input_batch.req_ids) != 1 or int(needs_prompt_logprobs.sum()) != 1:
-                raise RuntimeError(
-                    "VLLM_KLD_CAPTURE_DIR requires exactly one prompt-logprob "
-                    "request in the batch"
-                )
+        if _should_capture_kld_batch(
+            input_batch.req_ids
+        ) and _kld_capture_batch_is_exclusive(
+            input_batch.req_ids, int(needs_prompt_logprobs.sum())
+        ):
             req_id = input_batch.req_ids[0]
             capture_start = int(computed_prefill[0])
             capture_rows = int(query_start_loc_np[1] - query_start_loc_np[0])

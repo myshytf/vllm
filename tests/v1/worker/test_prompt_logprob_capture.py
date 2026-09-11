@@ -14,6 +14,14 @@ def test_kld_capture_skips_synthetic_warmup(tmp_path, monkeypatch) -> None:
     assert prompt_logprob._should_capture_kld_batch(["cmpl-real"])
 
 
+def test_kld_capture_requires_exclusive_batch(caplog) -> None:
+    assert prompt_logprob._kld_capture_batch_is_exclusive(["cmpl-a"], 1)
+    # A concurrent request in the batch skips the capture instead of raising.
+    assert not prompt_logprob._kld_capture_batch_is_exclusive(["cmpl-a", "cmpl-b"], 1)
+    assert not prompt_logprob._kld_capture_batch_is_exclusive(["cmpl-a", "cmpl-b"], 2)
+    assert not prompt_logprob._kld_capture_batch_is_exclusive(["cmpl-a"], 0)
+
+
 def test_capture_kld_prompt_logits(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("VLLM_KLD_CAPTURE_DIR", str(tmp_path))
     monkeypatch.setattr(prompt_logprob, "is_global_first_rank", lambda: True)
