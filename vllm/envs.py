@@ -262,6 +262,8 @@ if TYPE_CHECKING:
     VLLM_K3_DCP_GATHER_DMA: bool = False
     VLLM_K3_DCP_GATHER_CLUSTERS: str = ""
     VLLM_K3_DCP_GATHER_PACKED: bool = False
+    VLLM_K3_DRAFT_REUSE_RESTORED_KV: bool = False
+    VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE: str = ""
     VLLM_K3_DCP_GATHER_DMA_MIN_ROWS: int = 2048
     VLLM_K3_DCP_GATHER_DMA_MIN_ROWS_FILE: str = ""
     VLLM_DEEP_GEMM_WARMUP: Literal[
@@ -2574,6 +2576,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # expand them on the receiving GPU with the original BF16 rounding.
     "VLLM_K3_DCP_GATHER_PACKED": lambda: bool(
         int(os.getenv("VLLM_K3_DCP_GATHER_PACKED", "0"))
+    ),
+    # The DFlash draft attends over the draft KV that a prefix-cache hit
+    # restores instead of hiding those tokens, so the target cache no longer
+    # drops the last hash unit of a hit to leave computed context for the
+    # draft: the recurrent checkpoint is published at the prompt's last
+    # hash boundary and warm turns recompute one hash unit less.
+    "VLLM_K3_DRAFT_REUSE_RESTORED_KV": lambda: bool(
+        int(os.getenv("VLLM_K3_DRAFT_REUSE_RESTORED_KV", "0"))
+    ),
+    # When this path exists, new requests hide restored tokens from the draft
+    # again (the previous behavior) without an engine restart. The cache-hit
+    # geometry chosen at start-up is unaffected.
+    "VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE": lambda: os.getenv(
+        "VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE", ""
     ),
     # Windows with fewer padded local rows than this use the push kernel
     # instead of the copy-engine publisher (one launch and one rendezvous

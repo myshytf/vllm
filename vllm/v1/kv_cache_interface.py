@@ -955,7 +955,14 @@ def get_mamba_prefill_checkpoint_position(
     hash_block_size: int,
     drop_eagle_block: bool,
 ) -> int:
-    """Return the reusable recurrent-state boundary for one prefill."""
+    """Return the reusable recurrent-state boundary for one prefill.
+
+    The boundary is the prompt's last hash-unit multiple, one unit lower when
+    the draft's EAGLE last-block drop rewinds every hit. A prompt that ends
+    exactly on a hash boundary publishes that boundary: a later, longer
+    prompt (the usual agentic turn) reuses it, while a same-length replay
+    cannot claim its own final token and falls back to an earlier state.
+    """
     checkpoint_position = num_tokens // hash_block_size * hash_block_size
     if drop_eagle_block:
         checkpoint_position -= hash_block_size
