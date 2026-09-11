@@ -1,9 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import numpy as np
 import torch
 
+from vllm import envs
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+
+
+def draft_reuses_restored_kv() -> bool:
+    """Whether new requests expose cache-restored tokens to the draft.
+
+    Enabled by ``VLLM_K3_DRAFT_REUSE_RESTORED_KV``; the presence of the file
+    named by ``VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE`` turns it off for
+    requests admitted afterwards without restarting the engine.
+    """
+    if not envs.VLLM_K3_DRAFT_REUSE_RESTORED_KV:
+        return False
+    disable_file = envs.VLLM_K3_DRAFT_REUSE_RESTORED_KV_DISABLE_FILE
+    return not (disable_file and os.path.exists(disable_file))
 
 
 class RequestState:
@@ -123,8 +139,13 @@ class RequestState:
         self.num_computed_prefill_tokens[req_idx] = num_computed_tokens
         self.num_computed_tokens_np[req_idx] = num_computed_tokens
         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
-        self.num_cached_tokens.stage_write_elem(req_idx, num_computed_tokens)
-        self.num_cached_tokens_np[req_idx] = num_computed_tokens
+        # Restored tokens are hidden from the draft unless it reuses the draft
+        # KV that came back with the hit (every cache group of a hit, the draft
+        # group included, holds the KV the producing request wrote for these
+        # exact tokens).
+        num_cached_tokens = 0 if draft_reuses_restored_kv() else num_computed_tokens
+        self.num_cached_tokens.stage_write_elem(req_idx, num_cached_tokens)
+        self.num_cached_tokens_np[req_idx] = num_cached_tokens
 
         self.draft_tokens[req_idx].zero_()
 

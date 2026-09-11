@@ -54,7 +54,11 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    MambaSpec,
+    get_mamba_prefill_checkpoint_position,
+)
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -471,17 +475,19 @@ class Scheduler(SchedulerInterface):
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
+        # The partial-tail entry is published where the recurrent manager
+        # keys it: the prompt's reusable hash boundary, one unit lower when
+        # the draft's EAGLE drop rewinds the hit (stopping above it cannot
+        # supply an earlier recurrent state).
         tail_boundary = (
-            request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
+            get_mamba_prefill_checkpoint_position(
+                request.num_prompt_tokens,
+                self.hash_block_size,
+                bool(getattr(self, "use_eagle_for_target_cache", self.use_eagle)),
+            )
             if self.mamba_partial_cache_hit
             else 0
         )
-        if tail_boundary and getattr(
-            self, "use_eagle_for_target_cache", self.use_eagle
-        ):
-            # Publish a recurrent state at the boundary the draft can reuse.
-            # Stopping above it cannot supply an earlier recurrent state.
-            tail_boundary = max(0, tail_boundary - self.hash_block_size)
         stops = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.

@@ -2016,6 +2016,12 @@ def _annotate_eagle_groups(
     spec_config = getattr(vllm_config, "speculative_config", None)
     if spec_config is None or not spec_config.use_eagle():
         return
+    if spec_config.use_dflash() and envs.VLLM_K3_DRAFT_REUSE_RESTORED_KV:
+        # The draft reuses the draft KV restored with a prefix hit, so no
+        # group needs the EAGLE last-block drop that reserves computed
+        # context for it. Leaving every group unflagged keeps target hits,
+        # recurrent checkpoints and chunk stops at the last hash boundary.
+        return
 
     draft_layer_names = {
         layer_name
