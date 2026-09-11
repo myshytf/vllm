@@ -362,9 +362,17 @@ class MambaHybridModelState(DefaultModelState):
             self._debug_log_endpoint_sources(copies, req_id_to_index, ctx)
         if not torch_copy or debug:
             copy_meta = torch.from_numpy(meta[:rows]).to(self.device)
-            ctx.run_endpoint_materialize(copy_meta)
+            trace = None
+            if debug:
+                trace = torch.zeros(
+                    (rows, ctx.num_layers * ctx.num_state_types, 4),
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            ctx.run_endpoint_materialize(copy_meta, trace)
             if debug:
                 torch.accelerator.synchronize()
+                self._debug_log_trace(records, trace)
                 self._debug_log_verification(
                     "kernel", records, layer_states, conv_dim_first
                 )
@@ -375,6 +383,37 @@ class MambaHybridModelState(DefaultModelState):
                 self._debug_log_verification(
                     "torch", records, layer_states, conv_dim_first
                 )
+
+    def _debug_log_trace(
+        self, records: list[EndpointCopyRecord], trace: torch.Tensor | None
+    ) -> None:
+        """Compare the addresses the kernel resolved with the host
+        expectation for every record and state."""
+        ctx = self._mamba_ctx
+        if ctx is None or trace is None:
+            return
+        expected = ctx.expected_endpoint_addresses(records)
+        actual = trace.cpu().tolist()
+        mismatches: list[dict[str, Any]] = []
+        for record_idx, per_state in enumerate(expected):
+            for state_idx, want in enumerate(per_state):
+                got = tuple(actual[record_idx][state_idx])
+                if got != want:
+                    mismatches.append(
+                        {
+                            "record": record_idx,
+                            "state_idx": state_idx,
+                            "kernel": [hex(v) for v in got],
+                            "expected": [hex(v) for v in want],
+                        }
+                    )
+        logger.info(
+            "[endpoint] trace records=%d states=%d address_mismatches=%d first=%s",
+            len(records),
+            len(expected[0]) if expected else 0,
+            len(mismatches),
+            mismatches[0] if mismatches else None,
+        )
 
     def _debug_log_verification(
         self,

@@ -615,6 +615,11 @@ def materialize_mamba_endpoint_kernel(
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr = 1,
+    # Optional address trace: int64 [num_copies, total_states, 4] receiving
+    # (conv source, temporal source, destination, from_shadow) per state.
+    trace_ptr=None,
+    trace_copy_stride=0,
+    HAS_TRACE: tl.constexpr = False,
 ):
     """Write finished requests' committed recurrent states into pool blocks.
 
@@ -663,6 +668,13 @@ def materialize_mamba_endpoint_kernel(
     use_shadow = from_shadow != 0
     conv_src_addr = tl.where(use_shadow, shadow_conv_addr, slot_conv_addr)
     temporal_src_addr = tl.where(use_shadow, shadow_temporal_addr, slot_temporal_addr)
+    if HAS_TRACE:  # noqa: SIM102 (constexpr guard kept separate for Triton)
+        if tile_idx == 0:
+            trace = trace_ptr + copy_idx * trace_copy_stride + state_idx * 4
+            tl.store(trace + 0, conv_src_addr.to(tl.int64))
+            tl.store(trace + 1, temporal_src_addr.to(tl.int64))
+            tl.store(trace + 2, dst_addr.to(tl.int64))
+            tl.store(trace + 3, from_shadow.to(tl.int64))
 
     _copy_mamba_state_addrs(
         state_idx,
@@ -1141,6 +1153,8 @@ class MambaSpecDecodeGPUContext:
     state_block_strides_cpu: list[int] = dataclasses.field(default_factory=list)
     state_conv_widths_cpu: list[int] = dataclasses.field(default_factory=list)
     state_group_indices_cpu: list[int] = dataclasses.field(default_factory=list)
+    state_base_addrs_cpu: list[int] = dataclasses.field(default_factory=list)
+    shadow_base_addrs_cpu: list[int] = dataclasses.field(default_factory=list)
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
@@ -1256,6 +1270,7 @@ class MambaSpecDecodeGPUContext:
         self.shadow_buffers = buffers
         self.shadow_num_slots = num_slots
         self.shadow_temporal_slots = temporal_slots
+        self.shadow_base_addrs_cpu = [int(a) for a in addrs]
         logger.info(
             "Request-endpoint recurrent-state shadow: %d slot(s) x %d state(s), "
             "%d temporal page(s) per slot, %.1f MiB",
@@ -1460,6 +1475,7 @@ class MambaSpecDecodeGPUContext:
         self.state_group_indices_cpu = [
             int(v) for v in self.state_group_indices.tolist()
         ]
+        self.state_base_addrs_cpu = [int(v) for v in self.state_base_addrs.tolist()]
         self.is_initialized = True
 
     def compute_aligned_state_indices(
@@ -1613,10 +1629,15 @@ class MambaSpecDecodeGPUContext:
             HAS_SHADOW=has_shadow,
         )
 
-    def run_endpoint_materialize(self, copy_meta: torch.Tensor) -> None:
+    def run_endpoint_materialize(
+        self, copy_meta: torch.Tensor, trace: torch.Tensor | None = None
+    ) -> None:
         """Run ``materialize_mamba_endpoint_kernel`` over ``copy_meta``, an
         int32 ``[num_copies, ENDPOINT_COPY_META_FIXED + 2 * num_groups]``
-        device tensor of per-copy records."""
+        device tensor of per-copy records. ``trace``, when given, is an
+        int64 ``[num_copies, total_states, 4]`` device tensor that receives
+        the addresses the kernel resolved (conv source, temporal source,
+        destination) and the source kind per state."""
         num_copies = int(copy_meta.shape[0])
         if num_copies == 0 or not self.is_initialized:
             return
@@ -1625,6 +1646,9 @@ class MambaSpecDecodeGPUContext:
         assert copy_meta.is_contiguous()
         assert self.shadow_base_addrs is not None
         total_states = self.num_layers * self.num_state_types
+        if trace is not None:
+            assert trace.dtype == torch.int64 and trace.is_contiguous()
+            assert tuple(trace.shape) == (num_copies, total_states, 4)
         grid = (num_copies, total_states, _TEMPORAL_TILES)
         materialize_mamba_endpoint_kernel[grid](
             copy_meta,
@@ -1644,7 +1668,43 @@ class MambaSpecDecodeGPUContext:
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            trace_ptr=trace,
+            trace_copy_stride=0 if trace is None else trace.stride(0),
+            HAS_TRACE=trace is not None,
         )
+
+    def expected_endpoint_addresses(
+        self, records: list["EndpointCopyRecord"]
+    ) -> list[list[tuple[int, int, int, int]]]:
+        """Per record and state, the (conv source, temporal source,
+        destination, from_shadow) addresses ``materialize_mamba_endpoint_kernel``
+        must resolve, computed on the host from the captured metadata."""
+        total_states = self.num_layers * self.num_state_types
+        out: list[list[tuple[int, int, int, int]]] = []
+        for record in records:
+            per_state: list[tuple[int, int, int, int]] = []
+            for state_idx in range(total_states):
+                base = self.state_base_addrs_cpu[state_idx]
+                stride = self.state_block_strides_cpu[state_idx]
+                group = self.state_group_indices_cpu[state_idx]
+                dst = base + record.dst_block_id * stride
+                if record.from_shadow:
+                    shadow = self.shadow_base_addrs_cpu[state_idx]
+                    conv_src = shadow + record.req_idx * stride
+                    temporal_src = (
+                        shadow
+                        + (
+                            record.req_idx * self.shadow_temporal_slots
+                            + record.token_bias
+                        )
+                        * stride
+                    )
+                else:
+                    conv_src = base + record.conv_src_block_ids[group] * stride
+                    temporal_src = base + record.temporal_src_block_ids[group] * stride
+                per_state.append((conv_src, temporal_src, dst, int(record.from_shadow)))
+            out.append(per_state)
+        return out
 
     def run_fused_postprocess_align(
         self,
