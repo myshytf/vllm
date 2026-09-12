@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import math
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -73,6 +74,14 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import compute_iteration_details, record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# Seconds a waiting request may sit on an unresolved KV-connector lookup
+# (``get_num_new_matched_tokens`` returning ``None``) before it is scheduled
+# without external KV. Bounds the stall a wedged cache server can impose on
+# new requests; a resolved lookup normally takes well under a second.
+_PENDING_LOOKUP_TIMEOUT_S = float(
+    os.environ.get("VLLM_K3_CONNECTOR_LOOKUP_TIMEOUT_S", "30")
+)
 
 
 def use_eagle_for_target_cache(
@@ -240,6 +249,8 @@ class Scheduler(SchedulerInterface):
         # KV Connector: requests in process of async KV loading or recving
         self.finished_recving_kv_req_ids: set[str] = set()
         self.failed_recving_kv_req_ids: set[str] = set()
+        # req_id -> monotonic time its KV-connector lookup was first unresolved.
+        self._lookup_pending_since: dict[str, float] = {}
 
         # Grammar compilation failures to finish as per-request errors in
         # update_from_output.
@@ -893,12 +904,29 @@ class Scheduler(SchedulerInterface):
                             load_kv_async = False
 
                         if ext_tokens is None:
-                            # The request cannot be scheduled because
-                            # the KVConnector couldn't determine
-                            # the number of matched tokens.
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
-                            continue
+                            # The KVConnector has not resolved its lookup yet.
+                            # Wait for it, but not forever: past the deadline
+                            # the request is scheduled as a miss so a stalled
+                            # cache server cannot hold it (and the requests
+                            # queued behind it) indefinitely.
+                            now = time.monotonic()
+                            pending_since = self._lookup_pending_since.setdefault(
+                                request_id, now
+                            )
+                            if now - pending_since <= _PENDING_LOOKUP_TIMEOUT_S:
+                                request_queue.pop_request()
+                                step_skipped_waiting.prepend_request(request)
+                                continue
+                            logger.warning(
+                                "%s: KV connector lookup unresolved after %.0f s; "
+                                "scheduling without external KV.",
+                                request_id,
+                                now - pending_since,
+                            )
+                            request.skip_reading_prefix_cache = True
+                            ext_tokens = 0
+                            load_kv_async = False
+                        self._lookup_pending_since.pop(request_id, None)
 
                         if partial_tail and ext_tokens > partial_tail:
                             # Remote strictly exceeds the full local hit: drop the
@@ -2577,6 +2605,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        self._lookup_pending_since.pop(request.request_id, None)
         self._cache_request_endpoint(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -3157,14 +3186,25 @@ class Scheduler(SchedulerInterface):
 
                 if new_invalid_block_ids:
                     marked_invalid_block = True
-                    request.num_computed_tokens = min(
+                    recompute_boundary = min(
                         invalid_block_boundaries[block_id]
                         for block_id in new_invalid_block_ids
                     )
-                    num_affected_tokens = (
-                        req_num_computed_tokens - request.num_computed_tokens
-                    )
-                    total_affected_tokens += num_affected_tokens
+                    # One load failure is reported by every worker, and the
+                    # reports can arrive over several scheduler steps. An
+                    # earlier report may already have unwound this request
+                    # to a lower boundary; a later one must never advance it
+                    # again, or the request resumes over blocks that were
+                    # never written. Only a lower boundary changes the
+                    # request; otherwise this step's tokens are reverted like
+                    # any other affected request.
+                    if recompute_boundary < req_num_computed_tokens:
+                        request.num_computed_tokens = recompute_boundary
+                        total_affected_tokens += (
+                            req_num_computed_tokens - recompute_boundary
+                        )
+                    else:
+                        request.num_computed_tokens = req_num_computed_tokens
 
                     # Every KV group after the common recomputation boundary
                     # depends on the failed prefix, so collect downstream
