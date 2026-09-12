@@ -30,6 +30,8 @@ Out of scope (extension points, not wired here): prefill context parallelism
 """
 
 import math
+import os
+import re
 import time
 from typing import TYPE_CHECKING, cast
 
@@ -81,6 +83,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.utils import replace_parameter
 from vllm.models.common.ops import fused_q_kv_rmsnorm
+from vllm.models.kimi_k3.nvidia import residual_digest
 from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_decode_q_concat_kv_cache_insert,
     fused_mla_key_concat_ds_mla_insert,
@@ -160,6 +163,16 @@ def _dma_min_rows() -> int:
     return _dma_min_rows_cache[1]
 
 
+def _split_prefill_shares_compute_stream() -> bool:
+    """True when the Kimi-K3 split prefill may run as ubatch 1.
+
+    ``k3_ubatch_prefill`` issues both halves on the step's compute stream
+    (see ``_run_overlapped``), so per-ubatch buffers that are produced and
+    consumed on that stream can be shared between the halves.
+    """
+    return os.getenv("VLLM_K3_UBATCH_PREFILL", "0") == "1"
+
+
 class KimiK3PrefillProjectionWorkspace:
     """Retained output storage for large dense context projections."""
 
@@ -234,10 +247,17 @@ class KimiK3PrefillProjectionWorkspace:
             )
         ubatch_id = dbo_current_ubatch_id()
         if ubatch_id >= self.num_ubatches:
-            raise RuntimeError(
-                f"ubatch {ubatch_id} has no Kimi-K3 prefill projection workspace; "
-                f"configured slots: {self.num_ubatches}"
-            )
+            if _split_prefill_shares_compute_stream():
+                # The Kimi-K3 split prefill (k3_ubatch_prefill) runs both
+                # halves on one compute stream; the context projection is
+                # written and consumed in stream order, so the halves can
+                # share slot 0 without a second 195 MiB buffer.
+                ubatch_id = 0
+            else:
+                raise RuntimeError(
+                    f"ubatch {ubatch_id} has no Kimi-K3 prefill projection "
+                    f"workspace; configured slots: {self.num_ubatches}"
+                )
         return buffer[ubatch_id, :num_tokens]
 
 
@@ -1300,6 +1320,10 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 # The projection and the concat were the last reads of the
                 # gathered planes; the attention reads the packed key.
                 release()
+            # Context-attention inputs, one table row per context chunk.
+            residual_digest.tap("mla.ctx_q", q[chunk.token_slice])
+            residual_digest.tap("mla.ctx_k", k)
+            residual_digest.tap("mla.ctx_v", v)
             attn_output, attn_lse = prefill_backend.run_prefill_context_chunk(
                 chunk=chunk, q=q[chunk.token_slice], k=k, v=v, out=out
             )
@@ -1620,6 +1644,71 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             gathered[..., self.kv_lora_rank :],
         )
 
+    # First half's bf16 keys/values of the split prefill (ubatch 0 writes,
+    # ubatch 1 consumes; both on the compute stream, so one slot suffices).
+    _split_kv_stash: tuple[torch.Tensor, torch.Tensor] | None = None
+    _split_cu_k_cache: dict[tuple[int, int | None], torch.Tensor] = {}
+
+    @classmethod
+    def _split_cu_seqlens_k(cls, k_len: int, device: torch.device) -> torch.Tensor:
+        key = (k_len, device.index)
+        cu = cls._split_cu_k_cache.get(key)
+        if cu is None:
+            cu = torch.tensor([0, k_len], dtype=torch.int32, device=device)
+            cls._split_cu_k_cache[key] = cu
+        return cu
+
+    def _split_naive_check(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_len: int,
+        output_prefill,
+    ) -> None:
+        """Diagnostic (``VLLM_K3_UBATCH_STASH_CHECK=1``): compare the second
+        half's FA4 result over ``[first half | own rows]`` with an fp32
+        softmax attention under the bottom-right causal mask (query row t
+        attends keys ``<= k_len - Q + t``)."""
+        served = (
+            output_prefill[0] if isinstance(output_prefill, tuple) else output_prefill
+        )
+        served = served[..., : self.v_head_dim].float()
+        rows = q.shape[0]
+        scale = float(self.scale)
+        # Row chunks keep the fp32 score tensor small (a whole 2,304 x 4,608
+        # x 11-head chunk is 0.5 GiB, which a fully provisioned production
+        # GPU cannot spare); the reference is exact per chunk.
+        j = torch.arange(k_len, device=q.device)[None, :]
+        kf = k.float()
+        vf = v.float()
+        max_d = torch.zeros((), device=q.device)
+        sum_d = torch.zeros((), device=q.device)
+        sum_x = torch.zeros((), device=q.device)
+        step = 256
+        for start in range(0, rows, step):
+            end = min(start + step, rows)
+            scores = torch.einsum("qhd,khd->hqk", q[start:end].float(), kf) * scale
+            t = torch.arange(start, end, device=q.device)[:, None]
+            scores = scores.masked_fill((j > (k_len - rows) + t)[None], float("-inf"))
+            ref = torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), vf)
+            diff = (served[start:end] - ref).abs()
+            max_d = torch.maximum(max_d, diff.max())
+            sum_d += diff.sum()
+            sum_x += ref.abs().sum()
+            del scores, ref, diff
+        numel = float(served.numel())
+        logger.info(
+            "split naive check %s ub1: FA4 vs fp32 bottom-right max|d| %.3e "
+            "mean|d| %.3e ref mean|x| %.3e rows %d keys %d",
+            getattr(self, "layer_name", "?"),
+            max_d.item(),
+            (sum_d / numel).item(),
+            (sum_x / numel).item(),
+            rows,
+            k_len,
+        )
+
     def _forward_prefill_fused(
         self,
         q: torch.Tensor,
@@ -1728,20 +1817,77 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
             )
 
+        # Split prefill (k3_ubatch_prefill): the chunk's first row half runs
+        # as ubatch 0 and the second as ubatch 1. The second half must see
+        # the first half's keys exactly as the unsplit chunk would (bf16, not
+        # through the fp8 cache), so ubatch 0 stashes its bf16 keys/values
+        # and ubatch 1 attends over [first half | own rows] with the
+        # bottom-right causal mask; its chunked context covers earlier
+        # chunks only (the driver builds that half's MLA metadata with the
+        # chunk start as the computed length).
+        split_k_len = None
+        if getattr(attn_metadata, "k3_split_exact", False):
+            if fp8_prefill:
+                raise RuntimeError(
+                    "Kimi-K3 exact split prefill needs a bf16 prefill query"
+                )
+            # The driver labels each half; the ubatch id is only a fallback
+            # (the sequential mode runs both halves as ubatch 0).
+            ubatch = getattr(attn_metadata, "k3_split_half", None)
+            if ubatch is None:
+                ubatch = dbo_current_ubatch_id()
+            if ubatch == 0:
+                # Own copies: `k` and `v` are per-call allocations, but the
+                # stash outlives this call and must not alias storage the
+                # second half's projections reuse.
+                self._split_kv_stash = (k.clone(), v.clone())
+            elif ubatch == 1:
+                stash = self._split_kv_stash
+                if stash is None:
+                    raise RuntimeError(
+                        "Kimi-K3 exact split prefill: second half has no "
+                        "first-half key/value stash"
+                    )
+                self._split_kv_stash = None
+                stash_k, stash_v = stash
+                k = torch.cat((stash_k, k), dim=0)
+                v = torch.cat((stash_v, v), dim=0)
+                split_k_len = int(k.shape[0])
+
+        residual_digest.tap("mla.q", q)
+        residual_digest.tap("mla.k", k)
+        residual_digest.tap("mla.v", v)
         # When there is no chunked context, backends that honor `out` write the
         # attention result straight into it, avoiding a slice+flatten+copy.
         writes_out = not has_context and prefill.prefill_backend.supports_out()
-        output_prefill = prefill.prefill_backend.run_prefill_new_tokens(
-            q=q,
-            k=k,
-            v=v,
-            return_softmax_lse=has_context,
-            out=(
-                out.view(-1, self.num_local_heads, self.v_head_dim)
-                if writes_out
-                else None
-            ),
+        prefill_out = (
+            out.view(-1, self.num_local_heads, self.v_head_dim) if writes_out else None
         )
+        if split_k_len is not None:
+            backend = prefill.prefill_backend
+            output_prefill = backend._flash_attn_varlen_diff_headdims(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=prefill.query_start_loc,
+                cu_seqlens_k=self._split_cu_seqlens_k(split_k_len, q.device),
+                max_seqlen_q=prefill.max_query_len,
+                max_seqlen_k=split_k_len,
+                softmax_scale=backend.scale,
+                causal=True,
+                return_softmax_lse=has_context,
+                out=prefill_out,
+            )
+            if os.getenv("VLLM_K3_UBATCH_STASH_CHECK", "0") == "1":
+                self._split_naive_check(q, k, v, split_k_len, output_prefill)
+        else:
+            output_prefill = prefill.prefill_backend.run_prefill_new_tokens(
+                q=q,
+                k=k,
+                v=v,
+                return_softmax_lse=has_context,
+                out=prefill_out,
+            )
 
         if has_context:
             suffix_output, suffix_lse = output_prefill
@@ -1753,6 +1899,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             # output aliasing its suffix input, so both padded results never
             # need to be live at the same time.
             out.copy_(suffix_output[..., : self.v_head_dim])
+            residual_digest.tap("mla.new", out)
+            residual_digest.tap("mla.new_lse", suffix_lse.t())
             del output_prefill, suffix_output
             dcp_kv_gather = prefill.chunked_context.dcp_manager
             if self.dcp_world_size > 1 and not (
@@ -1774,6 +1922,8 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             compact_context_output = _reuse_consumed_query_for_context_output(q, out)
             compact_context_output.copy_(context_output[..., : self.v_head_dim])
             del context_output
+            residual_digest.tap("mla.ctx", compact_context_output)
+            residual_digest.tap("mla.ctx_lse", context_lse.t())
             merge_attn_states(
                 output=out,
                 prefix_output=compact_context_output,
@@ -1781,5 +1931,6 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 suffix_output=out,
                 suffix_lse=suffix_lse,
             )
+            residual_digest.tap("mla.merged", out)
         elif not writes_out:
             out.copy_(output_prefill[..., : self.v_head_dim].flatten(start_dim=-2))

@@ -17,6 +17,7 @@ from vllm.config import VllmConfig
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce_in_place,
@@ -107,6 +108,7 @@ from vllm.models.common.ops.sequence_parallel import (
 from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MegaMoEExperts
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.models.kimi_k3.nvidia import l2_prefetch as _l2pf
+from vllm.models.kimi_k3.nvidia import residual_digest
 from vllm.models.kimi_k3.nvidia.kda import KimiK3DeltaAttention
 from vllm.models.kimi_k3.nvidia.latent_moe_runner import (
     LatentMoERunner,
@@ -118,7 +120,7 @@ from vllm.models.kimi_k3.nvidia.mla import (
     KimiK3PrefillProjectionWorkspace,
     MultiHeadLatentAttention,
 )
-from vllm.models.kimi_k3.nvidia.ops import attn_res
+from vllm.models.kimi_k3.nvidia.ops import attn_res, invariant_gemm
 from vllm.models.kimi_k3.nvidia.tp_projection import (
     KIMI_DMA_PAIR_GATHER_MIN_TOKENS,
     gather_kimi_projection_pair_prefill,
@@ -143,6 +145,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
+from vllm.v1.worker.gpu import k3_piecewise_graph
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
 from ..common.mm_preprocess import (
@@ -376,7 +379,10 @@ class KimiMLP(nn.Module):
                 "KimiMLP caller-owned output must not alias the down-projection input"
             )
 
-        torch.mm(x, self.down_proj.weight.t(), out=output)
+        if invariant_gemm.applies_to(x, self.down_proj.weight):
+            invariant_gemm.mm(x, self.down_proj.weight.t(), out=output)
+        else:
+            torch.mm(x, self.down_proj.weight.t(), out=output)
         if self.down_proj.reduce_results and self.down_proj.tp_size > 1:
             output = tensor_model_parallel_all_reduce_in_place(output)
         return output
@@ -717,10 +723,18 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
         prefix: str,
         *,
         gather_output: bool = True,
+        fixed_order_gemm: bool = False,
     ) -> None:
         tp_size = get_tensor_model_parallel_world_size()
         self.logical_output_size = output_size
         self.kimi_gather_output = gather_output
+        # Prefill-size calls take the row-count-invariant GEMM kernel when
+        # the operator enables it (invariant_gemm): for the routed latent
+        # projection (K 7168, N 400 at TP9) cuBLAS picks a split-K kernel
+        # whose result depends on the row count, which breaks the split
+        # prefill's exactness; the other shapes of this class are invariant
+        # on cuBLAS and keep it.
+        self.fixed_order_gemm = fixed_order_gemm
         padded_output_size = kimi_projection_shard_width(output_size, tp_size) * tp_size
         super().__init__(
             input_size,
@@ -732,6 +746,12 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
         )
 
     def forward_local(self, x: torch.Tensor):
+        if (
+            self.fixed_order_gemm
+            and self.bias is None
+            and invariant_gemm.applies_to(x, self.weight)
+        ):
+            return invariant_gemm.mm(x, self.weight.T), None
         return super().forward(x)
 
     def forward(self, x: torch.Tensor):
@@ -757,7 +777,10 @@ class KimiColumnParallelGate(KimiPaddedColumnParallelLinear):
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if x.is_cuda and x.dtype == self.weight.dtype == torch.bfloat16:
-            output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
+            if invariant_gemm.applies_to(x, self.weight):
+                output = invariant_gemm.mm(x, self.weight.T, out_dtype=torch.float32)
+            else:
+                output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
         else:
             output = torch.nn.functional.linear(
                 x.to(self.weight.dtype), self.weight
@@ -1377,6 +1400,7 @@ class KimiMoE(nn.Module):
                     hidden_size,
                     self.moe_hidden_size,
                     prefix=f"{prefix}.routed_expert_down_proj",
+                    fixed_order_gemm=True,
                 )
             else:
                 self.routed_expert_down_proj = ReplicatedLinear(
@@ -2046,6 +2070,7 @@ class KimiDecoderLayer(nn.Module):
                 output=caller_output,
             )
 
+        residual_digest.tap("attn", hidden_states)
         if self.use_sequence_parallel:
             # Add SP padding if needed, and then perform reduce scatter.
             hidden_states = sp_reduce_scatter(hidden_states)
@@ -2059,8 +2084,10 @@ class KimiDecoderLayer(nn.Module):
             hidden_states
         ):
             hidden_states = self.mlp(hidden_states, output=hidden_states)
+            residual_digest.tap("mlp", hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
+            residual_digest.tap("mlp", hidden_states)
         return hidden_states, prefix_sum, residual
 
     def _l2pf_build_plans(self) -> None:
@@ -2420,6 +2447,20 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 shape[2],
             ).permute(1, 0, 2)
             self._attn_res_workspace = workspace
+        # A split prefill runs its second half on another thread with the
+        # same row count; give it the upper half of the reserved rows so the
+        # two halves' block residuals never alias (the reserved workspace
+        # covers the full chunk and the second half is the smaller one).
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+        ubatch = dbo_current_ubatch_id()
+        if ubatch > 0:
+            offset = ubatch * (workspace.size(0) // 2)
+            if offset + shape[0] > workspace.size(0):
+                raise RuntimeError(
+                    "AttnRes workspace too small for the split prefill half"
+                )
+            return workspace[offset : offset + shape[0]]
         return workspace[: shape[0]]
 
     def reserve_attn_res_workspace(self) -> None:
@@ -2581,10 +2622,33 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         else:
             attn_res_scratch = None
 
+        digest = None
+        # Prefill-size forwards only: a decode forward has nothing to digest
+        # and its CUDA-graph capture cannot host the .item() below.
+        if (
+            residual_digest.enabled()
+            and positions.numel() >= residual_digest.BLOCK_ROWS
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            digest = residual_digest.ForwardDigest(
+                self.end_layer - self.start_layer,
+                first_position=int(positions[0].item()),
+                rank=get_tensor_model_parallel_rank(),
+            )
+        # A split prefill may capture a layer's device work as CUDA graphs cut
+        # at its collectives (k3_piecewise_graph). A latent-attention layer's
+        # chunked context pass issues a number of key gathers that follows the
+        # context length, so it is not captured and suspends the recording
+        # around itself. Resolved once per forward: every other forward,
+        # decode included, pays one identity test per layer.
+        piecewise = k3_piecewise_graph.active_session()
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
         ):
+            if piecewise is not None:
+                capturable = not isinstance(layer.self_attn, MultiHeadLatentAttention)
+                piecewise.enter_layer(layer_idx, capturable)
             hidden_states, prefix_sum, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -2592,6 +2656,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                 residual=residual,
                 attn_res_scratch=attn_res_scratch,
             )
+            if piecewise is not None:
+                piecewise.leave_layer(layer_idx, capturable)
+            if digest is not None:
+                digest.add(hidden_states)
             if (layer_idx + 1) in self.aux_hidden_state_layers:
                 if stream_aux_hidden_states and self.use_attn_res:
                     assert prefix_sum is not None
@@ -2611,6 +2679,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     aux_hidden_state = hidden_states + residual
                     aux_hidden_states.append(aux_hidden_state)
 
+        if digest is not None:
+            digest.flush()
         # Rejoin the L2 prefetch side stream (no-op when nothing was issued).
         if _l2pf.ENABLED:
             _l2pf.join_all()

@@ -219,6 +219,108 @@ def _maybe_dump_topk_ids(layer: "RoutedExperts", topk_ids: torch.Tensor) -> None
     )
 
 
+def _moe_split_launch_active() -> bool:
+    """Whether a routed W4A16 prefill call runs as two expert-range launches
+    with a split-prefill hand-off between them: a split half is running and
+    ``VLLM_K3_MOE_SPLIT_LAUNCH=1`` (or the split mode file's ``moesplit=1``).
+    The two launches write disjoint per-route slots of the FC2 buffer (the
+    first launch zeroes it) and one top-k sum reads them all, so the result
+    equals the single launch's bit for bit."""
+    from vllm.v1.worker.ubatching import dbo_enabled
+
+    if not dbo_enabled():
+        return False
+    from vllm.v1.worker.gpu.k3_ubatch_prefill import runtime_option
+
+    value = runtime_option("moesplit")
+    if value is None:
+        value = os.getenv("VLLM_K3_MOE_SPLIT_LAUNCH", "0")
+    return value == "1"
+
+
+def _split_launch_expert_maps(
+    state: "_HybridLayerState",
+) -> tuple[Any, Any] | None:
+    """The secondary tier's route map split into two expert ranges (local
+    experts below and from the midpoint); cached on the layer state."""
+    maps = state.emap_secondary_split
+    if maps is not None:
+        return maps
+    emap = state.emap_secondary
+    if emap is None or int(state.num_secondary) < 2:
+        return None
+    half = (int(state.num_secondary) + 1) // 2
+    minus_one = torch.full_like(emap, -1)
+    first = torch.where((emap >= 0) & (emap < half), emap, minus_one).contiguous()
+    second = torch.where(emap >= half, emap, minus_one).contiguous()
+    maps = (first, second)
+    state.emap_secondary_split = maps
+    return maps
+
+
+def _split_half_scratch(
+    runtime: "_HybridSharedRuntime", scratch: torch.Tensor
+) -> torch.Tensor:
+    """The scratch arena for the running split half: the shared arena for the
+    first half, a second arena of the same shape for the second half."""
+    from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+    if dbo_current_ubatch_id() == 0:
+        return scratch
+    second = runtime.trellis_scratch_second
+    if (
+        second is None
+        or second.numel() < scratch.numel()
+        or second.dtype != scratch.dtype
+        or second.device != scratch.device
+    ):
+        second = torch.empty_like(scratch)
+        runtime.trellis_scratch_second = second
+        logger.info(
+            "split MoE launches: second scratch arena of %.1f MiB allocated",
+            second.numel() * second.element_size() / 2**20,
+        )
+    return second
+
+
+def _run_split_launches(
+    trellis_plan: Any,
+    bind_kwargs: dict[str, Any],
+    state: "_HybridLayerState",
+    maps: tuple[Any, Any],
+) -> torch.Tensor:
+    from b12x.moe import fused_moe
+
+    from vllm.v1.worker.gpu.k3_ubatch_prefill import compute_handoff
+
+    fused_launch, topk_sum_launch = state.trellis_w4a16_prefill_launches or (
+        None,
+        None,
+    )
+    first_map, second_map = maps
+    binding = fused_moe.bind(
+        trellis_plan, **{**bind_kwargs, "route_expert_map": first_map}
+    )
+    binding = dataclasses.replace(
+        binding,
+        fused_launch=fused_launch,
+        topk_sum_launch=topk_sum_launch,
+        skip_topk_sum=True,
+    )
+    fused_moe.run(binding=binding)
+    compute_handoff()
+    binding = fused_moe.bind(
+        trellis_plan, **{**bind_kwargs, "route_expert_map": second_map}
+    )
+    binding = dataclasses.replace(
+        binding,
+        fused_launch=fused_launch,
+        topk_sum_launch=topk_sum_launch,
+        zero_fc2_output_override=False,
+    )
+    return fused_moe.run(binding=binding)
+
+
 def _stack_exl3_intermediate_rotations(
     w13_svh: torch.Tensor,
     w2_suh: torch.Tensor,
@@ -352,6 +454,8 @@ class _HybridSharedRuntime:
         # H128(h * down_suh); this stable buffer receives its inverse transform.
         self.kquant_logical_mid: torch.Tensor | None = None
         self.trellis_scratch: torch.Tensor | None = None
+        # Second scratch arena for the second split-prefill half (split MoE launches).
+        self.trellis_scratch_second: torch.Tensor | None = None
         self.trellis_prefill_scratch: torch.Tensor | None = None
         self.trellis_output: torch.Tensor | None = None
         self.trellis_prefill_input: torch.Tensor | None = None
@@ -393,6 +497,8 @@ class _HybridLayerState:
         # Global -> local id maps, -1 for experts outside the tier.
         self.emap_kept: torch.Tensor | None = None
         self.emap_secondary: torch.Tensor | None = None
+        # Expert-range halves of emap_secondary for the split MoE launches.
+        self.emap_secondary_split: tuple[Any, Any] | None = None
         # (decode_launch, prefill_launch) for the kept tier, set at first apply.
         self.launch_kept: tuple[Any, Any] | None = None
         # MXFP4 kept tier: modular kernel + its weight-holder module and a
@@ -2268,19 +2374,38 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
             )
             if not use_w4a8_prefill:
                 bind_kwargs["route_expert_map"] = state.emap_secondary
-            binding = fused_moe.bind(trellis_plan, **bind_kwargs)
-            if use_w4a16_prefill and state.trellis_w4a16_prefill_launches is not None:
-                # bind() leaves the launch slots empty; without them
-                # run_w4a16_moe re-derives the launch objects on every call.
-                fused_launch, topk_sum_launch = state.trellis_w4a16_prefill_launches
-                binding = dataclasses.replace(
-                    binding,
-                    fused_launch=fused_launch,
-                    topk_sum_launch=topk_sum_launch,
-                )
-            # W4A16 decode emits fp32 while W4A8 prefill emits model dtype;
-            # normalize both contracts for downstream layers.
-            out_trellis = fused_moe.run(binding=binding)[:m]
+            split_maps = (
+                _split_launch_expert_maps(state)
+                if use_w4a16_prefill
+                and not use_w4a8_prefill
+                and _moe_split_launch_active()
+                else None
+            )
+            if split_maps is not None:
+                # Two expert-range launches with a hand-off to the other split
+                # half between them; each half has its own scratch arena so the
+                # per-route FC2 buffer survives the other half's MoE call.
+                bind_kwargs["scratch"] = _split_half_scratch(runtime, trellis_scratch)
+                out_trellis = _run_split_launches(
+                    trellis_plan, bind_kwargs, state, split_maps
+                )[:m]
+            else:
+                binding = fused_moe.bind(trellis_plan, **bind_kwargs)
+                if (
+                    use_w4a16_prefill
+                    and state.trellis_w4a16_prefill_launches is not None
+                ):
+                    # bind() leaves the launch slots empty; without them
+                    # run_w4a16_moe re-derives the launch objects on every call.
+                    fused_launch, topk_sum_launch = state.trellis_w4a16_prefill_launches
+                    binding = dataclasses.replace(
+                        binding,
+                        fused_launch=fused_launch,
+                        topk_sum_launch=topk_sum_launch,
+                    )
+                # W4A16 decode emits fp32 while W4A8 prefill emits model dtype;
+                # normalize both contracts for downstream layers.
+                out_trellis = fused_moe.run(binding=binding)[:m]
             if use_w4a8_prefill:
                 out_trellis = run_w4a8_coupled_outer_transform(
                     out_trellis,

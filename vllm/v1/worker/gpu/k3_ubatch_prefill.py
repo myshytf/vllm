@@ -1,20 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Split one prefill chunk into two row halves and run them as consecutive
 sub-steps (Kimi-K3, eager chunked prefill).
 
 Stage 1 of the TP all-reduce / compute overlap design
-(research/prefill-w4a16-20260902/DESIGN-intra-request-ubatch-prefill-20260902.md):
-the halves run sequentially on the current stream, so every cross-half
-dependency (K/V written by the first half, the recurrent KDA state carried
-in the request's mamba slot) is satisfied by stream order and the outputs
-are the same values the unsplit forward produces. This stage only proves
-the split; the overlap (two streams, yield points at the collectives)
-comes on top of it.
+(research/prefill-w4a16-20260902/DESIGN-intra-request-ubatch-prefill-20260902.md,
+research/prefill-campaign-20260906/r1-split-prefill.md): the halves run
+sequentially on the current stream, so every cross-half dependency is
+satisfied by stream order. Cross-half state and its exactness:
+
+- KDA recurrent/conv state: carried in the request's mamba slot; exact when
+  the boundary is a FlashKDA tile boundary (``SPLIT_ALIGNMENT``).
+- MLA keys of the first half: bf16 stash consumed by the second half
+  (``mla.py``, ``k3_split_exact``); the fp8 cache path is not exact.
+- TP all-reduces: the B12X DMA ring orders its reduction by the row block
+  ``row // (rows / world)``, which depends on the row count, so the halves
+  are not bit-identical to the unsplit chunk unless the ring uses its
+  row-count-invariant granule mapping (``B12X_PCIE_RING_GRANULE_ROWS=g``).
+  With that mapping the boundary must fall on a ``world * g`` row period
+  and the chunk must be a whole number of periods (``split_point``);
+  chunks that are not run whole.
+
+The overlap (two threads, yield points at the collectives) comes on top of
+the split (``_run_overlapped``).
 
 Eligibility: a single request, no draft tokens, eager (non-graph) dispatch,
 at least ``VLLM_K3_UBATCH_PREFILL_MIN_TOKENS`` scheduled tokens, enabled
 with ``VLLM_K3_UBATCH_PREFILL=1``. Anything else runs the normal path.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -30,12 +44,15 @@ from vllm.forward_context import (
     override_forward_context,
     set_forward_context,
 )
+from vllm.logger import init_logger
+from vllm.v1.worker.gpu import k3_piecewise_graph
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
+logger = init_logger(__name__)
 
-_MODE_CACHE: list = [0.0, None]
+_MODE_CACHE: list = [0.0, None, {}]
 
 
 def runtime_mode() -> str | None:
@@ -48,23 +65,48 @@ def runtime_mode() -> str | None:
     ``lockstep`` (hand-offs with the device drained around each),
     ``overlap``, or ``inexact`` (overlap with the second half reading the
     first half through the KV cache instead of the bf16 stash). The file is
-    re-read at most once per second; a missing file leaves the
-    environment-derived behaviour in place.
+    re-read at most once per second. A configured file that is missing,
+    unreadable or empty selects ``off``: the operator switch fails safe to
+    the unsplit chunk rather than to whatever the environment enables.
+
+    Words after the mode are ``key=value`` options read by
+    ``runtime_option``: ``yieldall`` (0/1, hand off at every ring
+    collective) and ``offset`` (hand-offs the first half runs alone).
     """
+    return _read_mode_file()[0]
+
+
+def runtime_option(key: str) -> str | None:
+    """Value of a ``key=value`` word of the mode file, or None."""
+    mode, options = _read_mode_file()
+    if mode is None:
+        return None
+    return options.get(key)
+
+
+def _read_mode_file() -> tuple[str | None, dict[str, str]]:
     path = os.getenv("VLLM_K3_UBATCH_MODE_FILE", "")
     if not path:
-        return None
+        return None, {}
     now = time.time()
     if now - _MODE_CACHE[0] < 1.0:
-        return _MODE_CACHE[1]
+        return _MODE_CACHE[1], _MODE_CACHE[2]
+    options: dict[str, str] = {}
     try:
         with open(path) as fh:
-            mode = fh.read().split()[0].strip().lower()
+            words = fh.read().split()
+        mode = words[0].strip().lower() if words else "off"
+        for word in words[1:]:
+            key, sep, value = word.partition("=")
+            if sep:
+                options[key.strip().lower()] = value.strip()
     except Exception:
-        mode = None
+        mode = "off"
+        options = {}
     _MODE_CACHE[0] = now
     _MODE_CACHE[1] = mode
-    return mode
+    _MODE_CACHE[2] = options
+    return mode, options
 
 
 def ubatch_prefill_enabled() -> bool:
@@ -74,8 +116,37 @@ def ubatch_prefill_enabled() -> bool:
     return os.getenv("VLLM_K3_UBATCH_PREFILL", "0") == "1"
 
 
+def ubatch_prefill_configured() -> bool:
+    """Whether a split may be selected at any point in this process's life:
+    the split is enabled by the environment, or a mode file is configured
+    so an operator can turn it on later. Boot-time preparation (workspace
+    slots for the second half) keys on this rather than on the mode that
+    happens to be selected while the model warms up."""
+    if os.getenv("VLLM_K3_UBATCH_PREFILL", "0") == "1":
+        return True
+    return bool(os.getenv("VLLM_K3_UBATCH_MODE_FILE", ""))
+
+
 def ubatch_prefill_min_tokens() -> int:
     return int(os.getenv("VLLM_K3_UBATCH_PREFILL_MIN_TOKENS", "1024"))
+
+
+def ubatch_prefill_offset() -> int:
+    """``VLLM_K3_UBATCH_OFFSET``: hand-offs the first half performs alone
+    before the second half starts (default 0: the halves alternate from
+    their first collective). With hand-offs at every ring collective, an
+    offset of about half a layer's collectives keeps the two halves in
+    opposite phases (one half's MoE runs while the other half's wide
+    all-reduce is on the ring); the second half then trails the first by
+    that many segments for the whole forward, and the cross-half
+    dependencies (KDA state, MLA key stash) still hold by stream order."""
+    value = runtime_option("offset")
+    if value is None:
+        value = os.getenv("VLLM_K3_UBATCH_OFFSET", "0")
+    try:
+        return max(0, int(value or 0))
+    except ValueError:
+        return 0
 
 
 def ubatch_prefill_overlap() -> bool:
@@ -99,6 +170,88 @@ def _comm_resources(device: torch.device):
     return _COMM_STREAM, _READY_BARRIER
 
 
+_STEP_COUNTER = [0]
+
+
+def record_step(runner, scheduler_output, input_batch) -> None:
+    """Describe the scheduler step about to run for the residual digests
+    (``VLLM_K3_RESIDUAL_DIGEST_DIR``): requests with their computed-token
+    counts, resumptions, blocks to zero, block copies, partial-tail offloads,
+    KV-connector operations and whether the chunk splits. Rank 0 also logs
+    the description so the container log places every digest file in time.
+    Diagnostic only; never raises."""
+    from vllm.models.kimi_k3.nvidia import residual_digest
+
+    if not residual_digest.enabled():
+        return
+    try:
+        so = scheduler_output
+        cached = so.scheduled_cached_reqs
+        conn = getattr(so.kv_connector_metadata, "requests", None) or []
+        meta = {
+            "step": _STEP_COUNTER[0],
+            "rows": int(input_batch.num_tokens),
+            "padded": int(input_batch.num_tokens_after_padding),
+            "reqs": int(input_batch.num_reqs),
+            "prefilling": bool(input_batch.is_prefilling_np[0])
+            if input_batch.num_reqs
+            else None,
+            "computed": [
+                int(v)
+                for v in input_batch.num_computed_tokens_np[: input_batch.num_reqs]
+            ],
+            "new": [
+                (
+                    r.req_id[-12:],
+                    int(r.num_computed_tokens),
+                    [len(b) for b in r.block_ids],
+                )
+                for r in so.scheduled_new_reqs
+            ],
+            "cached": [
+                (
+                    rid[-12:],
+                    int(nct),
+                    rid in cached.resumed_req_ids,
+                    None if nb is None else [len(b) for b in nb],
+                )
+                for rid, nct, nb in zip(
+                    cached.req_ids, cached.num_computed_tokens, cached.new_block_ids
+                )
+            ],
+            "scheduled": {k[-12:]: int(v) for k, v in so.num_scheduled_tokens.items()},
+            "zero_blocks": len(so.new_block_ids_to_zero or []),
+            "block_copies": len(so.kv_cache_block_copies or []),
+            "tail_offloads": {
+                k[-12:]: v for k, v in (so.partial_tail_offloads or {}).items()
+            },
+            "connector": [
+                (
+                    m.request_id[-12:],
+                    m.direction,
+                    int(m.op.start),
+                    int(m.op.end),
+                    int(getattr(m.op, "skip_first_n_tokens", 0) or 0),
+                )
+                for m in conn
+            ],
+            "mode": runtime_mode(),
+            "split": bool(ubatch_prefill_enabled() and eligible(input_batch)),
+        }
+        _STEP_COUNTER[0] += 1
+        residual_digest.set_step_meta(meta)
+        if _tp_rank() == 0:
+            logger.info("[k3 digest step] %s", meta)
+    except Exception as exc:  # diagnostic path only
+        logger.warning("[k3 digest step] description failed: %s", exc)
+
+
+def _tp_rank() -> int:
+    from vllm.distributed import get_tensor_model_parallel_rank
+
+    return get_tensor_model_parallel_rank()
+
+
 def prime_workspaces() -> None:
     """Give the second half its own workspace slots before the manager locks.
 
@@ -109,9 +262,11 @@ def prime_workspaces() -> None:
     indexes past the slot list or hits the growth lock on its first KDA/MLA
     workspace request. Each ubatch-1 lane gets a buffer as large as the
     corresponding ubatch-0 lane after warm-up (sized for the full chunk, so
-    a half fits). No-op when the split is disabled or the slots exist.
+    a half fits). The slots are created whenever a split can be selected
+    later (``ubatch_prefill_configured``), including a boot whose mode file
+    says ``off``; no-op when no split is configured or the slots exist.
     """
-    if not ubatch_prefill_enabled():
+    if not ubatch_prefill_configured():
         return
     from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -130,12 +285,101 @@ def prime_workspaces() -> None:
         )
 
 
+# FlashKDA advances its recurrent state in 16-token tiles and the state at a
+# tile boundary is a bf16 value that the fp32 mamba slot carries losslessly,
+# so a half boundary on a tile boundary hands the second half exactly the
+# state the unsplit chunk holds there. An unaligned boundary would make the
+# kernel re-tile the second half (different intra-tile terms).
+SPLIT_ALIGNMENT = 16
+
+# Granules per ring chunk that the B12X ring accepts before it falls back to
+# the served contiguous mapping (b12x.comm.pcie.pcie_dma.MAX_PIECES): one
+# granule is one copy piece of a reduce-scatter step.
+_RING_MAX_GRANULES_PER_CHUNK = 8
+
+
+def ring_granule_rows() -> int:
+    """Rows per granule of the B12X ring's row-count-invariant chunk mapping.
+
+    ``B12X_PCIE_RING_GRANULE_ROWS=g`` (``g > 0``) makes the ring assign row
+    granules of ``g`` rows round-robin to its ``world`` reduction chunks, so
+    an element's summation order depends only on its position inside a
+    ``world * g`` row period instead of on the tensor's row count. 0 (the
+    default) selects the served contiguous mapping, whose order is
+    row-count-relative.
+    """
+    try:
+        return max(0, int(os.getenv("B12X_PCIE_RING_GRANULE_ROWS", "0") or 0))
+    except ValueError:
+        return 0
+
+
+def _tp_world_size() -> int:
+    from vllm.distributed.parallel_state import (
+        get_tensor_model_parallel_world_size,
+    )
+
+    return int(get_tensor_model_parallel_world_size())
+
+
+def split_point(rows: int, block_rows: int = 0) -> int:
+    """Row index where the second half starts, or 0 to run the chunk whole.
+
+    ``block_rows`` is the row period over which the TP all-reduce's element
+    ordering repeats (``world * granule`` for the ring's row-count-invariant
+    mapping, 0 when the ring orders its reduction relative to the row count).
+
+    With a period, both the chunk and the boundary must be whole multiples of
+    it, because the halves reduce to the same bits as the unsplit chunk only
+    when each half's rows start and end on a period boundary; a chunk that is
+    not a multiple of the period runs whole. Without a period the boundary is
+    rounded up to ``SPLIT_ALIGNMENT`` and the halves' all-reduces differ from
+    the unsplit chunk's whatever the boundary is.
+
+    The first half is the larger one so the second half fits the upper half
+    of the retained AttnRes workspace (see KimiLinearModel).
+    """
+    if rows <= 0:
+        return 0
+    if block_rows <= 0:
+        split = rows - rows // 2
+        split = -(-split // SPLIT_ALIGNMENT) * SPLIT_ALIGNMENT
+        return split if split < rows else 0
+    blocks, tail = divmod(rows, block_rows)
+    if tail or blocks < 2 or blocks > _RING_MAX_GRANULES_PER_CHUNK:
+        return 0
+    return (blocks - blocks // 2) * block_rows
+
+
+def current_split_point(rows: int) -> int:
+    """``split_point`` for the ring this process runs; 0 to run the chunk
+    whole.
+
+    A configured granule whose period cannot be determined (no
+    tensor-parallel group) refuses the split rather than falling back to the
+    row-count-relative boundary: the granule is configured precisely to make
+    the halves reduce like the unsplit chunk.
+    """
+    granule = ring_granule_rows()
+    if granule <= 0:
+        return split_point(rows)
+    try:
+        world = _tp_world_size()
+    except Exception:
+        return 0
+    if world <= 1:
+        return split_point(rows)
+    return split_point(rows, world * granule)
+
+
 def eligible(input_batch: InputBatch) -> bool:
+    rows = input_batch.num_tokens
     return (
         input_batch.num_reqs == 1
         and input_batch.num_draft_tokens == 0
-        and input_batch.num_tokens == input_batch.num_tokens_after_padding
-        and input_batch.num_tokens >= ubatch_prefill_min_tokens()
+        and rows == input_batch.num_tokens_after_padding
+        and rows >= ubatch_prefill_min_tokens()
+        and 0 < current_split_point(rows) < rows
         and bool(input_batch.is_prefilling_np[0])
     )
 
@@ -162,10 +406,12 @@ def _half_batch(
     computed_prefill = input_batch.num_computed_prefill_tokens_np.copy()
     computed_prefill[0] += computed_offset
     seq_len = int(computed[0] + rows)
-    seq_lens = torch.full((input_batch.num_reqs_after_padding,), seq_len,
-                          dtype=torch.int32, device=device)
-    seq_lens_cpu = torch.full((input_batch.num_reqs_after_padding,), seq_len,
-                              dtype=torch.int32)
+    seq_lens = torch.full(
+        (input_batch.num_reqs_after_padding,), seq_len, dtype=torch.int32, device=device
+    )
+    seq_lens_cpu = torch.full(
+        (input_batch.num_reqs_after_padding,), seq_len, dtype=torch.int32
+    )
     qsl_np = np.array([0, rows], dtype=np.int32)
     qsl = torch.from_numpy(qsl_np).to(device, non_blocking=True)
     dcp_local = None
@@ -214,9 +460,9 @@ def run_split_prefill(
     """Run the chunk as two consecutive half forwards; returns the
     concatenated model output in the same form as one forward."""
     rows = input_batch.num_tokens
-    # First half is the larger one so the second half fits the upper half
-    # of the retained AttnRes workspace (see KimiLinearModel).
-    split = rows - rows // 2
+    split = current_split_point(rows)
+    if not 0 < split < rows:
+        raise ValueError(f"{rows} rows do not split (boundary {split})")
     halves = ((0, split), (split, rows))
     outputs = []
     prepared = []
@@ -233,6 +479,11 @@ def run_split_prefill(
     for start, end in halves:
         hb = _half_batch(runner, input_batch, start, end)
         block_tables, slot_mappings = runner.prepare_attn(hb)
+        # The runner computes slot mappings into one persistent buffer and
+        # returns a view of it; both halves are prepared before either runs,
+        # so without a copy the first half would write its keys into the
+        # second half's cache slots and leave its own unwritten.
+        slot_mappings = slot_mappings.clone()
         # The recurrent-state pre-copy reads the request's computed-token
         # count from the GPU request table; the second half starts where the
         # first ended, so hand it a shifted copy instead of the step-start
@@ -243,33 +494,51 @@ def run_split_prefill(
             computed_for_half = num_computed_gpu.clone()
             computed_for_half[req_state_idx] += start
         runner.model_state.preprocess_state(
-            hb, block_tables, runner.kv_cache_config, computed_for_half,
+            hb,
+            block_tables,
+            runner.kv_cache_config,
+            computed_for_half,
         )
         slot_mappings_by_layer = build_slot_mappings_by_layer(
             slot_mappings, runner.kv_cache_config
         )
         attn_metadata = runner.model_state.prepare_attn(
-            hb, cudagraph_runtime_mode, block_tables, slot_mappings,
-            runner.attn_groups, runner.kv_cache_config, for_capture=False,
+            hb,
+            cudagraph_runtime_mode,
+            block_tables,
+            slot_mappings,
+            runner.attn_groups,
+            runner.kv_cache_config,
+            for_capture=False,
         )
+        half_index = 0 if start == 0 else 1
         if exact_mla:
             # Both halves' MLA layers take the exact path: the first half
-            # stashes its bf16 keys, the second consumes them.
+            # stashes its bf16 keys, the second consumes them. The half
+            # index travels in the metadata because the sequential
+            # (single-thread) mode has no ubatch context to read it from.
             for md in attn_metadata.values():
                 if hasattr(md, "prefill") and hasattr(md, "num_decode_tokens"):
                     md.k3_split_exact = True
+                    md.k3_split_half = half_index
         if start > 0 and exact_mla:
             # MLA layers of the second half: context = earlier chunks only;
             # the first half's keys come from the layer's bf16 stash.
             hb_mla = _half_batch(runner, input_batch, start, end, computed_offset=0)
             mla_metadata = runner.model_state.prepare_attn(
-                hb_mla, cudagraph_runtime_mode, block_tables, slot_mappings,
-                runner.attn_groups, runner.kv_cache_config, for_capture=False,
+                hb_mla,
+                cudagraph_runtime_mode,
+                block_tables,
+                slot_mappings,
+                runner.attn_groups,
+                runner.kv_cache_config,
+                for_capture=False,
             )
             merged = dict(attn_metadata)
             for name, md in mla_metadata.items():
                 if hasattr(md, "prefill") and hasattr(md, "num_decode_tokens"):
                     md.k3_split_exact = True
+                    md.k3_split_half = half_index
                     if os.getenv("VLLM_K3_UBATCH_STASH_CHECK", "0") == "1":
                         # Diagnostics (mla.py _split_cache_reference): the
                         # half's cache-path metadata, context through the
@@ -286,7 +555,8 @@ def run_split_prefill(
             attn_metadata = merged
         half_inputs = dict(model_inputs)
         half_inputs["input_ids"] = (
-            None if model_inputs.get("input_ids") is None
+            None
+            if model_inputs.get("input_ids") is None
             else model_inputs["input_ids"][start:end]
         )
         half_inputs["positions"] = model_inputs["positions"][start:end]
@@ -294,9 +564,15 @@ def run_split_prefill(
             half_inputs["inputs_embeds"] = model_inputs["inputs_embeds"][start:end]
         half_inputs.update(runner.model_state.prepare_inputs(hb, runner.req_states))
         prepared.append((hb, attn_metadata, slot_mappings_by_layer, half_inputs))
+    # Leave the runner's persistent slot-mapping and block-table buffers
+    # holding the whole batch's mappings again: consumers later in the step
+    # (the draft speculator, connector-driven copies) read them as the
+    # mapping of the scheduled tokens, not of the last prepared half.
+    runner.prepare_attn(input_batch)
 
     if not ubatch_prefill_overlap():
-        for hb, attn_metadata, slot_mappings_by_layer, half_inputs in prepared:
+        for half_index, item in enumerate(prepared):
+            hb, attn_metadata, slot_mappings_by_layer, half_inputs = item
             with set_forward_context(
                 attn_metadata,
                 runner.vllm_config,
@@ -310,10 +586,15 @@ def run_split_prefill(
                 skip_compiled=skip_compiled,
                 is_padding=hb.is_padding,
             ):
-                outputs.append(runner.model(**half_inputs))
+                outputs.append(
+                    _run_half(
+                        runner, half_index, hb, half_inputs, slot_mappings_by_layer
+                    )
+                )
     else:
-        outputs = _run_overlapped(runner, prepared, cudagraph_runtime_mode,
-                                  batch_descriptor, skip_compiled)
+        outputs = _run_overlapped(
+            runner, prepared, cudagraph_runtime_mode, batch_descriptor, skip_compiled
+        )
     first = outputs[0]
     if isinstance(first, tuple):
         hidden = torch.cat([o[0] for o in outputs], dim=0)
@@ -323,8 +604,45 @@ def run_split_prefill(
     return torch.cat(outputs, dim=0)
 
 
-def _run_overlapped(runner, prepared, cudagraph_runtime_mode, batch_descriptor,
-                    skip_compiled):
+def _run_half(runner, half_index, hb, half_inputs, slot_mappings_by_layer):
+    """Run one half, through its recorded piece graphs when they exist.
+
+    Without ``VLLM_K3_PREFILL_PIECEWISE_GRAPH`` this is the plain forward.
+    With it, the first eligible chunk captures the half's device work between
+    its collectives and every later chunk of the same row count replays the
+    capture; the per-chunk tensors the capture baked in are watched, so a
+    chunk whose metadata moved falls back to the eager forward instead of
+    reading the previous chunk's addresses.
+    """
+    session = k3_piecewise_graph.session_for(
+        half_index, hb.num_tokens, hb.query_start_loc.device
+    )
+    if session is None:
+        return runner.model(**half_inputs)
+    inputs = {
+        name: half_inputs[name]
+        for name in ("input_ids", "positions", "inputs_embeds")
+        if half_inputs.get(name) is not None
+    }
+    watch = {"query_start_loc": hb.query_start_loc, "seq_lens": hb.seq_lens}
+    for layer_name, mapping in (slot_mappings_by_layer or {}).items():
+        watch[f"slot_mapping:{layer_name}"] = mapping
+    try:
+        with k3_piecewise_graph.half_region(session, inputs, watch) as bound:
+            if bound is None:
+                return session.output
+            session.output = runner.model(**{**half_inputs, **bound})
+            return session.output
+    except k3_piecewise_graph.PlanMismatch:
+        # The driver has disabled itself and said why; this chunk still owes
+        # an answer, and the eager path is unaffected by the abandoned
+        # capture (it executed nothing).
+        return runner.model(**half_inputs)
+
+
+def _run_overlapped(
+    runner, prepared, cudagraph_runtime_mode, batch_descriptor, skip_compiled
+):
     """Two threads, one per half, alternating at every TP all-reduce.
 
     Both halves compute on the current (compute) stream in CPU-issue order,
@@ -359,6 +677,7 @@ def _run_overlapped(runner, prepared, cudagraph_runtime_mode, batch_descriptor,
         forward_contexts=forward_contexts,
         ready_barrier=ready_barrier,
     )
+    _install_offset_handoff(ctxs, ubatch_prefill_offset())
     results: list = []
     errors: list = []
 
@@ -372,6 +691,12 @@ def _run_overlapped(runner, prepared, cudagraph_runtime_mode, batch_descriptor,
             torch.cuda.set_stream(compute_stream)
             with ctx:
                 out = runner.model(**half_inputs)
+                # This half makes no more hand-offs; the other half's later
+                # yields must return at once instead of waiting for a signal
+                # that would never come.
+                for other in ctxs:
+                    if other is not ctx:
+                        other._k3_partner_done = True  # type: ignore[attr-defined]
             results.append((ctx.id, out))
         except BaseException as exc:  # surfaced after join
             import traceback
@@ -379,7 +704,10 @@ def _run_overlapped(runner, prepared, cudagraph_runtime_mode, batch_descriptor,
             from vllm.logger import init_logger
 
             init_logger(__name__).error(
-                "split-prefill half %d failed: %s\n%s", ctx.id, exc, traceback.format_exc()
+                "split-prefill half %d failed: %s\n%s",
+                ctx.id,
+                exc,
+                traceback.format_exc(),
             )
             errors.append(exc)
             ctx.cpu_signal_event.set()
@@ -411,6 +739,54 @@ def _run_overlapped(runner, prepared, cudagraph_runtime_mode, batch_descriptor,
     return [out for _, out in sorted(results, key=lambda r: r[0])]
 
 
+def compute_handoff() -> None:
+    """Hand the CPU to the other split half without a collective, so the
+    other half's next segment is queued on the compute stream before this
+    half continues (a routed MoE call issued as two expert-range launches
+    yields between them). No-op outside a split half."""
+    from vllm.v1.worker import ubatching
+
+    if not ubatching.dbo_enabled():
+        return
+    ctx = ubatching._CURRENT_CONTEXTS[ubatching.dbo_current_ubatch_id()]
+    if ctx is None:
+        return
+    ctx._cpu_yield()
+
+
+def _install_offset_handoff(ctxs, offset: int) -> None:
+    """Give the ubatch contexts the split prefill's hand-off rules.
+
+    The first half skips its first ``offset`` hand-offs (it runs ahead and
+    the second half starts at the first real hand-off), and a half whose
+    partner has finished its forward no longer waits at a hand-off. Both
+    halves issue the same sequence of collectives, so the resulting order
+    of ring ops is the same on every rank.
+    """
+    import types
+
+    from vllm import forward_context as _fc
+    from vllm.utils.torch_utils import current_stream as _cs
+
+    def _cpu_yield(self):
+        if self._k3_skip > 0:
+            self._k3_skip -= 1
+            return
+        if self._k3_partner_done:
+            return
+        assert _fc._forward_context == self.forward_context
+        assert _cs() == self.current_stream
+        self.cpu_signal_event.set()
+        self.cpu_wait_event.wait()
+        self.cpu_wait_event.clear()
+        self._restore_context()
+
+    for ctx in ctxs:
+        ctx._k3_skip = offset if ctx.id == 0 else 0
+        ctx._k3_partner_done = False
+        ctx._cpu_yield = types.MethodType(_cpu_yield, ctx)
+
+
 def _join_with_watchdog(threads, runner) -> None:
     """Join the half threads; if they do not finish within
     ``VLLM_K3_UBATCH_WATCHDOG_S`` seconds (0 = off), log this rank's
@@ -429,7 +805,7 @@ def _join_with_watchdog(threads, runner) -> None:
 
     logger = init_logger(__name__)
     deadline = time.time() + timeout
-    reported = 0
+    reported = 0.0
     while any(th.is_alive() for th in threads):
         for th in threads:
             th.join(timeout=0.5)
@@ -441,12 +817,16 @@ def _join_with_watchdog(threads, runner) -> None:
                 fr = frames.get(th.ident)
                 if fr is not None:
                     stacks.append(
-                        f"{th.name}: " + " <- ".join(
-                            f"{f.name}:{f.lineno}" for f in traceback.extract_stack(fr)[-6:]
+                        f"{th.name}: "
+                        + " <- ".join(
+                            f"{f.name}:{f.lineno}"
+                            for f in traceback.extract_stack(fr)[-6:]
                         )
                     )
             logger.error(
                 "split-prefill watchdog (rank %s): %s | %s",
-                getattr(runner, "rank", "?"), _UbatchTrace.report(), " || ".join(stacks),
+                getattr(runner, "rank", "?"),
+                _UbatchTrace.report(),
+                " || ".join(stacks),
             )
     _UbatchTrace.reset()
