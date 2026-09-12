@@ -116,8 +116,9 @@ def _ubatch_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     _UbatchTrace.end(token)
     if lockstep:
         torch.cuda.synchronize()
-    if input_.shape[-1] >= _ubatch_yield_min_cols() or _ubatch_yield_option(
-        "yieldnarrow"
+    cols = input_.shape[-1]
+    if cols >= _ubatch_yield_min_cols() or (
+        _ubatch_yield_option("yieldnarrow") and cols >= _ubatch_yield_tiny_max_cols()
     ):
         dbo_yield_and_switch_from_comm_to_compute()
     else:
@@ -141,6 +142,15 @@ def _ubatch_yield_min_cols() -> int:
     import os
 
     return int(os.getenv("VLLM_K3_UBATCH_YIELD_MIN_COLS", "7168") or 0)
+
+
+def _ubatch_yield_tiny_max_cols() -> int:
+    """Collectives narrower than this never yield even under ``yieldnarrow``
+    (default 1024: a scalar or per-row statistic all-reduce has nothing to
+    hide and a hand-off there only costs a thread switch)."""
+    import os
+
+    return int(os.getenv("VLLM_K3_UBATCH_YIELD_TINY_MAX_COLS", "1024") or 0)
 
 
 def _ubatch_yield_all() -> bool:

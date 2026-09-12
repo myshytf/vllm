@@ -739,6 +739,21 @@ def _run_overlapped(
     return [out for _, out in sorted(results, key=lambda r: r[0])]
 
 
+def compute_handoff() -> None:
+    """Hand the CPU to the other split half without a collective, so the
+    other half's next segment is queued on the compute stream before this
+    half continues (a routed MoE call issued as two expert-range launches
+    yields between them). No-op outside a split half."""
+    from vllm.v1.worker import ubatching
+
+    if not ubatching.dbo_enabled():
+        return
+    ctx = ubatching._CURRENT_CONTEXTS[ubatching.dbo_current_ubatch_id()]
+    if ctx is None:
+        return
+    ctx._cpu_yield()
+
+
 def _install_offset_handoff(ctxs, offset: int) -> None:
     """Give the ubatch contexts the split prefill's hand-off rules.
 
