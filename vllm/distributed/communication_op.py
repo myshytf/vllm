@@ -39,7 +39,11 @@ class _UbatchTrace:
         start = torch.cuda.Event()
         start.record(torch.cuda.current_stream())
         rec = [
-            threading.get_ident(), tuple(shape), start, None, __import__("time").time()
+            threading.get_ident(),
+            tuple(shape),
+            start,
+            None,
+            __import__("time").time(),
         ]
         with cls.lock:
             cls.records.setdefault(threading.get_ident(), []).append(rec)
@@ -98,10 +102,9 @@ def _ubatch_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """
     from vllm.v1.worker.ubatching import (
         dbo_switch_to_comm_sync,
+        dbo_switch_to_compute_sync,
         dbo_yield_and_switch_from_comm_to_compute,
     )
-
-    from vllm.v1.worker.ubatching import dbo_switch_to_compute_sync
 
     lockstep = _ubatch_lockstep()
     snapshot = input_.clone()
@@ -113,14 +116,17 @@ def _ubatch_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     _UbatchTrace.end(token)
     if lockstep:
         torch.cuda.synchronize()
-    if input_.shape[-1] >= _ubatch_yield_min_cols():
+    if input_.shape[-1] >= _ubatch_yield_min_cols() or _ubatch_yield_option(
+        "yieldnarrow"
+    ):
         dbo_yield_and_switch_from_comm_to_compute()
     else:
         # Narrow collectives (the latent all-reduce sits between the MoE and
         # a short up-projection) stay on the comm stream but hand the CPU
-        # straight back: the other half's MoE is already queued on the
-        # compute stream, so yielding here would only leave this half's
-        # final all-reduce nothing long to hide behind.
+        # straight back: with hand-offs at the wide all-reduces only, the
+        # other half's MoE is already queued on the compute stream, so
+        # yielding here would leave this half's final all-reduce nothing
+        # long to hide behind. ``VLLM_K3_UBATCH_YIELD_ALL`` yields here too.
         dbo_switch_to_compute_sync()
     if lockstep:
         torch.cuda.synchronize()
@@ -135,6 +141,55 @@ def _ubatch_yield_min_cols() -> int:
     import os
 
     return int(os.getenv("VLLM_K3_UBATCH_YIELD_MIN_COLS", "7168") or 0)
+
+
+def _ubatch_yield_all() -> bool:
+    """``VLLM_K3_UBATCH_YIELD_ALL=1``: a split half hands the CPU to the
+    other half at every ring collective (the narrow latent all-reduce, the
+    reduce-scatter, the projection gather pair and any all-gather), not only
+    at the two wide all-reduces of a layer. Every collective then has the
+    other half's next compute segment queued ahead of this half's wait on
+    it, so the ring keeps working while the compute stream is busy and the
+    compute stream is not blocked behind a collective it does not need yet.
+    Both halves issue the same sequence of collectives, so the ring sees
+    the same op order on every rank. The mode file's ``yieldall=0|1`` word
+    overrides the environment."""
+    import os
+
+    from vllm.v1.worker.gpu.k3_ubatch_prefill import runtime_option
+
+    value = runtime_option("yieldall")
+    if value is None:
+        value = os.getenv("VLLM_K3_UBATCH_YIELD_ALL", "0")
+    return value == "1"
+
+
+def _ubatch_yield_option(name: str) -> bool:
+    """One of the yield-all hand-off points, individually switchable through
+    the mode file: ``yieldnarrow`` (all-reduces narrower than the wide
+    threshold), ``yieldring`` (ring reduce-scatter, gather pair and
+    all-gather) and ``yielddefer`` (the gather pair yields without ordering
+    the compute stream after it). Each defaults to the ``yieldall`` value."""
+    from vllm.v1.worker.gpu.k3_ubatch_prefill import runtime_option
+
+    value = runtime_option(name)
+    if value is None:
+        return _ubatch_yield_all()
+    return value == "1"
+
+
+def _dbo_yield_and_switch_to_compute_no_wait() -> None:
+    """Yield after a comm-stream collective and resume on the compute stream
+    without ordering the compute stream after the collective; the caller
+    orders its consumer after the collective's own completion event."""
+    from vllm.v1.worker import ubatching
+
+    ctx = ubatching._CURRENT_CONTEXTS[ubatching.dbo_current_ubatch_id()]
+    assert ctx is not None
+    assert ubatching.current_stream() == ctx.comm_stream
+    ctx._signal_comm_done()
+    ctx._cpu_yield()
+    ctx.update_stream(ctx.compute_stream)
 
 
 def _ubatch_lockstep() -> bool:
@@ -245,7 +300,9 @@ def tensor_model_parallel_is_borrowed_storage(tensor: torch.Tensor) -> bool:
     return get_tp_group().is_borrowed_reduction_storage(tensor)
 
 
-def _ubatch_ring_call(fn, inputs: tuple[torch.Tensor, ...]):
+def _ubatch_ring_call(
+    fn, inputs: tuple[torch.Tensor, ...], *, deferred_wait: bool = False
+):
     """Issue a ring collective of one split half on the comm stream.
 
     The DMA ring shares its scratch, side streams and replay entries between
@@ -258,14 +315,23 @@ def _ubatch_ring_call(fn, inputs: tuple[torch.Tensor, ...]):
     stream (they may live in runtime buffers the other half reuses), the op
     runs on the comm stream, ``fn`` copies entry-owned results into fresh
     comm-stream tensors, and the compute stream is made to wait for them.
-    The CPU is not yielded: the caller consumes the result at once.
+    Without ``VLLM_K3_UBATCH_YIELD_ALL`` the CPU is not yielded: the caller
+    consumes the result at once. With it the half yields after issuing the
+    op, like the wide all-reduces. ``deferred_wait`` (yield-all only) skips
+    the compute-stream wait on resume and returns ``(result, keepalive)``:
+    the caller orders its consumer after the op's completion event itself
+    and keeps ``keepalive`` (the input snapshots) referenced until then, so
+    the compute stream cannot recycle their storage under the transfer.
     """
     from vllm.v1.worker.ubatching import (
         dbo_switch_to_comm_sync,
         dbo_switch_to_compute_sync,
+        dbo_yield_and_switch_from_comm_to_compute,
     )
 
     lockstep = _ubatch_lockstep()
+    yield_ring = _ubatch_yield_option("yieldring") and not lockstep
+    defer = deferred_wait and yield_ring and _ubatch_yield_option("yielddefer")
     snapshots = tuple(t.clone() for t in inputs)
     if lockstep:
         torch.cuda.synchronize()
@@ -273,10 +339,18 @@ def _ubatch_ring_call(fn, inputs: tuple[torch.Tensor, ...]):
     result = fn(*snapshots)
     if lockstep:
         torch.cuda.synchronize()
-    dbo_switch_to_compute_sync()
+    if defer:
+        _dbo_yield_and_switch_to_compute_no_wait()
+        return result, snapshots
+    if yield_ring:
+        dbo_yield_and_switch_from_comm_to_compute()
+    else:
+        dbo_switch_to_compute_sync()
     if lockstep:
         torch.cuda.synchronize()
     del snapshots
+    if deferred_wait:
+        return result, None
     return result
 
 
@@ -286,9 +360,11 @@ def _ubatch_ring_active() -> bool:
 
 def tensor_model_parallel_pcie_all_gather_pair(
     first: torch.Tensor, second: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, Any] | None:
+) -> tuple[Any, ...] | None:
     """Gather two rank-local ``[rows, c]`` blocks on the TP group's
-    copy-engine ring side stream; ``None`` when unavailable."""
+    copy-engine ring side stream; ``None`` when unavailable. Returns
+    ``(out_first, out_second, done)``, plus a keep-alive object as a fourth
+    element inside a split half whose hand-off deferred the wait."""
     if not _ubatch_ring_active():
         return get_tp_group().pcie_all_gather_pair(first, second)
 
@@ -305,7 +381,14 @@ def tensor_model_parallel_pcie_all_gather_pair(
         ready.record(stream)
         return out_first, out_second, ready
 
-    return _ubatch_ring_call(_run, (first, second))
+    # The gathered blocks are consumed only after the shared experts, so
+    # the compute stream is ordered after the gather by the caller's wait
+    # on ``ready``; the snapshots travel with the result until then.
+    result, keepalive = _ubatch_ring_call(_run, (first, second), deferred_wait=True)
+    if result is None:
+        return None
+    out_first, out_second, ready = result
+    return out_first, out_second, ready, keepalive
 
 
 def tensor_model_parallel_prepare_pcie_reduce_scatter(wire: str) -> bool:
@@ -321,9 +404,7 @@ def tensor_model_parallel_pcie_reduce_scatter_columns(
     return this rank's ``[rows, cols]`` column block; ``None`` when
     unavailable."""
     if not _ubatch_ring_active():
-        return get_tp_group().pcie_reduce_scatter_columns(
-            input_, wire=wire, cols=cols
-        )
+        return get_tp_group().pcie_reduce_scatter_columns(input_, wire=wire, cols=cols)
 
     def _run(x: torch.Tensor):
         out = get_tp_group().pcie_reduce_scatter_columns(x, wire=wire, cols=cols)

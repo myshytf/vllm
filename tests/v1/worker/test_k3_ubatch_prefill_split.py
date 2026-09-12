@@ -278,3 +278,96 @@ def test_each_half_keeps_its_own_slot_mapping(monkeypatch):
     assert torch.equal(seen[0], torch.arange(0, split))
     assert torch.equal(seen[1], torch.arange(split, rows))
     assert torch.equal(shared[0], torch.arange(0, rows))
+
+
+class _FakeUbatchContext:
+    """Stand-in for ``UBatchContext``: only the hand-off state matters."""
+
+    _k3_skip = 0
+    _k3_partner_done = False
+
+    def __init__(self, ctx_id: int, wait_event, signal_event, forward_context):
+        self.id = ctx_id
+        self.cpu_wait_event = wait_event
+        self.cpu_signal_event = signal_event
+        self.forward_context = forward_context
+        self.current_stream = "compute"
+
+    def _restore_context(self) -> None:
+        pass
+
+
+def _run_handoff_pair(offset: int, yields_a: int, yields_b: int):
+    """Two threads that yield at fixed points, as the halves do at their
+    collectives; returns the order in which their segments ran."""
+    import threading
+
+    from vllm import forward_context as fc
+    from vllm.v1.worker.gpu import k3_ubatch_prefill as split
+
+    events = [threading.Event(), threading.Event()]
+    ctxs = [
+        _FakeUbatchContext(0, events[0], events[1], fc._forward_context),
+        _FakeUbatchContext(1, events[1], events[0], fc._forward_context),
+    ]
+    split._install_offset_handoff(ctxs, offset)
+    order: list[tuple[int, int]] = []
+
+    def half(ctx, yields):
+        # UBatchContext.__enter__: wait for the hand-off that starts this half.
+        ctx.cpu_wait_event.wait()
+        ctx.cpu_wait_event.clear()
+        for i in range(yields):
+            order.append((ctx.id, i))
+            ctx._cpu_yield()
+        order.append((ctx.id, yields))
+        # __exit__ after the forward: the partner never waits on us again.
+        for other in ctxs:
+            if other is not ctx:
+                other._k3_partner_done = True
+        ctx.cpu_signal_event.set()
+        ctx.cpu_wait_event.clear()
+
+    threads = [
+        threading.Thread(target=half, args=(ctxs[0], yields_a)),
+        threading.Thread(target=half, args=(ctxs[1], yields_b)),
+    ]
+    for th in threads:
+        th.start()
+    ctxs[0].cpu_wait_event.set()
+    for th in threads:
+        th.join(timeout=10)
+    assert not any(th.is_alive() for th in threads), "hand-off deadlocked"
+    return order
+
+
+def test_offset_handoff_runs_the_first_half_ahead(monkeypatch):
+    from vllm.utils import torch_utils
+
+    monkeypatch.setattr(torch_utils, "current_stream", lambda: "compute")
+    order = _run_handoff_pair(offset=3, yields_a=8, yields_b=8)
+    # The first half runs its first three segments alone, then the halves
+    # alternate with the second half three segments behind.
+    assert order[:5] == [(0, 0), (0, 1), (0, 2), (0, 3), (1, 0)]
+    assert order[5:9] == [(0, 4), (1, 1), (0, 5), (1, 2)]
+    # Every segment of both halves ran exactly once.
+    assert sorted(order) == [(h, i) for h in (0, 1) for i in range(9)]
+
+
+def test_handoff_without_offset_alternates_from_the_first_collective(monkeypatch):
+    from vllm.utils import torch_utils
+
+    monkeypatch.setattr(torch_utils, "current_stream", lambda: "compute")
+    order = _run_handoff_pair(offset=0, yields_a=4, yields_b=4)
+    assert order[:4] == [(0, 0), (1, 0), (0, 1), (1, 1)]
+
+
+def test_handoff_survives_unequal_yield_counts(monkeypatch):
+    """A half whose partner finished keeps running without waiting."""
+    from vllm.utils import torch_utils
+
+    monkeypatch.setattr(torch_utils, "current_stream", lambda: "compute")
+    order = _run_handoff_pair(offset=2, yields_a=3, yields_b=7)
+    assert sorted(order) == [(0, i) for i in range(4)] + [(1, i) for i in range(8)]
+    order = _run_handoff_pair(offset=0, yields_a=7, yields_b=3)
+    assert sorted(order) == [(0, i) for i in range(8)] + [(1, i) for i in range(4)]

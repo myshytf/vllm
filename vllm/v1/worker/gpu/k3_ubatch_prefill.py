@@ -39,12 +39,12 @@ import time
 import numpy as np
 import torch
 
-from vllm.logger import init_logger
 from vllm.forward_context import (
     create_forward_context,
     override_forward_context,
     set_forward_context,
 )
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu import k3_piecewise_graph
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -52,7 +52,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 
 logger = init_logger(__name__)
 
-_MODE_CACHE: list = [0.0, None]
+_MODE_CACHE: list = [0.0, None, {}]
 
 
 def runtime_mode() -> str | None:
@@ -68,22 +68,45 @@ def runtime_mode() -> str | None:
     re-read at most once per second. A configured file that is missing,
     unreadable or empty selects ``off``: the operator switch fails safe to
     the unsplit chunk rather than to whatever the environment enables.
+
+    Words after the mode are ``key=value`` options read by
+    ``runtime_option``: ``yieldall`` (0/1, hand off at every ring
+    collective) and ``offset`` (hand-offs the first half runs alone).
     """
+    return _read_mode_file()[0]
+
+
+def runtime_option(key: str) -> str | None:
+    """Value of a ``key=value`` word of the mode file, or None."""
+    mode, options = _read_mode_file()
+    if mode is None:
+        return None
+    return options.get(key)
+
+
+def _read_mode_file() -> tuple[str | None, dict[str, str]]:
     path = os.getenv("VLLM_K3_UBATCH_MODE_FILE", "")
     if not path:
-        return None
+        return None, {}
     now = time.time()
     if now - _MODE_CACHE[0] < 1.0:
-        return _MODE_CACHE[1]
+        return _MODE_CACHE[1], _MODE_CACHE[2]
+    options: dict[str, str] = {}
     try:
         with open(path) as fh:
             words = fh.read().split()
         mode = words[0].strip().lower() if words else "off"
+        for word in words[1:]:
+            key, sep, value = word.partition("=")
+            if sep:
+                options[key.strip().lower()] = value.strip()
     except Exception:
         mode = "off"
+        options = {}
     _MODE_CACHE[0] = now
     _MODE_CACHE[1] = mode
-    return mode
+    _MODE_CACHE[2] = options
+    return mode, options
 
 
 def ubatch_prefill_enabled() -> bool:
@@ -106,6 +129,24 @@ def ubatch_prefill_configured() -> bool:
 
 def ubatch_prefill_min_tokens() -> int:
     return int(os.getenv("VLLM_K3_UBATCH_PREFILL_MIN_TOKENS", "1024"))
+
+
+def ubatch_prefill_offset() -> int:
+    """``VLLM_K3_UBATCH_OFFSET``: hand-offs the first half performs alone
+    before the second half starts (default 0: the halves alternate from
+    their first collective). With hand-offs at every ring collective, an
+    offset of about half a layer's collectives keeps the two halves in
+    opposite phases (one half's MoE runs while the other half's wide
+    all-reduce is on the ring); the second half then trails the first by
+    that many segments for the whole forward, and the cross-half
+    dependencies (KDA state, MLA key stash) still hold by stream order."""
+    value = runtime_option("offset")
+    if value is None:
+        value = os.getenv("VLLM_K3_UBATCH_OFFSET", "0")
+    try:
+        return max(0, int(value or 0))
+    except ValueError:
+        return 0
 
 
 def ubatch_prefill_overlap() -> bool:
@@ -155,9 +196,16 @@ def record_step(runner, scheduler_output, input_batch) -> None:
             "prefilling": bool(input_batch.is_prefilling_np[0])
             if input_batch.num_reqs
             else None,
-            "computed": [int(v) for v in input_batch.num_computed_tokens_np[: input_batch.num_reqs]],
+            "computed": [
+                int(v)
+                for v in input_batch.num_computed_tokens_np[: input_batch.num_reqs]
+            ],
             "new": [
-                (r.req_id[-12:], int(r.num_computed_tokens), [len(b) for b in r.block_ids])
+                (
+                    r.req_id[-12:],
+                    int(r.num_computed_tokens),
+                    [len(b) for b in r.block_ids],
+                )
                 for r in so.scheduled_new_reqs
             ],
             "cached": [
@@ -629,6 +677,7 @@ def _run_overlapped(
         forward_contexts=forward_contexts,
         ready_barrier=ready_barrier,
     )
+    _install_offset_handoff(ctxs, ubatch_prefill_offset())
     results: list = []
     errors: list = []
 
@@ -642,6 +691,12 @@ def _run_overlapped(
             torch.cuda.set_stream(compute_stream)
             with ctx:
                 out = runner.model(**half_inputs)
+                # This half makes no more hand-offs; the other half's later
+                # yields must return at once instead of waiting for a signal
+                # that would never come.
+                for other in ctxs:
+                    if other is not ctx:
+                        other._k3_partner_done = True  # type: ignore[attr-defined]
             results.append((ctx.id, out))
         except BaseException as exc:  # surfaced after join
             import traceback
@@ -684,6 +739,39 @@ def _run_overlapped(
     return [out for _, out in sorted(results, key=lambda r: r[0])]
 
 
+def _install_offset_handoff(ctxs, offset: int) -> None:
+    """Give the ubatch contexts the split prefill's hand-off rules.
+
+    The first half skips its first ``offset`` hand-offs (it runs ahead and
+    the second half starts at the first real hand-off), and a half whose
+    partner has finished its forward no longer waits at a hand-off. Both
+    halves issue the same sequence of collectives, so the resulting order
+    of ring ops is the same on every rank.
+    """
+    import types
+
+    from vllm import forward_context as _fc
+    from vllm.utils.torch_utils import current_stream as _cs
+
+    def _cpu_yield(self):
+        if self._k3_skip > 0:
+            self._k3_skip -= 1
+            return
+        if self._k3_partner_done:
+            return
+        assert _fc._forward_context == self.forward_context
+        assert _cs() == self.current_stream
+        self.cpu_signal_event.set()
+        self.cpu_wait_event.wait()
+        self.cpu_wait_event.clear()
+        self._restore_context()
+
+    for ctx in ctxs:
+        ctx._k3_skip = offset if ctx.id == 0 else 0
+        ctx._k3_partner_done = False
+        ctx._cpu_yield = types.MethodType(_cpu_yield, ctx)
+
+
 def _join_with_watchdog(threads, runner) -> None:
     """Join the half threads; if they do not finish within
     ``VLLM_K3_UBATCH_WATCHDOG_S`` seconds (0 = off), log this rank's
@@ -702,7 +790,7 @@ def _join_with_watchdog(threads, runner) -> None:
 
     logger = init_logger(__name__)
     deadline = time.time() + timeout
-    reported = 0
+    reported = 0.0
     while any(th.is_alive() for th in threads):
         for th in threads:
             th.join(timeout=0.5)

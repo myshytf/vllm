@@ -223,16 +223,22 @@ class PendingProjectionGather:
         done,
         first_width: int,
         second_width: int,
+        keepalive=None,
     ) -> None:
         self._out_first = out_first
         self._out_second = out_second
         self._done = done
         self._first_width = first_width
         self._second_width = second_width
+        # Input storage the ring may still be reading (split-prefill
+        # snapshots); released once the consuming stream is ordered after
+        # the gather.
+        self._keepalive = keepalive
 
     def wait(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._done is not None:
             torch.cuda.current_stream().wait_event(self._done)
+        self._keepalive = None
         first = assemble_rank_major_blocks(self._out_first, self._first_width)
         second = assemble_rank_major_blocks(self._out_second, self._second_width)
         return first, second
@@ -305,9 +311,10 @@ def try_gather_kimi_projection_pair_async(
     gathered = tensor_model_parallel_pcie_all_gather_pair(local_first, local_second)
     if gathered is None:
         return None
-    out_first, out_second, done = gathered
+    out_first, out_second, done = gathered[:3]
+    keepalive = gathered[3] if len(gathered) > 3 else None
     return PendingProjectionGather(
-        out_first, out_second, done, first_width, second_width
+        out_first, out_second, done, first_width, second_width, keepalive=keepalive
     )
 
 
