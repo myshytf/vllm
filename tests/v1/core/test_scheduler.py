@@ -6243,3 +6243,98 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
 
     assert output.num_scheduled_tokens[req_id] > 0
     assert not output.scheduled_encoder_inputs.get(req_id)
+
+
+def _connector_only_output(invalid_block_ids: set[int]) -> ModelRunnerOutput:
+    return ModelRunnerOutput(
+        req_ids=[],
+        req_id_to_index={},
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+        kv_connector_output=KVConnectorOutput(invalid_block_ids=invalid_block_ids),
+    )
+
+
+def test_kv_load_failure_reports_never_advance_the_recompute_boundary():
+    """One load failure is reported by every worker, over several scheduler
+    steps. The first report unwinds the request to the earliest invalid
+    boundary; later reports of blocks behind that boundary must leave it
+    there, and a report of an earlier block still lowers it."""
+    BLOCK_SIZE = 16
+    NUM_MATCHED = BLOCK_SIZE * 4
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=NUM_MATCHED, is_async=True),
+        block_size=BLOCK_SIZE,
+    )
+    # Production serves with kv_load_failure_policy=recompute.
+    scheduler.recompute_kv_load_failures = True
+    request = create_requests(
+        num_requests=1,
+        num_tokens=NUM_MATCHED + BLOCK_SIZE,
+        max_tokens=2,
+        block_size=BLOCK_SIZE,
+    )[0]
+    scheduler.add_request(request)
+    output = scheduler.schedule()
+    assert request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert request.num_computed_tokens == NUM_MATCHED
+    block_ids = list(scheduler.kv_cache_manager.get_block_ids(request.request_id)[0])
+    # Groups whose block lists are not clipped to the computed prefix (recurrent
+    # state groups of hybrid models) report every block regardless of how far
+    # the request was already unwound; model that here.
+    scheduler.kv_cache_manager.get_block_ids_for_computed_tokens = (
+        lambda request_id, num_computed_tokens: (list(block_ids),)
+    )
+
+    # First report: the block holding tokens [16, 32) failed.
+    scheduler.update_from_output(output, _connector_only_output({block_ids[1]}))
+    assert request.num_computed_tokens == BLOCK_SIZE
+    assert request.request_id in scheduler.failed_recving_kv_req_ids
+
+    # Second report from another worker names a later block: no advance.
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _connector_only_output({block_ids[2]}))
+    assert request.num_computed_tokens == BLOCK_SIZE
+
+    # A report of an earlier block still lowers the boundary.
+    output = scheduler.schedule()
+    scheduler.update_from_output(output, _connector_only_output({block_ids[0]}))
+    assert request.num_computed_tokens == 0
+
+
+def test_unresolved_connector_lookup_times_out_to_a_local_prefill():
+    """A request whose connector lookup never resolves waits at most
+    ``_PENDING_LOOKUP_TIMEOUT_S`` and is then scheduled without external KV."""
+    BLOCK_SIZE = 16
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(
+            matched_tokens=BLOCK_SIZE, is_async=True, num_defers_before_matching=10_000
+        ),
+        block_size=BLOCK_SIZE,
+    )
+    request = create_requests(
+        num_requests=1, num_tokens=BLOCK_SIZE * 2, max_tokens=2, block_size=BLOCK_SIZE
+    )[0]
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+    assert output.scheduled_new_reqs == []
+    assert request.status == RequestStatus.WAITING
+    assert request.request_id in scheduler._lookup_pending_since
+
+    # Still unresolved within the deadline: keep waiting.
+    output = scheduler.schedule()
+    assert output.scheduled_new_reqs == []
+
+    # Past the deadline: scheduled as a miss, the lookup result ignored from now on.
+    scheduler._lookup_pending_since[request.request_id] -= 10_000.0
+    output = scheduler.schedule()
+    assert [req.req_id for req in output.scheduled_new_reqs] == [request.request_id]
+    assert output.num_scheduled_tokens[request.request_id] == BLOCK_SIZE * 2
+    assert request.skip_reading_prefix_cache is True
+    assert request.request_id not in scheduler._lookup_pending_since
+
