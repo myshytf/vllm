@@ -96,11 +96,39 @@ def test_aux_stream_output_lifetime_extends_to_consumer(monkeypatch) -> None:
     output.record_stream.assert_called_once_with(consumer_stream)
 
 
+def test_live_microbatches_keep_outputs_separate_without_global_dbo(monkeypatch):
+    """Both halves may produce a shared result before either consumes it."""
+    for precomputed in (False, True):
+        shared = object.__new__(SharedExperts)
+        torch.nn.Module.__init__(shared)
+        shared.enable_dbo = False
+        shared._output = [None, None]
+        shared._precomputed = [None, None]
+        shared._layer = torch.nn.Identity()
+        shared._determine_shared_experts_order = lambda _: SharedExpertsOrder.NO_OVERLAP
+        current = [0]
+        monkeypatch.setattr(
+            shared_module, "dbo_current_ubatch_id", lambda current=current: current[0]
+        )
+        inputs = [torch.full((2, 4), float(i + 1)) for i in range(2)]
+        for half in (0, 1):
+            current[0] = half
+            if precomputed:
+                shared.install_precomputed_output(inputs[half])
+            shared(inputs[half], SharedExpertsOrder.NO_OVERLAP)
+        for half in (1, 0):
+            current[0] = half
+            assert shared.output is inputs[half]
+        assert shared._output == [None, None]
+        assert shared._precomputed == [None, None]
+
+
 def test_shared_expert_reuses_input_only_for_synchronous_execution() -> None:
     shared_experts = object.__new__(SharedExperts)
     torch.nn.Module.__init__(shared_experts)
     shared_experts.enable_dbo = False
     shared_experts._output = [None, None]
+    shared_experts._precomputed = [None, None]
     shared_experts._layer = _InputReusingSharedLayer()
     shared_experts._determine_shared_experts_order = MethodType(
         lambda self, hidden_states: SharedExpertsOrder.NO_OVERLAP,
@@ -126,6 +154,7 @@ def test_shared_expert_reuses_input_only_for_synchronous_execution() -> None:
 def test_tp_partial_output_transform_defers_shared_reduce(monkeypatch) -> None:
     runner = object.__new__(MoERunner)
     torch.nn.Module.__init__(runner)
+    runner.reduction_borrow_output = False
     runner.routed_output_transform = _PartialOutputTransform()
     runner.routed_input_transform = None
     runner.routed_scaling_factor = 1.0
@@ -179,6 +208,7 @@ def test_tp_partial_output_transform_defers_shared_reduce(monkeypatch) -> None:
 def test_tp_partial_output_transform_reuses_dead_input(monkeypatch) -> None:
     runner = object.__new__(MoERunner)
     torch.nn.Module.__init__(runner)
+    runner.reduction_borrow_output = False
     runner.routed_output_transform = _BufferedPartialOutputTransform()
     runner.routed_input_transform = None
     runner.routed_scaling_factor = 1.0
@@ -243,6 +273,7 @@ def test_tp_partial_output_transform_accumulates_into_reused_shared_input(
 ) -> None:
     runner = object.__new__(MoERunner)
     torch.nn.Module.__init__(runner)
+    runner.reduction_borrow_output = False
     runner.routed_output_transform = _ResidualPartialOutputTransform()
     runner.routed_input_transform = None
     runner.routed_scaling_factor = 1.0
@@ -306,6 +337,7 @@ def test_tp_partial_output_transform_accumulates_into_reused_shared_input(
 def test_reused_shared_input_reduces_latent_output_in_place(monkeypatch) -> None:
     runner = object.__new__(MoERunner)
     torch.nn.Module.__init__(runner)
+    runner.reduction_borrow_output = False
     runner.routed_output_transform = _ResidualPartialOutputTransform()
     runner.routed_input_transform = None
     runner.routed_scaling_factor = 1.0

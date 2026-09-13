@@ -271,6 +271,7 @@ if TYPE_CHECKING:
     VLLM_K3_REQUEST_ENDPOINT_CACHE_MAX_ENTRIES: int = 8
     VLLM_K3_REQUEST_ENDPOINT_CACHE_DISABLE_FILE: str = ""
     VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG: bool = False
+    VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG_DISABLE_FILE: str = ""
     VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY: bool = False
     VLLM_K3_REQUEST_ENDPOINT_CACHE_TORCH_COPY_FILE: str = ""
     VLLM_K3_DCP_GATHER_DMA_MIN_ROWS: int = 2048
@@ -2641,6 +2642,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the recurrent-state pages read and written by the endpoint copies.
     "VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG": lambda: bool(
         int(os.getenv("VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG", "0"))
+    ),
+    # Permit bounded A/B qualification of synchronous endpoint diagnostics
+    # without rebuilding the model or changing cache-copy arithmetic.
+    "VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG_DISABLE_FILE": lambda: os.getenv(
+        "VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG_DISABLE_FILE", ""
     ),
     # Materialize request-endpoint recurrent states with per-state torch
     # copies instead of the fused Triton kernel (same results; a fallback

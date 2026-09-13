@@ -68,6 +68,29 @@ from vllm.v1.request import Request
 pytestmark = pytest.mark.cpu_test
 
 
+def test_endpoint_debug_marker_can_be_reversed_without_restarting(
+    monkeypatch, tmp_path
+):
+    marker = tmp_path / "diagnostics-disabled"
+    monkeypatch.setattr(
+        kv_cache_utils.envs, "VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG", True
+    )
+    monkeypatch.setattr(
+        kv_cache_utils.envs,
+        "VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG_DISABLE_FILE",
+        str(marker),
+    )
+    assert kv_cache_utils.request_endpoint_cache_debug()
+    marker.touch()
+    assert not kv_cache_utils.request_endpoint_cache_debug()
+    marker.unlink()
+    assert kv_cache_utils.request_endpoint_cache_debug()
+    monkeypatch.setattr(
+        kv_cache_utils.envs, "VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG", False
+    )
+    assert not kv_cache_utils.request_endpoint_cache_debug()
+
+
 @pytest.fixture(autouse=True)
 def _auto_init_hash_fn(request):
     hash_fn: Callable

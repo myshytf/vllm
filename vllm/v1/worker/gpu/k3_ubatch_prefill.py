@@ -690,7 +690,14 @@ def _run_overlapped(
             # thread to the step's compute stream up front.
             torch.cuda.set_stream(compute_stream)
             with ctx:
-                out = runner.model(**half_inputs)
+                try:
+                    out = runner.model(**half_inputs)
+                except BaseException as exc:
+                    # Cancel before __exit__ signals the partner. It must not
+                    # issue more work against a partially completed half.
+                    errors.append(exc)
+                    _cancel_split_handoffs(ctxs)
+                    raise
                 # This half makes no more hand-offs; the other half's later
                 # yields must return at once instead of waiting for a signal
                 # that would never come.
@@ -709,8 +716,9 @@ def _run_overlapped(
                 exc,
                 traceback.format_exc(),
             )
-            errors.append(exc)
-            ctx.cpu_signal_event.set()
+            if not any(error is exc for error in errors):
+                errors.append(exc)
+            _cancel_split_handoffs(ctxs)
 
     with override_forward_context(None):
         threads = [
@@ -754,6 +762,14 @@ def compute_handoff() -> None:
     ctx._cpu_yield()
 
 
+def _cancel_split_handoffs(ctxs) -> None:
+    """Wake every waiting half and prevent further work after a peer fails."""
+    for ctx in ctxs:
+        ctx._k3_cancelled = True
+    for ctx in ctxs:
+        ctx.cpu_wait_event.set()
+
+
 def _install_offset_handoff(ctxs, offset: int) -> None:
     """Give the ubatch contexts the split prefill's hand-off rules.
 
@@ -769,6 +785,8 @@ def _install_offset_handoff(ctxs, offset: int) -> None:
     from vllm.utils.torch_utils import current_stream as _cs
 
     def _cpu_yield(self):
+        if self._k3_cancelled:
+            raise RuntimeError("split-prefill partner failed")
         if self._k3_skip > 0:
             self._k3_skip -= 1
             return
@@ -779,11 +797,14 @@ def _install_offset_handoff(ctxs, offset: int) -> None:
         self.cpu_signal_event.set()
         self.cpu_wait_event.wait()
         self.cpu_wait_event.clear()
+        if self._k3_cancelled:
+            raise RuntimeError("split-prefill partner failed")
         self._restore_context()
 
     for ctx in ctxs:
         ctx._k3_skip = offset if ctx.id == 0 else 0
         ctx._k3_partner_done = False
+        ctx._k3_cancelled = False
         ctx._cpu_yield = types.MethodType(_cpu_yield, ctx)
 
 

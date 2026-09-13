@@ -286,6 +286,9 @@ class _FakeUbatchContext:
     _k3_skip = 0
     _k3_partner_done = False
 
+    def _cpu_yield(self) -> None:
+        raise AssertionError("The hand-off implementation must be installed first")
+
     def __init__(self, ctx_id: int, wait_event, signal_event, forward_context):
         self.id = ctx_id
         self.cpu_wait_event = wait_event
@@ -295,6 +298,39 @@ class _FakeUbatchContext:
 
     def _restore_context(self) -> None:
         pass
+
+
+def test_cancelled_split_wakes_waiters_and_rejects_further_handoffs(monkeypatch):
+    import threading
+
+    from vllm import forward_context as fc
+    from vllm.utils import torch_utils
+    from vllm.v1.worker.gpu import k3_ubatch_prefill as split
+
+    monkeypatch.setattr(torch_utils, "current_stream", lambda: "compute")
+    events = [threading.Event(), threading.Event()]
+    ctxs = [
+        _FakeUbatchContext(0, events[0], events[1], fc._forward_context),
+        _FakeUbatchContext(1, events[1], events[0], fc._forward_context),
+    ]
+    split._install_offset_handoff(ctxs, 0)
+    errors = []
+
+    def wait_for_partner():
+        try:
+            ctxs[0]._cpu_yield()
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    thread = threading.Thread(target=wait_for_partner)
+    thread.start()
+    assert events[1].wait(timeout=1)
+    split._cancel_split_handoffs(ctxs)
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert errors == ["split-prefill partner failed"]
+    with pytest.raises(RuntimeError, match="partner failed"):
+        ctxs[1]._cpu_yield()
 
 
 def _run_handoff_pair(offset: int, yields_a: int, yields_b: int):
