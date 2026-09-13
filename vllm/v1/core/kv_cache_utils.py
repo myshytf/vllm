@@ -235,8 +235,11 @@ def request_endpoint_cache_enabled() -> bool:
 
 
 def request_endpoint_cache_debug() -> bool:
-    """Whether endpoint registration, hits and worker copies are logged."""
-    return bool(envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG)
+    """Enable synchronous endpoint diagnostics unless their marker is present."""
+    if not envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG:
+        return False
+    path = envs.VLLM_K3_REQUEST_ENDPOINT_CACHE_DEBUG_DISABLE_FILE
+    return not path or not os.path.exists(path)
 
 
 def request_endpoint_cache_torch_copy() -> bool:
