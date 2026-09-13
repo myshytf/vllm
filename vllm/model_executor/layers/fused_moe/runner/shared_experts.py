@@ -48,8 +48,8 @@ class SharedExperts(torch.nn.Module):
 
         # The SharedExperts need to handle DBO since they can be called from
         # an MK's finalize method.  We keep a list of outputs indexed by current
-        # DBO ubatch id to handle this case.  If DBO is not enabled, the
-        # index is always 0 and the second output list element is ignored.
+        # microbatch id, including contexts installed by Kimi split prefill.
+        # Without a live context the index is zero.
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
         # A result the model computed itself (to overlap the shared experts
@@ -155,7 +155,10 @@ class SharedExperts(torch.nn.Module):
 
     @property
     def _output_idx(self) -> int:
-        return dbo_current_ubatch_id() if self.enable_dbo else 0
+        # Kimi split prefill installs live microbatch contexts independently
+        # of the global DBO configuration. Producers and consumers must use
+        # that context's slot; the helper returns zero outside a microbatch.
+        return dbo_current_ubatch_id()
 
     @property
     def output(self) -> torch.Tensor:
