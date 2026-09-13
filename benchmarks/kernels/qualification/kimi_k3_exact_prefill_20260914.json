@@ -1,0 +1,193 @@
+{
+  "status": "qualified",
+  "reference_mode": "overlap moesplit=0",
+  "optimized_mode": "overlap moesplit=1 offset=2",
+  "basis": "Same running final implementation; stability, reconstruction and diagnostic configuration are common to both arms. No profiler or independent GPU work during these intervals.",
+  "hardware": "Nine RTX PRO 6000 Blackwell GPUs, TP9/DCP9, existing power policy",
+  "precision": "QSRT K2 target, BF16 model, MXFP8 W8A16 dense path, existing target fp8_ds_mla and draft FP8 KV, unchanged accumulation precision",
+  "vllm_revision": "5d5eb62e38",
+  "b12x_serving_revision": "aff7f0f",
+  "seed": 20260912,
+  "temperature": 0,
+  "cache_salt": "Fresh per request; zero local and external hits required",
+  "performance": [
+    {
+      "input_tokens": 8192,
+      "comparison": "ABBA",
+      "samples_per_arm": 2,
+      "reference_prefill_tok_s": 2016.1258953512756,
+      "optimized_prefill_tok_s": 2121.611857171026,
+      "reference_ttft_s": 4.070568105002167,
+      "optimized_ttft_s": 3.867882511985954,
+      "reference_decode_tok_s": 118.24694565292414,
+      "optimized_decode_tok_s": 118.3051516090253,
+      "all_tokens_logprobs_equal": true,
+      "reference_raw_prefill_tok_s": [
+        2015.2144236396205,
+        2017.037367062931
+      ],
+      "optimized_raw_prefill_tok_s": [
+        2121.680904319251,
+        2121.5428100228005
+      ],
+      "prefill_gain_pct": 5.232111846932597
+    },
+    {
+      "input_tokens": 32768,
+      "comparison": "ABBA",
+      "samples_per_arm": 2,
+      "reference_prefill_tok_s": 2226.9650729426194,
+      "optimized_prefill_tok_s": 2462.0144226835882,
+      "reference_ttft_s": 14.730620067974087,
+      "optimized_ttft_s": 13.325411807978526,
+      "reference_decode_tok_s": 83.14492735138741,
+      "optimized_decode_tok_s": 83.16926557882033,
+      "all_tokens_logprobs_equal": true,
+      "reference_raw_prefill_tok_s": [
+        2225.2667328768557,
+        2228.6634130083826
+      ],
+      "optimized_raw_prefill_tok_s": [
+        2462.9755278292746,
+        2461.0533175379014
+      ],
+      "prefill_gain_pct": 10.554694036147794
+    },
+    {
+      "input_tokens": 65536,
+      "comparison": "ABBA",
+      "samples_per_arm": 2,
+      "reference_prefill_tok_s": 2131.319481576901,
+      "optimized_prefill_tok_s": 2361.7446559958444,
+      "reference_ttft_s": 30.77465787550318,
+      "optimized_ttft_s": 27.777345073001925,
+      "reference_decode_tok_s": 83.99588532906654,
+      "optimized_decode_tok_s": 84.12026231687841,
+      "all_tokens_logprobs_equal": true,
+      "reference_raw_prefill_tok_s": [
+        2124.1515583011465,
+        2138.4874048526563
+      ],
+      "optimized_raw_prefill_tok_s": [
+        2363.818305992877,
+        2359.6710059988122
+      ],
+      "prefill_gain_pct": 10.81138592363724
+    },
+    {
+      "input_tokens": 131072,
+      "comparison": "ABBA",
+      "samples_per_arm": 2,
+      "reference_prefill_tok_s": 1953.0524015290086,
+      "optimized_prefill_tok_s": 2081.605202419768,
+      "reference_ttft_s": 68.18144663551357,
+      "optimized_ttft_s": 63.07274081601645,
+      "reference_decode_tok_s": 69.74894482976879,
+      "optimized_decode_tok_s": 70.28524071065863,
+      "all_tokens_logprobs_equal": true,
+      "reference_raw_prefill_tok_s": [
+        1950.0439817413717,
+        1956.0608213166456
+      ],
+      "optimized_raw_prefill_tok_s": [
+        2127.946653885333,
+        2035.2637509542026
+      ],
+      "prefill_gain_pct": 6.582148066796245
+    },
+    {
+      "input_tokens": 262144,
+      "comparison": "AB",
+      "samples_per_arm": 1,
+      "reference_prefill_tok_s": 1664.0490033252277,
+      "optimized_prefill_tok_s": 1828.1712800588123,
+      "reference_ttft_s": 157.65630518901162,
+      "optimized_ttft_s": 143.4837590759853,
+      "reference_decode_tok_s": 66.07882795741486,
+      "optimized_decode_tok_s": 65.41713281028944,
+      "all_tokens_logprobs_equal": true,
+      "reference_raw_prefill_tok_s": [
+        1664.0490033252277
+      ],
+      "optimized_raw_prefill_tok_s": [
+        1828.1712800588123
+      ],
+      "prefill_gain_pct": 9.86282714064448
+    }
+  ],
+  "limitations": [
+    "256k has one paired measurement; other reported sizes use ABBA with two samples per arm.",
+    "The earlier mixed-length 128k A/B pair showed -1.3%; the subsequent same-length ABBA is retained as the final comparison, not erased.",
+    "Numbers characterize this workload and host, not an all-workload speed guarantee.",
+    "Maximum configured context remains 1048576; this campaign measures through 262144 tokens."
+  ],
+  "artifact_root": "kimi-k3-production/research/precision-preserving-20260914",
+  "cache_namespace": "iso-k3-stable-routes-20260914",
+  "correctness": {
+    "all_short_inputs_repeat_exactly": [
+      9,
+      12,
+      16,
+      17
+    ],
+    "cold_continuation_external_tokens_and_logprobs_equal": true,
+    "maximum_patch_image": {
+      "input_pixels": [
+        4096,
+        4096
+      ],
+      "prompt_tokens": 10449,
+      "output": "73",
+      "content_and_logprobs_equal": true
+    },
+    "concurrent_requests": {
+      "clients": 4,
+      "max_active_observed": 4,
+      "all_canaries_correct": true
+    },
+    "gateway": {
+      "status": 200,
+      "stream_done": true,
+      "finish_reason": "stop",
+      "content": "KIMI_PRECISION_OK",
+      "expected_marker": true
+    },
+    "endpoint_diagnostics": {
+      "retained": true,
+      "paired_latency_speedup_if_disabled": 1.0077653588407713,
+      "all_40_responses_equal": true
+    }
+  },
+  "checks": [
+    {
+      "name": "CPU layout and range contracts",
+      "passed": 8
+    },
+    {
+      "name": "CUDA Marlin reconstruction",
+      "passed": 3
+    },
+    {
+      "name": "CPU shared outputs and split cancellation",
+      "passed": 39
+    },
+    {
+      "name": "CUDA retained FC2",
+      "passed": 2
+    },
+    {
+      "name": "CUDA stable route packing",
+      "passed": 24
+    }
+  ],
+  "evidence_hashes": {
+    "final-boot/short-correctness.json": "00946bd177e09524555b66848d6aecd77e2296c5bc4284da426b61541eb3eceb",
+    "final-cache-quality/correctness.json": "76a691b62d1fa9dfc09da8fb06feeeec8ec3cf9ea8e6c48171daf9b950290209",
+    "final-vision/correctness.json": "ca78dcf0e8e4606bd3e229281e116c69c08865887ce8011d945ba692dd0b1ab0",
+    "final-four-active/correctness.json": "1648c1b5f09152a6c4290c7442f93bdf187e7ae66a608f9262f3db5a3650d22e",
+    "debug-abba/comparison.json": "95d11d4040be582b9038cd09cbf9b13caedb3d971a9a5c6f19f1c3d0b26a9f05",
+    "final-abba/correctness.json": "11e8bc1a3cba3a09a755a94dbc9f4a68eedad9f9443877dd463bfd90de01a2af",
+    "final-128k-abba/correctness.json": "cc695214117cba77d54b441ea5c267e389a3ee0ca7d05f6ff7ab7c53c0416b98",
+    "final-long/correctness.json": "e1742d61a1dc5cc21fce18a464b3b0dd73342a569d7ca449d5a108597baaf7bb"
+  }
+}
