@@ -105,30 +105,14 @@ def reconstruct_bf16_weight_torch(
     )
 
 
-@functools.cache
-def _scale_inverse_table(device: torch.device) -> torch.Tensor:
-    """64-entry table: original n_local -> position inside a Marlin 64-scale chunk.
-
-    Inverts ``marlin_permute_scales`` (scale_perm over 64 columns) followed by
-    ``mxfp8_marlin_process_scales`` (the [0, 2, 1, 3] swap inside groups of 4).
-    """
-    scale_perm, _ = get_scale_perms()
-    inv = torch.argsort(torch.tensor(scale_perm))  # orig n -> position after perm
-    swap = torch.tensor([0, 2, 1, 3])
-    pos = (inv // 4) * 4 + swap[inv % 4]
-    return pos.to(dtype=torch.int32, device=device)
-
-
 @triton.jit
 def _marlin_fp8_unrepack_dequant_kernel(
     packed_ptr,
-    inv_ptr,
-    scale_pos_ptr,
     marlin_scale_ptr,
     out_ptr,
-    padded_n,
-    size_n,
-    size_k,
+    padded_n: tl.constexpr,
+    size_n: tl.constexpr,
+    size_k: tl.constexpr,
     K_GROUPS: tl.constexpr,
     TILE_ELEMS: tl.constexpr,
 ):
@@ -144,12 +128,23 @@ def _marlin_fp8_unrepack_dequant_kernel(
     lane = tl.arange(0, TILE_ELEMS)
     n_local = lane // 16
     k_in = lane % 16
-    # tile-internal index of (n_local, k_in): [4 n-tiles][16 k][16 n]
-    g = (n_local // 16) * 256 + k_in * 16 + (n_local % 16)
-    src = tl.load(inv_ptr + g)
+    # Exact inverse of get_weight_perm(8), expressed as a bit permutation.
+    # The 1024-entry lookup and its per-call int64 -> int32 cast disappear.
+    src = (
+        (k_in >> 3)
+        | ((k_in & 1) << 1)
+        | ((n_local >> 3) << 2)
+        | ((k_in & 6) << 4)
+        | ((n_local & 7) << 7)
+    )
     n_global = nc * 64 + n_local
     n_mask = n_global < size_n
-    scale_pos = tl.load(scale_pos_ptr + n_local)
+    scale_pos = (
+        ((n_local & 16) >> 4)
+        | ((n_local & 8) >> 2)
+        | ((n_local & 32) >> 3)
+        | ((n_local & 7) << 3)
+    )
     for i in tl.static_range(K_GROUPS):
         kr = kg * K_GROUPS + i
         tile_base = kr.to(tl.int64) * (padded_n * 16) + nc * TILE_ELEMS
@@ -181,7 +176,6 @@ def reconstruct_bf16_weight_triton(
             marlin_qweight, marlin_scales, size_n, size_k, dtype
         )
     padded_n, padded_k = marlin_repacked_nk(marlin_qweight, num_bits=8)
-    inv_weight, _ = _inverse_perms(marlin_qweight.device)
     out = torch.empty(size_n, size_k, dtype=dtype, device=marlin_qweight.device)
     packed = marlin_qweight.contiguous().view(torch.uint8).view(-1)
     scales_u8 = marlin_scales.contiguous().view(torch.uint8).view(-1)
@@ -189,8 +183,6 @@ def reconstruct_bf16_weight_triton(
     grid = (padded_k // GPTQ_MARLIN_TILE // k_groups, padded_n // 64)
     _marlin_fp8_unrepack_dequant_kernel[grid](
         packed,
-        inv_weight.to(torch.int32),
-        _scale_inverse_table(marlin_qweight.device),
         scales_u8,
         out,
         padded_n,

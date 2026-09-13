@@ -46,10 +46,32 @@ def _reference_repack(weight: torch.Tensor, scales_u8: torch.Tensor, dtype):
     return marlin_q, mxfp8_marlin_process_scales(s)
 
 
-@pytest.mark.parametrize(
-    "size_n,size_k", [(256, 512), (1365, 7168), (7168, 683 * 32 // 32 * 32)]
-)
-def test_unrepack_matches_reference(size_n, size_k):
+def test_reconstruction_bit_permutations_cover_the_marlin_layout():
+    """Every tile lane and scale column selects the original packed byte."""
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        get_scale_perms,
+    )
+
+    lane = torch.arange(1024)
+    n, k = lane // 16, lane % 16
+    source = (
+        (k >> 3) | ((k & 1) << 1) | ((n >> 3) << 2) | ((k & 6) << 4) | ((n & 7) << 7)
+    )
+    tiled = (n // 16) * 256 + k * 16 + n % 16
+    assert torch.equal(source, torch.argsort(get_weight_perm(8))[tiled])
+
+    n = torch.arange(64)
+    scale = ((n & 16) >> 4) | ((n & 8) >> 2) | ((n & 32) >> 3) | ((n & 7) << 3)
+    inverse = torch.argsort(torch.tensor(get_scale_perms()[0]))
+    expected = (inverse // 4) * 4 + torch.tensor([0, 2, 1, 3])[inverse % 4]
+    assert torch.equal(scale, expected)
+
+
+@pytest.mark.parametrize("size_n,size_k", [(256, 512), (1365, 7168), (7168, 704)])
+def test_unrepack_matches_reference(size_n, size_k, monkeypatch):
+    # This part of the oracle uses CPU packing; GPU reconstruction is covered
+    # below independently of the serving image's backend preference.
+    monkeypatch.setenv("VLLM_MXFP8_HYBRID_RECONSTRUCT", "torch")
     torch.manual_seed(0)
     weight = (torch.randn(size_n, size_k) / 4).to(torch.float8_e4m3fn)
     scales = torch.randint(118, 132, (size_n, size_k // 32), dtype=torch.uint8)
@@ -77,6 +99,7 @@ def test_triton_reconstruction_matches_torch_on_cuda_repack(size_n, size_k):
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
         prepare_mxfp8_layer_for_marlin,
     )
+    from vllm.utils.torch_utils import set_default_torch_dtype
 
     torch.manual_seed(0)
     dev = torch.device("cuda")
@@ -93,7 +116,8 @@ def test_triton_reconstruction_matches_torch_on_cuda_repack(size_n, size_k):
     layer.weight_scale = torch.nn.Parameter(scales.clone(), requires_grad=False)
     layer.output_size_per_partition = size_n
     layer.input_size_per_partition = size_k
-    prepare_mxfp8_layer_for_marlin(layer)
+    with set_default_torch_dtype(torch.bfloat16):
+        prepare_mxfp8_layer_for_marlin(layer)
 
     w_torch = reconstruct_bf16_weight_torch(
         layer.weight, layer.weight_scale, size_n, size_k, torch.bfloat16

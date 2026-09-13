@@ -37,3 +37,26 @@ def test_split_launch_maps_need_two_experts():
 def test_split_launch_inactive_outside_a_split_half(monkeypatch):
     monkeypatch.setenv("VLLM_K3_MOE_SPLIT_LAUNCH", "1")
     assert not kq._moe_split_launch_active()
+
+
+def test_split_halves_retain_independent_fc2_without_duplicating_scratch(monkeypatch):
+    from vllm.v1.worker import ubatching
+
+    runtime = SimpleNamespace(max_m=8, trellis_split_fc2={})
+    binding = SimpleNamespace(
+        a=torch.empty(4, 16, dtype=torch.bfloat16),
+        num_topk=2,
+        intermediate_cache13=torch.empty(512, dtype=torch.float16),
+    )
+    monkeypatch.setattr(ubatching, "dbo_current_ubatch_id", lambda: 0)
+    first = kq._split_half_fc2_output(runtime, binding)
+    first.fill_(3)
+    assert kq._split_half_fc2_output(runtime, binding) is first
+    monkeypatch.setattr(ubatching, "dbo_current_ubatch_id", lambda: 1)
+    second = kq._split_half_fc2_output(runtime, binding)
+    second.fill_(5)
+    assert first.dtype == second.dtype == binding.intermediate_cache13.dtype
+    assert first.numel() == second.numel() == 4 * 2 * 16
+    assert first.data_ptr() != second.data_ptr()
+    assert torch.equal(first, torch.full_like(first, 3))
+    assert first.data_ptr() != binding.intermediate_cache13.data_ptr()

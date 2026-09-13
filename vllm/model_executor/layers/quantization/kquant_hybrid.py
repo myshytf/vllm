@@ -243,7 +243,7 @@ def _split_launch_expert_maps(
 ) -> tuple[Any, Any] | None:
     """The secondary tier's route map split into two expert ranges (local
     experts below and from the midpoint); cached on the layer state."""
-    maps = state.emap_secondary_split
+    maps = getattr(state, "emap_secondary_split", None)
     if maps is not None:
         return maps
     emap = state.emap_secondary
@@ -258,29 +258,38 @@ def _split_launch_expert_maps(
     return maps
 
 
-def _split_half_scratch(
-    runtime: "_HybridSharedRuntime", scratch: torch.Tensor
+def _split_half_fc2_output(
+    runtime: "_HybridSharedRuntime", binding: Any
 ) -> torch.Tensor:
-    """The scratch arena for the running split half: the shared arena for the
-    first half, a second arena of the same shape for the second half."""
+    """Retain one half's per-route outputs across the other half's FC1 work.
+
+    The ordinary kernel aliases FC1 and FC2 storage. Even consecutive expert
+    ranges in one half therefore need separate FC2 storage. The rest of the
+    scratch remains reusable because each fused launch completes before the
+    next launch on the shared compute stream.
+    """
     from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-    if dbo_current_ubatch_id() == 0:
-        return scratch
-    second = runtime.trellis_scratch_second
+    half = dbo_current_ubatch_id()
+    output = runtime.trellis_split_fc2.get(half)
+    rows, hidden = binding.a.shape
+    capacity_rows = max(rows, (runtime.max_m or rows) // 2)
+    elements = capacity_rows * binding.num_topk * hidden
+    dtype = binding.intermediate_cache13.dtype
     if (
-        second is None
-        or second.numel() < scratch.numel()
-        or second.dtype != scratch.dtype
-        or second.device != scratch.device
+        output is None
+        or output.numel() < elements
+        or output.dtype != dtype
+        or output.device != binding.a.device
     ):
-        second = torch.empty_like(scratch)
-        runtime.trellis_scratch_second = second
+        output = torch.empty(elements, dtype=dtype, device=binding.a.device)
+        runtime.trellis_split_fc2[half] = output
         logger.info(
-            "split MoE launches: second scratch arena of %.1f MiB allocated",
-            second.numel() * second.element_size() / 2**20,
+            "split MoE launches: half %d retains %.1f MiB of route output",
+            half,
+            output.numel() * output.element_size() / 2**20,
         )
-    return second
+    return output
 
 
 def _run_split_launches(
@@ -288,6 +297,7 @@ def _run_split_launches(
     bind_kwargs: dict[str, Any],
     state: "_HybridLayerState",
     maps: tuple[Any, Any],
+    runtime: "_HybridSharedRuntime",
 ) -> torch.Tensor:
     from b12x.moe import fused_moe
 
@@ -298,14 +308,19 @@ def _run_split_launches(
         None,
     )
     first_map, second_map = maps
+    # Route maps select one launch's experts. The final reduction must use
+    # the entire tier, including FC2 slots written before the hand-off.
+    bind_kwargs = {**bind_kwargs, "output_expert_map": state.emap_secondary}
     binding = fused_moe.bind(
         trellis_plan, **{**bind_kwargs, "route_expert_map": first_map}
     )
+    retained_fc2 = _split_half_fc2_output(runtime, binding)
     binding = dataclasses.replace(
         binding,
         fused_launch=fused_launch,
         topk_sum_launch=topk_sum_launch,
         skip_topk_sum=True,
+        retained_fc2_output=retained_fc2,
     )
     fused_moe.run(binding=binding)
     compute_handoff()
@@ -317,6 +332,7 @@ def _run_split_launches(
         fused_launch=fused_launch,
         topk_sum_launch=topk_sum_launch,
         zero_fc2_output_override=False,
+        retained_fc2_output=retained_fc2,
     )
     return fused_moe.run(binding=binding)
 
@@ -454,8 +470,8 @@ class _HybridSharedRuntime:
         # H128(h * down_suh); this stable buffer receives its inverse transform.
         self.kquant_logical_mid: torch.Tensor | None = None
         self.trellis_scratch: torch.Tensor | None = None
-        # Second scratch arena for the second split-prefill half (split MoE launches).
-        self.trellis_scratch_second: torch.Tensor | None = None
+        # Only per-route FC2 outputs survive expert-range hand-offs.
+        self.trellis_split_fc2: dict[int, torch.Tensor] = {}
         self.trellis_prefill_scratch: torch.Tensor | None = None
         self.trellis_output: torch.Tensor | None = None
         self.trellis_prefill_input: torch.Tensor | None = None
@@ -2382,12 +2398,10 @@ class KQuantHybridMoEMethod(FusedMoEMethodBase):
                 else None
             )
             if split_maps is not None:
-                # Two expert-range launches with a hand-off to the other split
-                # half between them; each half has its own scratch arena so the
-                # per-route FC2 buffer survives the other half's MoE call.
-                bind_kwargs["scratch"] = _split_half_scratch(runtime, trellis_scratch)
+                # Independent FC2 storage survives both halves' FC1 launches;
+                # the remaining scratch is ordered on the compute stream.
                 out_trellis = _run_split_launches(
-                    trellis_plan, bind_kwargs, state, split_maps
+                    trellis_plan, bind_kwargs, state, split_maps, runtime
                 )[:m]
             else:
                 binding = fused_moe.bind(trellis_plan, **bind_kwargs)
