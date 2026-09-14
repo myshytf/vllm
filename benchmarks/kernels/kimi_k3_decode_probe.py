@@ -69,6 +69,7 @@ class KimiDecodeProbeWorker:
             "policy": getattr(self, "_k3_probe_policy", "all"),
         }
 
+    @torch.inference_mode()
     def k3_set_prefetch_policy(self, policy: str):
         """Select original/all, no reads, window A only, or windows B/C only."""
         if policy not in ("all", "off", "a_only", "bc_only"):
