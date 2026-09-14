@@ -1,0 +1,263 @@
+{
+  "status": "qualified",
+  "metric": "isolated completion decode tokens per second; equal outputs and acceptance required",
+  "runtime_change": {
+    "VLLM_K3_L2_PREFETCH_PERSIST_MB": "32",
+    "actual_bytes_per_gpu": 33554432
+  },
+  "production_package": "/home/g0san/kimi-k3-production/candidates/k3-decode-cache-20260914",
+  "reference_package": "/home/g0san/kimi-k3-production/candidates/k3-precision-preserving-20260914",
+  "implementation_revision": "48acfd9e6f2c08348f11588ad41a1c916b01d829",
+  "image_id": "sha256:0ffca9b0e12bbca3e55f43a64351d8d25af336db4d11b27ef3887de4ac9116ed",
+  "hardware": {
+    "gpu": "9 RTX PRO 6000 Blackwell, SM120",
+    "physical_order": "1,2,3,4,5,6,7,8,0",
+    "tp": 9,
+    "dcp": 9
+  },
+  "inference": {
+    "model": "Kimi-K3",
+    "max_model_len": 1048576,
+    "max_num_seqs": 4,
+    "kv_bytes_per_rank": 3435973836,
+    "speculative_tokens": 3,
+    "draft_query_rows": 8,
+    "dtype": "bfloat16",
+    "target_weight_codec": "deployed QSRT K2",
+    "dense_weights": "deployed MXFP8 W8A16",
+    "kv_dtype": "fp8_ds_mla",
+    "draft_kv_dtype": "fp8",
+    "temperature": 0,
+    "seed": 20260912,
+    "prefill_mode": "overlap moesplit=1 offset=2"
+  },
+  "measurements": [
+    {
+      "status": "research-only",
+      "candidate": "off",
+      "persist": "0",
+      "length": 8192,
+      "output_tokens": 512,
+      "reference_median_tok_s": 118.75990703062742,
+      "candidate_median_tok_s": 115.62699577828641,
+      "candidate_over_reference": 0.9736197902922487,
+      "all_outputs_and_acceptance_exact": true,
+      "limitation": "Disabled plans retain their no-op CUDA graph nodes.",
+      "artifact": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/prefetch-off-fixed-8k",
+      "samples_per_arm": {
+        "A": 2,
+        "B": 2
+      },
+      "ttft_mean_s": {
+        "A": 3.8065834139997605,
+        "B": 4.171742761973292
+      },
+      "step_mean_ms": {
+        "A": 33.35506727900031,
+        "B": 34.258784360546514
+      }
+    },
+    {
+      "status": "research-only",
+      "candidate": "a_only",
+      "persist": "0",
+      "length": 8192,
+      "output_tokens": 512,
+      "reference_median_tok_s": 118.905711161247,
+      "candidate_median_tok_s": 116.09885956972892,
+      "candidate_over_reference": 0.9763943080268723,
+      "all_outputs_and_acceptance_exact": true,
+      "limitation": "Disabled plans retain their no-op CUDA graph nodes.",
+      "artifact": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/a-only-8k",
+      "samples_per_arm": {
+        "A": 2,
+        "B": 2
+      },
+      "ttft_mean_s": {
+        "A": 3.81557252901257,
+        "B": 3.8169264055031817
+      },
+      "step_mean_ms": {
+        "A": 33.31413095733043,
+        "B": 34.11954540313518
+      }
+    },
+    {
+      "status": "research-only",
+      "candidate": "bc_only",
+      "persist": "0",
+      "length": 8192,
+      "output_tokens": 512,
+      "reference_median_tok_s": 118.94786326511309,
+      "candidate_median_tok_s": 118.45827896805616,
+      "candidate_over_reference": 0.9958840429443804,
+      "all_outputs_and_acceptance_exact": true,
+      "limitation": "Disabled plans retain their no-op CUDA graph nodes.",
+      "artifact": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/bc-only-8k",
+      "samples_per_arm": {
+        "A": 2,
+        "B": 2
+      },
+      "ttft_mean_s": {
+        "A": 3.8209626594907604,
+        "B": 3.821963504975429
+      },
+      "step_mean_ms": {
+        "A": 33.30232663163121,
+        "B": 33.43996168597053
+      }
+    },
+    {
+      "status": "research-only",
+      "candidate": "all",
+      "persist": "max",
+      "length": 8192,
+      "output_tokens": 512,
+      "reference_median_tok_s": 118.97982059924337,
+      "candidate_median_tok_s": 119.29068779146536,
+      "candidate_over_reference": 1.002612772406752,
+      "all_outputs_and_acceptance_exact": true,
+      "limitation": "Disabled plans retain their no-op CUDA graph nodes.",
+      "artifact": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/persist-max-fixed-8k",
+      "samples_per_arm": {
+        "A": 2,
+        "B": 2
+      },
+      "ttft_mean_s": {
+        "A": 3.8280909525346942,
+        "B": 3.8707908715005033
+      },
+      "step_mean_ms": {
+        "A": 33.293382914659254,
+        "B": 33.20661830231222
+      }
+    },
+    {
+      "status": "research-only",
+      "candidate": "all",
+      "persist": "32",
+      "length": 8192,
+      "output_tokens": 512,
+      "reference_median_tok_s": 118.91140297137417,
+      "candidate_median_tok_s": 119.60251260325953,
+      "candidate_over_reference": 1.00581197105253,
+      "all_outputs_and_acceptance_exact": true,
+      "limitation": "Disabled plans retain their no-op CUDA graph nodes.",
+      "artifact": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/persist-32-8k",
+      "samples_per_arm": {
+        "A": 2,
+        "B": 2
+      },
+      "ttft_mean_s": {
+        "A": 3.814221381995594,
+        "B": 3.8161345459811855
+      },
+      "step_mean_ms": {
+        "A": 33.312538000005986,
+        "B": 33.120045825783095
+      }
+    },
+    {
+      "status": "research-only",
+      "candidate": "all",
+      "persist": "64",
+      "length": 8192,
+      "output_tokens": 512,
+      "reference_median_tok_s": 118.97527757433195,
+      "candidate_median_tok_s": 119.49326135726099,
+      "candidate_over_reference": 1.0043537093881156,
+      "all_outputs_and_acceptance_exact": true,
+      "limitation": "Disabled plans retain their no-op CUDA graph nodes.",
+      "artifact": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/persist-64-8k",
+      "samples_per_arm": {
+        "A": 2,
+        "B": 2
+      },
+      "ttft_mean_s": {
+        "A": 3.819413758988958,
+        "B": 3.845272784528788
+      },
+      "step_mean_ms": {
+        "A": 33.29465275561769,
+        "B": 33.15032501149987
+      }
+    },
+    {
+      "status": "research-only",
+      "candidate": "all",
+      "persist": "32",
+      "length": 8192,
+      "output_tokens": 1024,
+      "reference_median_tok_s": 119.32252678104555,
+      "candidate_median_tok_s": 120.0809693504059,
+      "candidate_over_reference": 1.0063562395954961,
+      "all_outputs_and_acceptance_exact": true,
+      "limitation": "Disabled plans retain their no-op CUDA graph nodes.",
+      "artifact": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/persist-32-repeat-8k",
+      "samples_per_arm": {
+        "A": 4,
+        "B": 4
+      },
+      "ttft_mean_s": {
+        "A": 3.8236399917368544,
+        "B": 3.826051151496358
+      },
+      "step_mean_ms": {
+        "A": 33.36272216729271,
+        "B": 33.153417244135014
+      }
+    },
+    {
+      "status": "research-only",
+      "candidate": "all",
+      "persist": "32",
+      "length": 65536,
+      "output_tokens": 512,
+      "reference_median_tok_s": 90.81952895698332,
+      "candidate_median_tok_s": 91.03351144590421,
+      "candidate_over_reference": 1.0023561285923674,
+      "all_outputs_and_acceptance_exact": true,
+      "limitation": "Disabled plans retain their no-op CUDA graph nodes.",
+      "artifact": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914/persist-32-64k",
+      "samples_per_arm": {
+        "A": 2,
+        "B": 2
+      },
+      "ttft_mean_s": {
+        "A": 27.469317091512494,
+        "B": 27.49946866152459
+      },
+      "step_mean_ms": {
+        "A": 34.10029039686461,
+        "B": 34.02010616952215
+      }
+    }
+  ],
+  "qualification": {
+    "startup_exact": "cache32-startup-output/correctness.json",
+    "cache_exact_against_previous_production": "cache32-cache-reference.json",
+    "four_active": "cache32-four-active/correctness.json",
+    "max_patch_vision": "cache32-vision/correctness.json",
+    "authenticated_gateway": "gateway-final.json",
+    "model_source_files_unchanged": 181
+  },
+  "trace_target_graph_median_ms": {
+    "reference": 30.9393095,
+    "candidate": 30.964291
+  },
+  "limitations": [
+    "Paired throughput evidence is workload-specific and includes only 8K and 64K inputs.",
+    "The four-step profile does not establish a speedup; performance claims use unprofiled measurements.",
+    "The 1M configured context limit was retained, not requalified in full.",
+    "The Marlin storage adapter is component-only; no established isolated-kernel speedup and not deployed."
+  ],
+  "artifact_root": "/home/g0san/kimi-k3-production/research/decode-optimization-20260914",
+  "artifact_sha256": {
+    "performance-summary.json": "07b1e39d55c6031fb7923a0b24d37582853ce89ea41390bb2ff1bb33175196a5",
+    "mounted-source-manifest.json": "b9ebd0e34a7bee89560bd9c8ee109c17bc23473b33835349e924f0686baae3cc",
+    "cache32-cache-reference.json": "8244a8ad0027560680599fd056c17182382487226a7bdc9a57942f4220f14ee2",
+    "gateway-final.json": "fd0140a1ebaed990e169249dd9c91e56b91cf965f9a5d336255fd72ee25dbdbd",
+    "native-marlin-final/command.json": "c91b8d132b7bedf4d8f8cb44a602be05ad49c58203c7cb38f838d6365a830aa4",
+    "native-marlin-final/results/results.json": "a358476791ec545b7d38a88f4d9ec7909cc34b7e921b3a9c4cf34f8a353655fe"
+  }
+}
