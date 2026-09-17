@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import functools
+import os
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -218,6 +220,48 @@ def is_fused_kda_decode_supported(
     ):
         return False
     # SM90 is architecture-specific; SM10x and SM12x use family binaries.
+    return (
+        current_platform.is_device_capability(90)
+        or current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(120)
+    )
+
+
+_KDA_SPEC_FUSED_LIB_ENV = "VLLM_K3_KDA_SPEC_FUSED_LIB"
+
+
+@functools.cache
+def load_kda_spec_fused_op() -> Callable[..., None] | None:
+    """The fused speculative-decode KDA step (`_C_k3kda.fused_kda_spec_decode`),
+    loaded from ``VLLM_K3_KDA_SPEC_FUSED_LIB`` when set; None keeps the served
+    three-kernel chain (conv update, recurrent KDA, gated output norm)."""
+    path = os.getenv(_KDA_SPEC_FUSED_LIB_ENV, "")
+    if not path:
+        return None
+    torch.ops.load_library(path)
+    return torch.ops._C_k3kda.fused_kda_spec_decode
+
+
+def is_fused_kda_spec_decode_supported(
+    head_dim: int,
+    conv_width: int,
+    num_spec: int,
+    input_dtype: torch.dtype,
+    conv_state_dtype: torch.dtype,
+) -> bool:
+    """Whether the fused speculative-decode step can replace the spec chain."""
+    if load_kda_spec_fused_op() is None:
+        return False
+    if (
+        head_dim != 128
+        or conv_width != 4
+        or num_spec <= 0
+        or num_spec + 1 > 8
+        or input_dtype != torch.bfloat16
+        or conv_state_dtype != torch.bfloat16
+        or is_conv_state_dim_first()
+    ):
+        return False
     return (
         current_platform.is_device_capability(90)
         or current_platform.is_device_capability_family(100)
@@ -595,15 +639,29 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         # consumed by the prefill and fallback decode kernels.
         conv_state_dtype, _ = self.get_state_dtype()
         decode_conv1d_weight = None
-        if is_fused_kda_decode_supported(
+        fused_decode_supported = is_fused_kda_decode_supported(
             self.local_num_heads,
             self.head_dim,
             self.conv_size,
             self.num_spec,
             vllm_config.model_config.dtype,
             conv_state_dtype,
-        ):
+        )
+        self.fused_spec_decode = is_fused_kda_spec_decode_supported(
+            self.head_dim,
+            self.conv_size,
+            self.num_spec,
+            vllm_config.model_config.dtype,
+            conv_state_dtype,
+        )
+        if fused_decode_supported:
             logger.info_once("Fused KDA decode kernel (conv+KDA+norm) is enabled.")
+        if self.fused_spec_decode:
+            logger.info_once(
+                "Fused KDA speculative-decode kernel (conv+KDA+norm, %s) is enabled.",
+                os.getenv(_KDA_SPEC_FUSED_LIB_ENV, ""),
+            )
+        if fused_decode_supported or self.fused_spec_decode:
             decode_conv1d_weight = torch.empty(
                 3,
                 self.conv_size,
@@ -912,6 +970,44 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 output_gate=g2[:num_actual_tokens],
                 norm_weight=self.decode_norm_weight,
                 norm_eps=self.o_norm.eps,
+            )
+            return
+
+        if (
+            self.fused_spec_decode
+            and has_spec_decode
+            and m.num_prefills == 0
+            and m.num_decodes == 0
+            and self.decode_conv1d_weight is not None
+            and self.decode_norm_weight is not None
+        ):
+            # Pure speculative-decode batch: one launch per layer replaces the
+            # conv update, the recurrent KDA kernel and the gated output norm
+            # (feedback: research/dense-feedback-20260918). Padded requests
+            # have zero query length and are skipped inside the kernel.
+            assert spec_state_indices_tensor is not None
+            assert spec_query_start_loc is not None
+            assert num_accepted_tokens is not None
+            fused_spec_op = load_kda_spec_fused_op()
+            assert fused_spec_op is not None
+            fused_spec_op(
+                mixed_qkv,
+                self.decode_conv1d_weight,
+                self.conv1d.bias,
+                conv_state,
+                g1,
+                beta,
+                self.A_log,
+                self.dt_bias,
+                spec_state_indices_tensor,
+                spec_query_start_loc,
+                num_accepted_tokens,
+                recurrent_state,
+                core_attn_out[:, :num_actual_tokens],
+                self.gate_lower_bound,
+                g2[:num_actual_tokens],
+                self.decode_norm_weight,
+                self.o_norm.eps,
             )
             return
 
