@@ -654,6 +654,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             vllm_config.model_config.dtype,
             conv_state_dtype,
         )
+        # The plain-decode fused kernel needs its own support check: the spec
+        # path also materialises the decode weights, but the plain kernel
+        # requires the num_spec == 0 conv-state width.
+        self.fused_plain_decode = fused_decode_supported
         if fused_decode_supported:
             logger.info_once("Fused KDA decode kernel (conv+KDA+norm) is enabled.")
         if self.fused_spec_decode:
@@ -947,7 +951,8 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             conv_state = conv_state.transpose(-1, -2)
 
         if (
-            self.decode_conv1d_weight is not None
+            self.fused_plain_decode
+            and self.decode_conv1d_weight is not None
             and self.decode_norm_weight is not None
             and not has_spec_decode
             and m.num_prefills == 0
