@@ -203,7 +203,9 @@ __global__ void __launch_bounds__(kThreads, 2) kda_spec_decode_kernel(
             (t < T) ? ld_bf16(x, (int64_t)(qs + t) * st.x_row + ch) : 0.0f;
       }
       const float b = bias == nullptr ? 0.0f : bias[ch];
-      const float* wp = w_t + (int64_t)part * kW * dim + ch;
+      // weight layout [3][kW][H*D]: index the channel within the part, not the
+      // packed q|k|v channel (the packed offset is only for x/bias/conv_state)
+      const float* wp = w_t + (int64_t)part * kW * dim + h * kD + c;
       const float w0 = wp[0 * dim], w1 = wp[1 * dim], w2 = wp[2 * dim],
                   w3 = wp[3 * dim];
 #pragma unroll
