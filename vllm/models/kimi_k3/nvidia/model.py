@@ -464,6 +464,7 @@ class KimiRoutedOutputTransform(nn.Module):
         *,
         column_block: bool = False,
         normalized_block: bool = False,
+        addmm_residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Project the routed latent back to the hidden dim.
 
@@ -485,6 +486,10 @@ class KimiRoutedOutputTransform(nn.Module):
                 normalized, packed ``[rows, shard_width]`` input shard (from
                 ``all_reduce_norm_shard``); the latent was captured there, so
                 it goes straight to the TP-sharded up-projection.
+            addmm_residual: decode shared-expert partial added in the
+                TP-sharded up-projection GEMM's beta epilogue
+                (``can_addmm_residual``); the result is the rank-local partial
+                hidden state plus that residual, rounded once.
         """
         if residual is not None and output is not None:
             raise ValueError(
@@ -501,7 +506,9 @@ class KimiRoutedOutputTransform(nn.Module):
                     "A normalized block feeds the TP-sharded up-projection "
                     "directly, without residual, output or column-block modes"
                 )
-            hidden_states, _ = self.up_proj.forward_packed_shard(hidden_states)
+            hidden_states, _ = self.up_proj.forward_packed_shard(
+                hidden_states, residual=addmm_residual
+            )
             return hidden_states
         if column_block:
             if not isinstance(self.up_proj, KimiPaddedRowParallelLinear):
@@ -537,11 +544,39 @@ class KimiRoutedOutputTransform(nn.Module):
         elif column_block:
             assert isinstance(self.up_proj, KimiPaddedRowParallelLinear)
             hidden_states, _ = self.up_proj.forward_local_block(hidden_states)
+        elif addmm_residual is not None:
+            assert isinstance(self.up_proj, KimiPaddedRowParallelLinear)
+            hidden_states, _ = self.up_proj.forward_addmm(hidden_states, addmm_residual)
         else:
             hidden_states, _ = self.up_proj(hidden_states)
         if residual is not None:
             hidden_states.add_(residual)
         return hidden_states
+
+    def can_addmm_residual(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> bool:
+        """Whether the decode shared-expert partial can ride the TP-sharded
+        up-projection's beta epilogue (``VLLM_K3_UP_PROJ_ADDMM``)."""
+        up_proj = self.up_proj
+        return (
+            envs.VLLM_K3_UP_PROJ_ADDMM
+            and isinstance(up_proj, KimiPaddedRowParallelLinear)
+            and isinstance(up_proj.quant_method, UnquantizedLinearMethod)
+            and getattr(up_proj, "weight", None) is not None
+            and up_proj.bias is None
+            and not up_proj.reduce_results
+            and not up_proj.input_is_parallel
+            and not envs.VLLM_BATCH_INVARIANT
+            and hidden_states.ndim == 2
+            and 0 < hidden_states.shape[0] <= 16
+            and residual.shape == (hidden_states.shape[0], up_proj.output_size)
+            and residual.dtype == hidden_states.dtype == torch.bfloat16
+            and residual.device == hidden_states.device
+            and residual.is_contiguous()
+            and hidden_states.is_cuda
+            and not torch.is_grad_enabled()
+        )
 
     def all_reduce_norm_shard(self, partial: torch.Tensor) -> torch.Tensor | None:
         """All-reduce a decode TP-partial latent, RMS-normalize the sum and
@@ -943,9 +978,13 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             x = torch.nn.functional.pad(x, (0, self.input_pad))
         return super().forward(x)
 
-    def forward_packed_shard(self, shard: torch.Tensor) -> tuple[torch.Tensor, None]:
+    def forward_packed_shard(
+        self, shard: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, None]:
         """Rank-local projection of an already packed ``[rows, shard_width]``
-        input shard (the decode shard-pack path's GEMM without its copy)."""
+        input shard (the decode shard-pack path's GEMM without its copy).
+        With ``residual`` the GEMM adds it in its beta epilogue (one bf16
+        rounding of ``residual + shard @ W^T``)."""
         if (
             shard.ndim != 2
             or shard.shape[1] != self.shard_width
@@ -955,11 +994,32 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
                 f"Packed shard must be contiguous [rows, {self.shard_width}], "
                 f"got {tuple(shard.shape)}"
             )
-        output = self.quant_method.apply(self, shard, None)
+        if residual is None:
+            output = self.quant_method.apply(self, shard, None)
+        else:
+            if residual.shape != (shard.shape[0], self.output_size):
+                raise ValueError("addmm residual must match the projection output")
+            output = torch.addmm(residual, shard, self.weight.t())
         hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
         if hook is not None:
             hook(output.shape[0])
         return output, None
+
+    def forward_addmm(
+        self, x: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, None]:
+        """The decode shard-pack projection with ``residual`` added in the
+        GEMM's beta epilogue (the served path packs, projects, then adds)."""
+        from vllm.models.kimi_k3.nvidia.ops.projection_shard import (
+            pack_projection_shard,
+        )
+
+        if x.ndim != 2 or x.shape[1] != self.logical_input_size or x.stride(-1) != 1:
+            raise ValueError("addmm projection needs the full logical input rows")
+        shard = pack_projection_shard(
+            x, self.tp_rank * self.shard_width, self.shard_width
+        )
+        return self.forward_packed_shard(shard, residual=residual)
 
     @property
     def shard_width(self) -> int:

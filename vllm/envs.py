@@ -259,6 +259,7 @@ if TYPE_CHECKING:
     VLLM_K3_PACKED_MLA_QUERY: str = "bf16"
     VLLM_K3_PAIR_TOPK_FUSED: bool = False
     VLLM_K3_LATENT_AR_NORM_FUSED: bool = False
+    VLLM_K3_UP_PROJ_ADDMM: bool = False
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -1991,6 +1992,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_K3_LATENT_AR_NORM_FUSED": lambda: bool(
         int(os.getenv("VLLM_K3_LATENT_AR_NORM_FUSED", "0"))
     ),
+    # Kimi-K3 decode: add the shared-expert partial in the up-projection
+    # GEMM's beta epilogue (`torch.addmm`) instead of a separate bf16 add:
+    # the sum is rounded to bf16 once instead of twice (not bit-identical,
+    # at least as precise). Off = the served GEMM + add.
+    "VLLM_K3_UP_PROJ_ADDMM": lambda: bool(int(os.getenv("VLLM_K3_UP_PROJ_ADDMM", "0"))),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(
         int(os.getenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1"))
