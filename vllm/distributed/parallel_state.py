@@ -721,6 +721,22 @@ class GroupCoordinator:
             return None
         return self.device_communicator.pcie_all_gather_pair(first, second)
 
+    def pcie_all_reduce_rms_norm_shard(
+        self,
+        input_: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        col0: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Fused all-reduce + RMSNorm + column-block store; ``None`` when
+        unavailable (the caller falls back to the separate operations)."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        return self.device_communicator.pcie_all_reduce_rms_norm_shard(
+            input_, weight, eps, col0, width
+        )
+
     def pcie_prepare_reduce_scatter(self, wire: str) -> bool:
         """Compile the copy-engine ring's reduce-scatter kernels ahead of
         any kernel freeze or capture; ``False`` when there is no ring."""

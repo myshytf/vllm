@@ -401,6 +401,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return None
         return ca_comm.pcie_dma_all_gather_pair(first, second)
 
+    def pcie_all_reduce_rms_norm_shard(
+        self,
+        input_: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        col0: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Fused all-reduce + RMSNorm + column-block store on the B12X
+        two-shot runtime (see ``CustomAllreduce.try_all_reduce_rms_norm_shard``)."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return None
+        return ca_comm.try_all_reduce_rms_norm_shard(input_, weight, eps, col0, width)
+
     def pcie_prepare_reduce_scatter(self, wire: str) -> bool:
         ca_comm = self.ca_comm
         if ca_comm is None or ca_comm.disabled:

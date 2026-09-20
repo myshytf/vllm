@@ -258,6 +258,7 @@ if TYPE_CHECKING:
     VLLM_K3_PACKED_MLA_PARTIAL_DTYPE: str = "fp32"
     VLLM_K3_PACKED_MLA_QUERY: str = "bf16"
     VLLM_K3_PAIR_TOPK_FUSED: bool = False
+    VLLM_K3_LATENT_AR_NORM_FUSED: bool = False
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -1980,6 +1981,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # served two-launch path.
     "VLLM_K3_PAIR_TOPK_FUSED": lambda: bool(
         int(os.getenv("VLLM_K3_PAIR_TOPK_FUSED", "0"))
+    ),
+    # Kimi-K3 decode: all-reduce the routed latent, RMS-normalize it and
+    # write this rank's up-projection input shard in one B12X two-shot
+    # launch (replaces the separate RMSNorm kernel and the shard copy). The
+    # all-reduce is unchanged; the norm's variance and scale are computed in
+    # float64 (more precise than the fp32 kernel), so outputs are not bit-
+    # identical. Off = the served three-kernel sequence.
+    "VLLM_K3_LATENT_AR_NORM_FUSED": lambda: bool(
+        int(os.getenv("VLLM_K3_LATENT_AR_NORM_FUSED", "0"))
     ),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(

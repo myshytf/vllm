@@ -21,6 +21,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce_in_place,
+    tensor_model_parallel_all_reduce_rms_norm_shard,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -462,6 +463,7 @@ class KimiRoutedOutputTransform(nn.Module):
         output: torch.Tensor | None = None,
         *,
         column_block: bool = False,
+        normalized_block: bool = False,
     ) -> torch.Tensor:
         """Project the routed latent back to the hidden dim.
 
@@ -479,11 +481,28 @@ class KimiRoutedOutputTransform(nn.Module):
                 ``reduce_scatter_tp_partial``) rather than the full width; it
                 is normalized with the column-block RMSNorm and fed to the
                 TP-sharded up-projection as its input shard.
+            normalized_block: ``hidden_states`` is this rank's already
+                normalized, packed ``[rows, shard_width]`` input shard (from
+                ``all_reduce_norm_shard``); the latent was captured there, so
+                it goes straight to the TP-sharded up-projection.
         """
         if residual is not None and output is not None:
             raise ValueError(
                 "Kimi routed output transform accepts either residual or output"
             )
+        if normalized_block:
+            if (
+                residual is not None
+                or output is not None
+                or column_block
+                or not isinstance(self.up_proj, KimiPaddedRowParallelLinear)
+            ):
+                raise ValueError(
+                    "A normalized block feeds the TP-sharded up-projection "
+                    "directly, without residual, output or column-block modes"
+                )
+            hidden_states, _ = self.up_proj.forward_packed_shard(hidden_states)
+            return hidden_states
         if column_block:
             if not isinstance(self.up_proj, KimiPaddedRowParallelLinear):
                 raise ValueError(
@@ -523,6 +542,56 @@ class KimiRoutedOutputTransform(nn.Module):
         if residual is not None:
             hidden_states.add_(residual)
         return hidden_states
+
+    def all_reduce_norm_shard(self, partial: torch.Tensor) -> torch.Tensor | None:
+        """All-reduce a decode TP-partial latent, RMS-normalize the sum and
+        return this rank's packed up-projection input shard, in one B12X
+        two-shot launch (``VLLM_K3_LATENT_AR_NORM_FUSED``).
+
+        Returns the normalized ``[rows, shard_width]`` block for the
+        ``normalized_block`` path of ``forward`` (the full reduced latent is
+        captured here), or ``None`` when the layer keeps the separate
+        all-reduce, RMSNorm and shard copy: the switch is off, the
+        up-projection is not the TP-sharded decode projection, the latent
+        capture is active, the norm is not the plain full-width RMSNorm, or
+        the collective declines the shape.
+        """
+        up_proj = self.up_proj
+        norm = self.norm
+        if (
+            not envs.VLLM_K3_LATENT_AR_NORM_FUSED
+            or norm is None
+            or norm.variance_size_override is not None
+            or not isinstance(up_proj, KimiPaddedRowParallelLinear)
+            or up_proj.reduce_results
+            or up_proj.input_is_parallel
+            or up_proj.bias is not None
+            or not isinstance(up_proj.quant_method, UnquantizedLinearMethod)
+            or envs.VLLM_BATCH_INVARIANT
+            or os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+            or partial.ndim != 2
+            or not 0 < partial.shape[0] <= 16
+            or partial.shape[1] != up_proj.logical_input_size
+            or partial.dtype != torch.bfloat16
+            or not partial.is_cuda
+            or not partial.is_contiguous()
+            or norm.weight.dtype != torch.bfloat16
+            or torch.is_grad_enabled()
+        ):
+            return None
+        shard_width = up_proj.shard_width
+        fused = tensor_model_parallel_all_reduce_rms_norm_shard(
+            partial,
+            norm.weight.data,
+            norm.variance_epsilon,
+            up_proj.tp_rank * shard_width,
+            shard_width,
+        )
+        if fused is None:
+            return None
+        reduced, block = fused
+        self.capture_routed_latent(reduced)
+        return block
 
     def reduce_scatter_tp_partial(self, partial: torch.Tensor) -> torch.Tensor | None:
         """Reduce a prefill TP-partial latent to this rank's input shard.
@@ -873,6 +942,24 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
         if self.input_pad:
             x = torch.nn.functional.pad(x, (0, self.input_pad))
         return super().forward(x)
+
+    def forward_packed_shard(self, shard: torch.Tensor) -> tuple[torch.Tensor, None]:
+        """Rank-local projection of an already packed ``[rows, shard_width]``
+        input shard (the decode shard-pack path's GEMM without its copy)."""
+        if (
+            shard.ndim != 2
+            or shard.shape[1] != self.shard_width
+            or not shard.is_contiguous()
+        ):
+            raise ValueError(
+                f"Packed shard must be contiguous [rows, {self.shard_width}], "
+                f"got {tuple(shard.shape)}"
+            )
+        output = self.quant_method.apply(self, shard, None)
+        hook = getattr(self, "_l2_prefetch_pre_reduce_hook", None)
+        if hook is not None:
+            hook(output.shape[0])
+        return output, None
 
     @property
     def shard_width(self) -> int:

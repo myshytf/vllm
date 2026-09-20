@@ -368,6 +368,24 @@ def _ubatch_ring_active() -> bool:
     return _ubatch_active() and not _ubatch_no_yield()
 
 
+def tensor_model_parallel_all_reduce_rms_norm_shard(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    col0: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """All-reduce ``input_`` across the TP group and, in the same launch,
+    RMS-normalize the result and store its column block ``[col0, col0+width)``.
+    Returns ``(reduced, block)`` or ``None`` when the fused collective is
+    unavailable; not used inside split-prefill regions or piecewise drivers."""
+    if _ubatch_active() or _piecewise() is not None:
+        return None
+    return get_tp_group().pcie_all_reduce_rms_norm_shard(
+        input_, weight, eps, col0, width
+    )
+
+
 def tensor_model_parallel_pcie_all_gather_pair(
     first: torch.Tensor, second: torch.Tensor
 ) -> tuple[Any, ...] | None:

@@ -246,6 +246,18 @@ class DeviceCommunicatorBase:
         """
         return None
 
+    def pcie_all_reduce_rms_norm_shard(
+        self,
+        input_: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        col0: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """All-reduce, RMS-normalize and store one column block in one
+        launch; ``None`` when no such fused collective is available."""
+        return None
+
     def pcie_prepare_reduce_scatter(self, wire: str) -> bool:
         """Compile a copy-engine ring's reduce-scatter kernels; ``False``
         when there is no such ring."""

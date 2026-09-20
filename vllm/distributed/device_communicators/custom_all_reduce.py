@@ -1155,6 +1155,13 @@ class CustomAllreduce:
                         f"all_reduce_mode; cannot select {mode!r}"
                     )
                 twoshot.all_reduce_mode = mode
+            if envs.VLLM_K3_LATENT_AR_NORM_FUSED and hasattr(
+                twoshot, "all_reduce_rms_norm_shard"
+            ):
+                # Compile the fused RMSNorm-shard all-reduce for capture too.
+                twoshot.norm_shard_enabled = getattr(
+                    twoshot, "all_reduce_mode", None
+                ) == "push" and getattr(twoshot, "_balanced_partition", False)
             twoshot.prepare_graph()
         except Exception as exc:
             init_error = exc
@@ -1422,6 +1429,48 @@ class CustomAllreduce:
                 self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
             )
         return out
+
+    def try_all_reduce_rms_norm_shard(
+        self,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        col0: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """All-reduce ``inp`` and, in the same B12X two-shot launch, RMS-
+        normalize the reduced rows and write the normalized column block
+        ``[col0, col0 + width)`` (``[rows, width]`` bf16, zero-filled past the
+        row). Returns ``(reduced, block)`` or ``None`` when the two-shot
+        runtime, its fused epilogue or the shape is unavailable; the caller
+        then runs the separate all-reduce, norm and shard copy.
+
+        Inside a warmup capture (no stream capturing) the placeholders of
+        ``custom_all_reduce`` are returned without communication.
+        """
+        twoshot = self._pcie_twoshot
+        if (
+            self.disabled
+            or twoshot is None
+            or not getattr(twoshot, "norm_shard_enabled", False)
+            or inp.ndim != 2
+            or inp.dtype != torch.bfloat16
+            or not self._pcie_twoshot_accepts(inp)
+            or inp.shape[0] > 16
+        ):
+            return None
+        if (
+            self._IS_CAPTURING
+            and not torch.cuda.is_current_stream_capturing()
+            and not _is_piecewise_cudagraph_runtime()
+        ):
+            # Warmup: mimic the allocation pattern without communication.
+            return torch.empty_like(inp), inp.new_empty((inp.shape[0], width))
+        stream = self._pcie_runtime_stream()
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                return twoshot.all_reduce_rms_norm_shard(inp, weight, eps, col0, width)
+        return twoshot.all_reduce_rms_norm_shard(inp, weight, eps, col0, width)
 
     def supports_fused_add_rms_norm(self) -> bool:
         """Return whether the B12X runtime provides fused AR + RMSNorm."""
