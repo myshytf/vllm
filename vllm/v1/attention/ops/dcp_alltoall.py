@@ -643,9 +643,14 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
     view of the second half of the FP32 allocation, which gives graph callers
     one allocation to retain.
 
-    A one-token input uses the combined B12X projection-gather and expert-
-    selection operation. Inputs of two through eight tokens use the paired
-    projection gather followed by one batched B12X expert-selection kernel.
+    With ``VLLM_K3_PAIR_TOPK_FUSED`` every batch of one to eight rows uses
+    the combined B12X projection-gather and expert-selection launch, also
+    for ranks that pad their shard to whole 16-byte packs (nine ranks: 400
+    latent columns and 104 experts per rank, clipped to the logical 3,584
+    and 896); its selection arithmetic is the batched kernel's. Without it,
+    a one-token input of exactly divided shards uses the combined launch and
+    two through eight tokens use the paired gather followed by the batched
+    selection kernel, as before.
 
     This binding has no collective fallback because the ordinary paired gather
     and router are model-level operations. Callers must use those operations
@@ -657,14 +662,25 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
     if local_down.ndim != 2 or local_router.ndim != 2:
         return None
     batch = int(local_down.shape[0])
-    local_down_width = _KIMI_LATENT_WIDTH // world_size
-    local_router_width = _KIMI_ROUTER_WIDTH // world_size
-    # The paired transport moves 16-byte packs; a world size that does not
-    # divide the widths into whole packs (nine ranks: 398 bf16 and 99 fp32)
-    # uses the ordinary paired gather and router instead.
-    if (
-        local_down_width * local_down.element_size() % 16
-        or local_router_width * local_router.element_size() % 16
+    local_down_width = int(local_down.shape[1])
+    local_router_width = int(local_router.shape[1])
+    fused_all = envs.VLLM_K3_PAIR_TOPK_FUSED
+    exact_shards = (
+        local_down_width * world_size == _KIMI_LATENT_WIDTH
+        and local_router_width * world_size == _KIMI_ROUTER_WIDTH
+    )
+    if not fused_all:
+        # The legacy paired transport moves 16-byte packs of exactly divided
+        # shards; a world size that does not divide the widths into whole
+        # packs (nine ranks: 398 bf16 and 99 fp32) uses the ordinary paired
+        # gather and router instead.
+        if not exact_shards:
+            return None
+    elif (
+        (local_down_width * local_down.element_size()) % 16
+        or (local_router_width * local_router.element_size()) % 16
+        or local_down_width * world_size < _KIMI_LATENT_WIDTH
+        or local_router_width * world_size < _KIMI_ROUTER_WIDTH
     ):
         return None
     if (
@@ -691,7 +707,10 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
     token_cap = envs.VLLM_DCP_A2A_MAX_TOKENS
     if token_cap > 0 and batch > token_cap:
         return None
-    max_batch_size = 1 if batch == 1 else _KIMI_PAIRED_MAX_BATCH_SIZE
+    if fused_all:
+        max_batch_size = _KIMI_PAIRED_MAX_BATCH_SIZE
+    else:
+        max_batch_size = 1 if batch == 1 else _KIMI_PAIRED_MAX_BATCH_SIZE
     if token_cap > 0:
         max_batch_size = min(max_batch_size, token_cap)
 
@@ -709,7 +728,8 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
     )
     if pool is None:
         return None
-    if batch == 1:
+    use_fused = fused_all or batch == 1
+    if use_fused:
         if not hasattr(pool, "all_gather_pair_kimi_topk"):
             return None
     elif not hasattr(pool, "all_gather_pair") or not hasattr(pool, "kimi_topk16"):
@@ -723,9 +743,9 @@ def try_dcp_b12x_all_gather_pair_kimi_topk(
     topk_weights = routing_payload[:batch]
     topk_ids = routing_payload[batch:].view(torch.int32)
     channel_id = _b12x_dcp_channel_id(cp_group)
-    if batch == 1:
+    if use_fused:
         gathered_down = torch.empty(
-            (1, _KIMI_LATENT_WIDTH),
+            (batch, _KIMI_LATENT_WIDTH),
             device=local_down.device,
             dtype=torch.bfloat16,
         )
@@ -873,6 +893,21 @@ def warmup_b12x_kimi_projection_gathers(
         device=device,
         dtype=torch.float32,
     )
+    if envs.VLLM_K3_PAIR_TOPK_FUSED:
+        # The fused selection serves the padded shards at every batch size;
+        # warm it with the same rows the paired gather uses so its launcher
+        # is prepared for capture on the shared pool.
+        for rows in range(1, pair_batch + 1):
+            if (
+                try_dcp_b12x_all_gather_pair_kimi_topk(
+                    local_down[:rows],
+                    local_router[:rows],
+                    correction_bias,
+                    projection_group,
+                )
+                is not None
+            ):
+                warmed += 1
     fused = try_dcp_b12x_all_gather_pair_kimi_topk(
         fused_down[:1],
         fused_router[:1],

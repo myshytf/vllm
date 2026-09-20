@@ -257,6 +257,7 @@ if TYPE_CHECKING:
     VLLM_K3_PACKED_MLA_SPLIT_POLICY: str = "balanced"
     VLLM_K3_PACKED_MLA_PARTIAL_DTYPE: str = "fp32"
     VLLM_K3_PACKED_MLA_QUERY: str = "bf16"
+    VLLM_K3_PAIR_TOPK_FUSED: bool = False
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -1970,6 +1971,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "full",
             "relax",
         ],
+    ),
+    # Kimi-K3 decode router: select the 16 routed experts inside the B12X
+    # paired projection gather (one launch) instead of a separate batched
+    # selection kernel after it. Covers padded shards (nine ranks) and
+    # batches of up to eight rows; the selection arithmetic is the batched
+    # kernel's, so expert ids and weights are bit-identical. Off = the
+    # served two-launch path.
+    "VLLM_K3_PAIR_TOPK_FUSED": lambda: bool(
+        int(os.getenv("VLLM_K3_PAIR_TOPK_FUSED", "0"))
     ),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(
