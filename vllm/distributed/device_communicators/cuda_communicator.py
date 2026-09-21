@@ -370,6 +370,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             input_, between, borrow_output=borrow_output
         )
 
+    def all_gather_owned_rows(
+        self, input_: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """Row all-gather over the split mapping (see ``split_owned_rows``);
+        ``None`` when unavailable."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled or not ca_comm.should_custom_ar(input_):
+            return None
+        return ca_comm.pcie_dma_all_gather_owned_rows(
+            input_, borrow_output=borrow_output
+        )
+
     def all_reduce_in_place(
         self, input_: torch.Tensor, *, borrow_output: bool = False
     ) -> torch.Tensor:

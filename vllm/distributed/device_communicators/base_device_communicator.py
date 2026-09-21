@@ -250,6 +250,12 @@ class DeviceCommunicatorBase:
         """Row blocks a split all-reduce hands to ``between``; None = unsupported."""
         return None
 
+    def all_gather_owned_rows(
+        self, input_: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """Row all-gather over the split mapping; None = unsupported."""
+        return None
+
     def all_reduce_in_place_split(
         self, input_: torch.Tensor, between, *, borrow_output: bool = False
     ) -> torch.Tensor | None:

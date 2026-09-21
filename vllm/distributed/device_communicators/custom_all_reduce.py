@@ -1687,6 +1687,23 @@ class CustomAllreduce:
                 return self._pcie_dma.all_reduce_in_place_split(inp, between, **kwargs)
         return self._pcie_dma.all_reduce_in_place_split(inp, between, **kwargs)
 
+    def pcie_dma_all_gather_owned_rows(
+        self, inp: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """Row all-gather over the B12X DMA ring's split mapping: every
+        rank's owned rows of ``inp`` (``pcie_dma_split_owned_rows``) reach
+        every rank; ``None`` when unavailable (see
+        ``pcie_dma_all_reduce_split``)."""
+        if self._IS_CAPTURING or self.pcie_dma_split_owned_rows(inp) is None:
+            return None
+        assert self._pcie_dma is not None
+        stream = self._pcie_runtime_stream()
+        kwargs = {"borrow_output": True} if borrow_output else {}
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                return self._pcie_dma.all_gather_owned_rows(inp, **kwargs)
+        return self._pcie_dma.all_gather_owned_rows(inp, **kwargs)
+
     def should_custom_reduce_scatter(self, inp: torch.Tensor) -> bool:
         if self.disabled or not current_platform.is_cuda():
             return False

@@ -713,6 +713,19 @@ class GroupCoordinator:
             return None
         return self.device_communicator.split_owned_rows(input_)
 
+    def all_gather_owned_rows(
+        self, input_: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """Row all-gather over the split mapping of ``all_reduce_in_place_split``;
+        None when unavailable."""
+        if self.world_size == 1:
+            return input_
+        if self.device_communicator is None:
+            return None
+        return self.device_communicator.all_gather_owned_rows(
+            input_, borrow_output=borrow_output
+        )
+
     def all_reduce_in_place_split(
         self, input_: torch.Tensor, between, *, borrow_output: bool = False
     ) -> torch.Tensor | None:

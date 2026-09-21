@@ -27,6 +27,10 @@ class _Group:
         self.calls.append(("split", x, between, borrow_output))
         return x
 
+    def all_gather_owned_rows(self, x, *, borrow_output=False):
+        self.calls.append(("gather", x, borrow_output))
+        return x
+
 
 def test_public_entry_forwards_to_the_group(monkeypatch):
     group = _Group()
@@ -71,6 +75,7 @@ def test_base_communicator_is_unsupported():
     x = torch.zeros(8, 4)
     assert comm.split_owned_rows(x) is None
     assert comm.all_reduce_in_place_split(x, lambda o: None) is None
+    assert comm.all_gather_owned_rows(x) is None
 
 
 def _custom_ar(ring, *, capturing=False, oneshot_max=16, twoshot=False):
@@ -93,6 +98,7 @@ def _ring(accept=True):
         between(inp),
         inp,
     )[1]
+    ring.all_gather_owned_rows.side_effect = lambda inp, **kw: inp
     return ring
 
 
@@ -106,6 +112,8 @@ def test_custom_all_reduce_dispatches_the_split_to_the_ring():
     ring.all_reduce_in_place_split.assert_called_once()
     assert ring.all_reduce_in_place_split.call_args.kwargs == {"borrow_output": True}
     assert ca.pcie_dma_split_owned_rows(x) == [(4, 4)]
+    assert ca.pcie_dma_all_gather_owned_rows(x, borrow_output=True) is x
+    assert ring.all_gather_owned_rows.call_args.kwargs == {"borrow_output": True}
 
 
 @pytest.mark.parametrize("case", ["capturing", "oneshot", "twoshot", "ring_refuses"])
@@ -120,5 +128,7 @@ def test_custom_all_reduce_declines_when_the_ring_path_is_unavailable(case):
     x = torch.zeros(8, 4, dtype=torch.bfloat16)
     assert ca.pcie_dma_all_reduce_split(x, lambda o: None) is None
     ring.all_reduce_in_place_split.assert_not_called()
+    assert ca.pcie_dma_all_gather_owned_rows(x) is None
+    ring.all_gather_owned_rows.assert_not_called()
     if case != "capturing":
         assert ca.pcie_dma_split_owned_rows(x) is None

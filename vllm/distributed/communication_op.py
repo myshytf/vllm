@@ -317,6 +317,19 @@ def tensor_model_parallel_split_owned_rows(
     return get_tp_group().split_owned_rows(input_)
 
 
+def tensor_model_parallel_all_gather_owned_rows(
+    input_: torch.Tensor, *, borrow_output: bool = False
+) -> torch.Tensor | None:
+    """Row all-gather over the split mapping: every rank's owned rows
+    (``tensor_model_parallel_split_owned_rows``) of ``input_`` reach every
+    rank, the other rows of the input being ignored. ``None`` when the
+    split path is unavailable (same conditions as
+    ``tensor_model_parallel_all_reduce_in_place_split``)."""
+    if _ubatch_active() or _piecewise() is not None:
+        return None
+    return get_tp_group().all_gather_owned_rows(input_, borrow_output=borrow_output)
+
+
 def tensor_model_parallel_all_reduce_in_place_split(
     input_: torch.Tensor, between, *, borrow_output: bool = False
 ) -> torch.Tensor | None:
