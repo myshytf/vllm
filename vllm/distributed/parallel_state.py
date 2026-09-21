@@ -706,6 +706,39 @@ class GroupCoordinator:
             )
         return self.device_communicator.all_reduce_in_place(input_)
 
+    def split_owned_rows(self, input_: torch.Tensor) -> list[tuple[int, int]] | None:
+        """Row blocks this rank holds fully reduced inside
+        ``all_reduce_in_place_split``; None when the split path is unavailable."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        return self.device_communicator.split_owned_rows(input_)
+
+    def all_gather_owned_rows(
+        self, input_: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """Row all-gather over the split mapping of ``all_reduce_in_place_split``;
+        None when unavailable."""
+        if self.world_size == 1:
+            return input_
+        if self.device_communicator is None:
+            return None
+        return self.device_communicator.all_gather_owned_rows(
+            input_, borrow_output=borrow_output
+        )
+
+    def all_reduce_in_place_split(
+        self, input_: torch.Tensor, between, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """All-reduce a dead tensor with ``between(out)`` run on this rank's
+        owned rows between the reduce-scatter and all-gather phases (B12X DMA
+        ring); None when unavailable, in which case the caller reduces with
+        ``all_reduce_in_place`` and runs its work on every row."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        return self.device_communicator.all_reduce_in_place_split(
+            input_, between, borrow_output=borrow_output
+        )
+
     def is_borrowed_reduction_storage(self, tensor: torch.Tensor) -> bool:
         """Whether ``tensor`` aliases communicator-owned reduction storage."""
         if self.world_size == 1 or self.device_communicator is None:
@@ -720,6 +753,22 @@ class GroupCoordinator:
         if self.world_size == 1 or self.device_communicator is None:
             return None
         return self.device_communicator.pcie_all_gather_pair(first, second)
+
+    def pcie_all_reduce_rms_norm_shard(
+        self,
+        input_: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        col0: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Fused all-reduce + RMSNorm + column-block store; ``None`` when
+        unavailable (the caller falls back to the separate operations)."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        return self.device_communicator.pcie_all_reduce_rms_norm_shard(
+            input_, weight, eps, col0, width
+        )
 
     def pcie_prepare_reduce_scatter(self, wire: str) -> bool:
         """Compile the copy-engine ring's reduce-scatter kernels ahead of

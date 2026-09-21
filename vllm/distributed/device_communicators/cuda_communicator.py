@@ -348,6 +348,40 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def split_owned_rows(self, input_: torch.Tensor) -> list[tuple[int, int]] | None:
+        """Row blocks this rank holds fully reduced inside
+        ``all_reduce_in_place_split``; ``None`` when that path is unavailable."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return None
+        return ca_comm.pcie_dma_split_owned_rows(input_)
+
+    def all_reduce_in_place_split(
+        self, input_: torch.Tensor, between, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """All-reduce a dead input on the B12X DMA ring with ``between(out)``
+        run on this rank's owned rows between the reduce-scatter and the
+        all-gather phases; ``None`` when the ring does not take the tensor
+        (the caller reduces normally)."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled or not ca_comm.should_custom_ar(input_):
+            return None
+        return ca_comm.pcie_dma_all_reduce_split(
+            input_, between, borrow_output=borrow_output
+        )
+
+    def all_gather_owned_rows(
+        self, input_: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """Row all-gather over the split mapping (see ``split_owned_rows``);
+        ``None`` when unavailable."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled or not ca_comm.should_custom_ar(input_):
+            return None
+        return ca_comm.pcie_dma_all_gather_owned_rows(
+            input_, borrow_output=borrow_output
+        )
+
     def all_reduce_in_place(
         self, input_: torch.Tensor, *, borrow_output: bool = False
     ) -> torch.Tensor:
@@ -400,6 +434,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if ca_comm is None or ca_comm.disabled:
             return None
         return ca_comm.pcie_dma_all_gather_pair(first, second)
+
+    def pcie_all_reduce_rms_norm_shard(
+        self,
+        input_: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        col0: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Fused all-reduce + RMSNorm + column-block store on the B12X
+        two-shot runtime (see ``CustomAllreduce.try_all_reduce_rms_norm_shard``)."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return None
+        return ca_comm.try_all_reduce_rms_norm_shard(input_, weight, eps, col0, width)
 
     def pcie_prepare_reduce_scatter(self, wire: str) -> bool:
         ca_comm = self.ca_comm

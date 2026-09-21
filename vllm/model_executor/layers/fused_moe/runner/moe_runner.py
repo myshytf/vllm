@@ -490,7 +490,8 @@ class MoERunner(MoERunnerInterface):
         fused_output: torch.Tensor,
         residual: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
-        column_block: bool = False,
+        column_block: bool | str = False,
+        addmm_residual: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply transform to routed expert output (e.g., latent to full dim).
 
@@ -502,7 +503,12 @@ class MoERunner(MoERunnerInterface):
         it is passed on only when set.
         """
         if self.routed_output_transform is not None:
-            kwargs = {"column_block": True} if column_block else {}
+            if column_block == "normalized":
+                kwargs = {"normalized_block": True}
+            else:
+                kwargs = {"column_block": True} if column_block else {}
+            if addmm_residual is not None:
+                kwargs["addmm_residual"] = addmm_residual
             if residual is not None:
                 r = self.routed_output_transform(
                     fused_output,
@@ -619,7 +625,7 @@ class MoERunner(MoERunnerInterface):
         fused_output_is_reduced: bool,
         *,
         in_place: bool = False,
-    ) -> tuple[torch.Tensor, bool, bool]:
+    ) -> tuple[torch.Tensor, bool, bool | str]:
         """Reduce the latent routed output before its output transform.
 
         Latent MoE output transforms may contain non-linear ops, e.g. RMSNorm.
@@ -647,6 +653,14 @@ class MoERunner(MoERunnerInterface):
             block = reduce_scatter(fused_output) if reduce_scatter is not None else None
             if block is not None:
                 return block, True, True
+            fused_norm = getattr(
+                self.routed_output_transform, "all_reduce_norm_shard", None
+            )
+            normalized = fused_norm(fused_output) if fused_norm is not None else None
+            if isinstance(normalized, torch.Tensor):
+                # The latent was all-reduced, normalized and packed into this
+                # rank's up-projection input shard in one launch.
+                return normalized, True, "normalized"
             if in_place:
                 fused_output = self._all_reduce_in_place(fused_output)
             else:
@@ -1035,13 +1049,28 @@ class MoERunner(MoERunnerInterface):
             and self._can_accumulate_routed_output_residual(fused_output, shared_output)
             else None
         )
+        # Decode: the shared-expert partial may ride the TP-sharded
+        # up-projection's beta epilogue instead of a separate add.
+        addmm_residual = None
+        if (
+            routed_output_residual is None
+            and routed_output_buffer is None
+            and shared_output is not None
+            and self.routed_output_transform is not None
+        ):
+            can_addmm = getattr(
+                self.routed_output_transform, "can_addmm_residual", None
+            )
+            if can_addmm is not None and can_addmm(fused_output, shared_output) is True:
+                addmm_residual = shared_output
         fused_output = self.apply_routed_output_transform(
             fused_output,
             residual=routed_output_residual,
             output=routed_output_buffer,
             column_block=latent_is_column_block,
+            addmm_residual=addmm_residual,
         )
-        if routed_output_residual is not None:
+        if routed_output_residual is not None or addmm_residual is not None:
             shared_output = None
         if output_transform_is_tp_partial:
             fused_output_is_reduced = False

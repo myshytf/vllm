@@ -1155,6 +1155,13 @@ class CustomAllreduce:
                         f"all_reduce_mode; cannot select {mode!r}"
                     )
                 twoshot.all_reduce_mode = mode
+            if envs.VLLM_K3_LATENT_AR_NORM_FUSED and hasattr(
+                twoshot, "all_reduce_rms_norm_shard"
+            ):
+                # Compile the fused RMSNorm-shard all-reduce for capture too.
+                twoshot.norm_shard_enabled = getattr(
+                    twoshot, "all_reduce_mode", None
+                ) == "push" and getattr(twoshot, "_balanced_partition", False)
             twoshot.prepare_graph()
         except Exception as exc:
             init_error = exc
@@ -1423,6 +1430,48 @@ class CustomAllreduce:
             )
         return out
 
+    def try_all_reduce_rms_norm_shard(
+        self,
+        inp: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        col0: int,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """All-reduce ``inp`` and, in the same B12X two-shot launch, RMS-
+        normalize the reduced rows and write the normalized column block
+        ``[col0, col0 + width)`` (``[rows, width]`` bf16, zero-filled past the
+        row). Returns ``(reduced, block)`` or ``None`` when the two-shot
+        runtime, its fused epilogue or the shape is unavailable; the caller
+        then runs the separate all-reduce, norm and shard copy.
+
+        Inside a warmup capture (no stream capturing) the placeholders of
+        ``custom_all_reduce`` are returned without communication.
+        """
+        twoshot = self._pcie_twoshot
+        if (
+            self.disabled
+            or twoshot is None
+            or not getattr(twoshot, "norm_shard_enabled", False)
+            or inp.ndim != 2
+            or inp.dtype != torch.bfloat16
+            or not self._pcie_twoshot_accepts(inp)
+            or inp.shape[0] > 16
+        ):
+            return None
+        if (
+            self._IS_CAPTURING
+            and not torch.cuda.is_current_stream_capturing()
+            and not _is_piecewise_cudagraph_runtime()
+        ):
+            # Warmup: mimic the allocation pattern without communication.
+            return torch.empty_like(inp), inp.new_empty((inp.shape[0], width))
+        stream = self._pcie_runtime_stream()
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                return twoshot.all_reduce_rms_norm_shard(inp, weight, eps, col0, width)
+        return twoshot.all_reduce_rms_norm_shard(inp, weight, eps, col0, width)
+
     def supports_fused_add_rms_norm(self) -> bool:
         """Return whether the B12X runtime provides fused AR + RMSNorm."""
         return (
@@ -1593,6 +1642,67 @@ class CustomAllreduce:
                 self.max_all_gather_size,
             )
         return out
+
+    def pcie_dma_split_owned_rows(
+        self, inp: torch.Tensor
+    ) -> list[tuple[int, int]] | None:
+        """Row blocks of ``inp`` this rank holds fully reduced between the
+        phases of ``pcie_dma_all_reduce_split``; ``None`` when the B12X DMA
+        ring would not take ``inp`` on its split path."""
+        if self.disabled or self._pcie_dma is None or not self.should_custom_ar(inp):
+            return None
+        inp_size = inp.numel() * inp.element_size()
+        if (
+            self._pcie_allreduce_max_size is not None
+            and inp_size <= self._pcie_allreduce_max_size
+        ):
+            return None
+        if self._pcie_twoshot_accepts(inp) or not self._pcie_dma.can_all_reduce_split(
+            inp
+        ):
+            return None
+        return self._pcie_dma.split_owned_rows(inp)
+
+    def pcie_dma_all_reduce_split(
+        self,
+        inp: torch.Tensor,
+        between,
+        *,
+        borrow_output: bool = False,
+    ) -> torch.Tensor | None:
+        """B12X DMA ring all-reduce split around ``between(out)``, the
+        caller's in-place work on its owned rows (see
+        ``PCIeDmaAllReduce.all_reduce_in_place_split``); ``None`` when the
+        ring is unavailable for ``inp`` or a graph capture is in progress
+        (the caller then reduces normally and runs its work on every row).
+        Issued on the PCIe runtime stream when the ring has one, so
+        ``between`` must launch on the current stream."""
+        if self._IS_CAPTURING or self.pcie_dma_split_owned_rows(inp) is None:
+            return None
+        assert self._pcie_dma is not None
+        stream = self._pcie_runtime_stream()
+        kwargs = {"borrow_output": True} if borrow_output else {}
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                return self._pcie_dma.all_reduce_in_place_split(inp, between, **kwargs)
+        return self._pcie_dma.all_reduce_in_place_split(inp, between, **kwargs)
+
+    def pcie_dma_all_gather_owned_rows(
+        self, inp: torch.Tensor, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """Row all-gather over the B12X DMA ring's split mapping: every
+        rank's owned rows of ``inp`` (``pcie_dma_split_owned_rows``) reach
+        every rank; ``None`` when unavailable (see
+        ``pcie_dma_all_reduce_split``)."""
+        if self._IS_CAPTURING or self.pcie_dma_split_owned_rows(inp) is None:
+            return None
+        assert self._pcie_dma is not None
+        stream = self._pcie_runtime_stream()
+        kwargs = {"borrow_output": True} if borrow_output else {}
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                return self._pcie_dma.all_gather_owned_rows(inp, **kwargs)
+        return self._pcie_dma.all_gather_owned_rows(inp, **kwargs)
 
     def should_custom_reduce_scatter(self, inp: torch.Tensor) -> bool:
         if self.disabled or not current_platform.is_cuda():

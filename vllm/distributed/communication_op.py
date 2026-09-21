@@ -305,6 +305,48 @@ def tensor_model_parallel_all_reduce_in_place(
     return driver.run_collective("ar_in_place", input_, _run)
 
 
+def tensor_model_parallel_split_owned_rows(
+    input_: torch.Tensor,
+) -> list[tuple[int, int]] | None:
+    """Row blocks ``(row0, rows)`` of ``input_`` this rank would hold fully
+    reduced inside ``tensor_model_parallel_all_reduce_in_place_split``; None
+    when that path is unavailable (split-prefill regions, piecewise drivers,
+    tensors the DMA ring's row-granule mapping does not cover)."""
+    if _ubatch_active() or _piecewise() is not None:
+        return None
+    return get_tp_group().split_owned_rows(input_)
+
+
+def tensor_model_parallel_all_gather_owned_rows(
+    input_: torch.Tensor, *, borrow_output: bool = False
+) -> torch.Tensor | None:
+    """Row all-gather over the split mapping: every rank's owned rows
+    (``tensor_model_parallel_split_owned_rows``) of ``input_`` reach every
+    rank, the other rows of the input being ignored. ``None`` when the
+    split path is unavailable (same conditions as
+    ``tensor_model_parallel_all_reduce_in_place_split``)."""
+    if _ubatch_active() or _piecewise() is not None:
+        return None
+    return get_tp_group().all_gather_owned_rows(input_, borrow_output=borrow_output)
+
+
+def tensor_model_parallel_all_reduce_in_place_split(
+    input_: torch.Tensor, between, *, borrow_output: bool = False
+) -> torch.Tensor | None:
+    """All-reduce a dead input tensor whose all-gather phase distributes what
+    ``between(out)`` wrote into this rank's owned rows (the B12X DMA ring's
+    split lossless all-reduce). ``None`` when unavailable — inside a
+    split-prefill communication region, under a piecewise prefill driver, or
+    for tensors the ring does not take — so the caller falls back to
+    ``tensor_model_parallel_all_reduce_in_place`` and runs its work on every
+    row. ``borrow_output`` as in the in-place all-reduce."""
+    if _ubatch_active() or _piecewise() is not None:
+        return None
+    return get_tp_group().all_reduce_in_place_split(
+        input_, between, borrow_output=borrow_output
+    )
+
+
 def tensor_model_parallel_is_borrowed_storage(tensor: torch.Tensor) -> bool:
     """Whether ``tensor`` aliases storage a borrowed reduction returned."""
     return get_tp_group().is_borrowed_reduction_storage(tensor)
@@ -366,6 +408,24 @@ def _ubatch_ring_call(
 
 def _ubatch_ring_active() -> bool:
     return _ubatch_active() and not _ubatch_no_yield()
+
+
+def tensor_model_parallel_all_reduce_rms_norm_shard(
+    input_: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    col0: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """All-reduce ``input_`` across the TP group and, in the same launch,
+    RMS-normalize the result and store its column block ``[col0, col0+width)``.
+    Returns ``(reduced, block)`` or ``None`` when the fused collective is
+    unavailable; not used inside split-prefill regions or piecewise drivers."""
+    if _ubatch_active() or _piecewise() is not None:
+        return None
+    return get_tp_group().pcie_all_reduce_rms_norm_shard(
+        input_, weight, eps, col0, width
+    )
 
 
 def tensor_model_parallel_pcie_all_gather_pair(

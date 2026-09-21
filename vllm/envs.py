@@ -257,6 +257,10 @@ if TYPE_CHECKING:
     VLLM_K3_PACKED_MLA_SPLIT_POLICY: str = "balanced"
     VLLM_K3_PACKED_MLA_PARTIAL_DTYPE: str = "fp32"
     VLLM_K3_PACKED_MLA_QUERY: str = "bf16"
+    VLLM_K3_PAIR_TOPK_FUSED: bool = False
+    VLLM_K3_LATENT_AR_NORM_FUSED: bool = False
+    VLLM_K3_UP_PROJ_ADDMM: bool = False
+    VLLM_K3_LATENT_NORM_WINDOW_LIB: str = ""
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -1970,6 +1974,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "full",
             "relax",
         ],
+    ),
+    # Kimi-K3 decode router: select the 16 routed experts inside the B12X
+    # paired projection gather (one launch) instead of a separate batched
+    # selection kernel after it. Covers padded shards (nine ranks) and
+    # batches of up to eight rows; the selection arithmetic is the batched
+    # kernel's, so expert ids and weights are bit-identical. Off = the
+    # served two-launch path.
+    "VLLM_K3_PAIR_TOPK_FUSED": lambda: bool(
+        int(os.getenv("VLLM_K3_PAIR_TOPK_FUSED", "0"))
+    ),
+    # Kimi-K3 decode: all-reduce the routed latent, RMS-normalize it and
+    # write this rank's up-projection input shard in one B12X two-shot
+    # launch (replaces the separate RMSNorm kernel and the shard copy). The
+    # all-reduce is unchanged; the norm's variance and scale are computed in
+    # float64 (more precise than the fp32 kernel), so outputs are not bit-
+    # identical. Off = the served three-kernel sequence.
+    "VLLM_K3_LATENT_AR_NORM_FUSED": lambda: bool(
+        int(os.getenv("VLLM_K3_LATENT_AR_NORM_FUSED", "0"))
+    ),
+    # Kimi-K3 decode: add the shared-expert partial in the up-projection
+    # GEMM's beta epilogue (`torch.addmm`) instead of a separate bf16 add:
+    # the sum is rounded to bf16 once instead of twice (not bit-identical,
+    # at least as precise). Off = the served GEMM + add.
+    "VLLM_K3_UP_PROJ_ADDMM": lambda: bool(int(os.getenv("VLLM_K3_UP_PROJ_ADDMM", "0"))),
+    # Kimi-K3 decode: path of the `_C_k3norm` side extension whose
+    # `rms_norm_window` normalizes the reduced routed latent and stores this
+    # rank's padded up-projection input shard in one launch (bit-identical to
+    # `_C.rms_norm` + the shard copy). Empty = the served two launches.
+    "VLLM_K3_LATENT_NORM_WINDOW_LIB": lambda: os.getenv(
+        "VLLM_K3_LATENT_NORM_WINDOW_LIB", ""
     ),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(

@@ -437,6 +437,31 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        # Short-turn latency: a long in-progress prefill is deferred while
+        # requests are waiting, so a waiting turn's small prefill remainder is
+        # admitted within a bounded number of steps instead of queueing behind
+        # the long prefill's whole remainder. The streak bound guarantees the
+        # long prefill still gets a step after at most this many consecutive
+        # deferrals. 0 disables the mechanism (strict FCFS).
+        self._long_prefill_defer_streak: dict[str, int] = {}
+        self.long_prefill_defer_max_streak = int(
+            os.getenv("VLLM_K3_LONG_PREFILL_DEFER_MAX_STREAK", "1")
+        )
+
+    def _defer_long_prefill(self, request: Request) -> bool:
+        """Streak-bounded deferral of a long in-progress prefill chunk.
+
+        Returns True (defer this step) while the request's consecutive
+        deferral streak is below ``long_prefill_defer_max_streak``; the streak
+        resets when the request is scheduled, so a long prefill is guaranteed
+        a step after at most that many deferrals.
+        """
+        streak = self._long_prefill_defer_streak.get(request.request_id, 0)
+        if streak >= self.long_prefill_defer_max_streak:
+            return False
+        self._long_prefill_defer_streak[request.request_id] = streak + 1
+        return True
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -627,6 +652,22 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            if (
+                self.long_prefill_defer_max_streak > 0
+                and request.is_prefill_chunk
+                and (self.waiting or self.skipped_waiting)
+                and request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens
+                > token_budget
+                and self._defer_long_prefill(request)
+            ):
+                # Long in-progress prefill with requests waiting: yield this
+                # step so a waiting turn's small prefill remainder can be
+                # admitted instead of queueing behind the whole remainder.
+                req_index += 1
+                continue
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -758,6 +799,7 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             prefill_scheduled |= request.is_prefill_chunk
             request_id = request.request_id
+            self._long_prefill_defer_streak.pop(request_id, None)
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
@@ -1483,6 +1525,7 @@ class Scheduler(SchedulerInterface):
         self._free_request_blocks(request)
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
+        self._long_prefill_defer_streak.pop(request.request_id, None)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
@@ -2606,6 +2649,7 @@ class Scheduler(SchedulerInterface):
 
         self._inflight_prefills.discard(request)
         self._lookup_pending_since.pop(request.request_id, None)
+        self._long_prefill_defer_streak.pop(request.request_id, None)
         self._cache_request_endpoint(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
