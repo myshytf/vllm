@@ -260,6 +260,7 @@ if TYPE_CHECKING:
     VLLM_K3_PAIR_TOPK_FUSED: bool = False
     VLLM_K3_LATENT_AR_NORM_FUSED: bool = False
     VLLM_K3_UP_PROJ_ADDMM: bool = False
+    VLLM_K3_LATENT_NORM_WINDOW_LIB: str = ""
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -1997,6 +1998,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the sum is rounded to bf16 once instead of twice (not bit-identical,
     # at least as precise). Off = the served GEMM + add.
     "VLLM_K3_UP_PROJ_ADDMM": lambda: bool(int(os.getenv("VLLM_K3_UP_PROJ_ADDMM", "0"))),
+    # Kimi-K3 decode: path of the `_C_k3norm` side extension whose
+    # `rms_norm_window` normalizes the reduced routed latent and stores this
+    # rank's padded up-projection input shard in one launch (bit-identical to
+    # `_C.rms_norm` + the shard copy). Empty = the served two launches.
+    "VLLM_K3_LATENT_NORM_WINDOW_LIB": lambda: os.getenv(
+        "VLLM_K3_LATENT_NORM_WINDOW_LIB", ""
+    ),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(
         int(os.getenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1"))

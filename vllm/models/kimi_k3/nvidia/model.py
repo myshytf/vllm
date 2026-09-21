@@ -122,6 +122,10 @@ from vllm.models.kimi_k3.nvidia.mla import (
     MultiHeadLatentAttention,
 )
 from vllm.models.kimi_k3.nvidia.ops import attn_res, invariant_gemm
+from vllm.models.kimi_k3.nvidia.ops.norm_window import (
+    can_rms_norm_window,
+    rms_norm_window,
+)
 from vllm.models.kimi_k3.nvidia.tp_projection import (
     KIMI_DMA_PAIR_GATHER_MIN_TOKENS,
     gather_kimi_projection_pair_prefill,
@@ -518,6 +522,29 @@ class KimiRoutedOutputTransform(nn.Module):
             hidden_states = self.normalize_column_block(hidden_states)
         else:
             self.capture_routed_latent(hidden_states)
+            if (
+                residual is None
+                and output is None
+                and self.can_norm_window_shard(hidden_states)
+            ):
+                # One launch normalizes the reduced latent and stores this
+                # rank's padded input shard (bit-identical to the norm kernel
+                # followed by the shard copy of the decode shard-pack path).
+                up_proj = self.up_proj
+                assert isinstance(up_proj, KimiPaddedRowParallelLinear)
+                assert self.norm is not None
+                shard = rms_norm_window(
+                    hidden_states,
+                    self.norm.weight.data,
+                    self.norm.variance_epsilon,
+                    up_proj.tp_rank * up_proj.shard_width,
+                    up_proj.shard_width,
+                    batch_invariant=envs.VLLM_BATCH_INVARIANT,
+                )
+                hidden_states, _ = up_proj.forward_packed_shard(
+                    shard, residual=addmm_residual
+                )
+                return hidden_states
             if self.norm is not None:
                 hidden_states = self.normalize_routed_latent(hidden_states)
         if residual is not None and isinstance(self.up_proj, ReplicatedLinear):
@@ -552,6 +579,30 @@ class KimiRoutedOutputTransform(nn.Module):
         if residual is not None:
             hidden_states.add_(residual)
         return hidden_states
+
+    def can_norm_window_shard(self, hidden_states: torch.Tensor) -> bool:
+        """Whether the decode latent norm and this rank's shard copy collapse
+        into ``rms_norm_window`` (``VLLM_K3_LATENT_NORM_WINDOW_LIB``): the
+        served decode shard-pack conditions of the TP-sharded up-projection,
+        a weighted full-width RMSNorm, and the extension's operand contract."""
+        norm = self.norm
+        up_proj = self.up_proj
+        if (
+            norm is None
+            or not norm.pass_weight
+            or norm.variance_size_override is not None
+            or not isinstance(up_proj, KimiPaddedRowParallelLinear)
+            or not up_proj.can_shard_pack(hidden_states)
+            or os.getenv("VLLM_KQUANT_CAPTURE_DIR")
+            or hidden_states.shape[1] != norm.hidden_size
+        ):
+            return False
+        return can_rms_norm_window(
+            hidden_states,
+            norm.weight.data,
+            up_proj.tp_rank * up_proj.shard_width,
+            up_proj.shard_width,
+        )
 
     def can_addmm_residual(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
@@ -943,8 +994,10 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             prefix=prefix,
         )
 
-    def forward(self, x: torch.Tensor):
-        if (
+    def can_shard_pack(self, x: torch.Tensor) -> bool:
+        """The decode shard-pack conditions of ``forward``: the rank packs its
+        padded input shard and runs the plain GEMM on it."""
+        return bool(
             kimi_decode_shard_pack_enabled()
             and self.input_pad
             and not self.input_is_parallel
@@ -959,7 +1012,10 @@ class KimiPaddedRowParallelLinear(RowParallelLinear):
             and x.stride(-1) == 1
             and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
             and not torch.is_grad_enabled()
-        ):
+        )
+
+    def forward(self, x: torch.Tensor):
+        if self.can_shard_pack(x):
             from vllm.models.kimi_k3.nvidia.ops.projection_shard import (
                 pack_projection_shard,
             )
