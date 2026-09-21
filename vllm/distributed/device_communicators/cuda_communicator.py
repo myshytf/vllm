@@ -348,6 +348,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def split_owned_rows(self, input_: torch.Tensor) -> list[tuple[int, int]] | None:
+        """Row blocks this rank holds fully reduced inside
+        ``all_reduce_in_place_split``; ``None`` when that path is unavailable."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled:
+            return None
+        return ca_comm.pcie_dma_split_owned_rows(input_)
+
+    def all_reduce_in_place_split(
+        self, input_: torch.Tensor, between, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """All-reduce a dead input on the B12X DMA ring with ``between(out)``
+        run on this rank's owned rows between the reduce-scatter and the
+        all-gather phases; ``None`` when the ring does not take the tensor
+        (the caller reduces normally)."""
+        ca_comm = self.ca_comm
+        if ca_comm is None or ca_comm.disabled or not ca_comm.should_custom_ar(input_):
+            return None
+        return ca_comm.pcie_dma_all_reduce_split(
+            input_, between, borrow_output=borrow_output
+        )
+
     def all_reduce_in_place(
         self, input_: torch.Tensor, *, borrow_output: bool = False
     ) -> torch.Tensor:

@@ -246,6 +246,17 @@ class DeviceCommunicatorBase:
         """
         return None
 
+    def split_owned_rows(self, input_: torch.Tensor) -> list[tuple[int, int]] | None:
+        """Row blocks a split all-reduce hands to ``between``; None = unsupported."""
+        return None
+
+    def all_reduce_in_place_split(
+        self, input_: torch.Tensor, between, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """All-reduce split around ``between(out)`` on this rank's owned rows;
+        None = unsupported on this communicator."""
+        return None
+
     def pcie_all_reduce_rms_norm_shard(
         self,
         input_: torch.Tensor,

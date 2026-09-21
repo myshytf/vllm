@@ -305,6 +305,35 @@ def tensor_model_parallel_all_reduce_in_place(
     return driver.run_collective("ar_in_place", input_, _run)
 
 
+def tensor_model_parallel_split_owned_rows(
+    input_: torch.Tensor,
+) -> list[tuple[int, int]] | None:
+    """Row blocks ``(row0, rows)`` of ``input_`` this rank would hold fully
+    reduced inside ``tensor_model_parallel_all_reduce_in_place_split``; None
+    when that path is unavailable (split-prefill regions, piecewise drivers,
+    tensors the DMA ring's row-granule mapping does not cover)."""
+    if _ubatch_active() or _piecewise() is not None:
+        return None
+    return get_tp_group().split_owned_rows(input_)
+
+
+def tensor_model_parallel_all_reduce_in_place_split(
+    input_: torch.Tensor, between, *, borrow_output: bool = False
+) -> torch.Tensor | None:
+    """All-reduce a dead input tensor whose all-gather phase distributes what
+    ``between(out)`` wrote into this rank's owned rows (the B12X DMA ring's
+    split lossless all-reduce). ``None`` when unavailable — inside a
+    split-prefill communication region, under a piecewise prefill driver, or
+    for tensors the ring does not take — so the caller falls back to
+    ``tensor_model_parallel_all_reduce_in_place`` and runs its work on every
+    row. ``borrow_output`` as in the in-place all-reduce."""
+    if _ubatch_active() or _piecewise() is not None:
+        return None
+    return get_tp_group().all_reduce_in_place_split(
+        input_, between, borrow_output=borrow_output
+    )
+
+
 def tensor_model_parallel_is_borrowed_storage(tensor: torch.Tensor) -> bool:
     """Whether ``tensor`` aliases storage a borrowed reduction returned."""
     return get_tp_group().is_borrowed_reduction_storage(tensor)

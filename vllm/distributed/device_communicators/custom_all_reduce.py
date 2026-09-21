@@ -1643,6 +1643,50 @@ class CustomAllreduce:
             )
         return out
 
+    def pcie_dma_split_owned_rows(
+        self, inp: torch.Tensor
+    ) -> list[tuple[int, int]] | None:
+        """Row blocks of ``inp`` this rank holds fully reduced between the
+        phases of ``pcie_dma_all_reduce_split``; ``None`` when the B12X DMA
+        ring would not take ``inp`` on its split path."""
+        if self.disabled or self._pcie_dma is None or not self.should_custom_ar(inp):
+            return None
+        inp_size = inp.numel() * inp.element_size()
+        if (
+            self._pcie_allreduce_max_size is not None
+            and inp_size <= self._pcie_allreduce_max_size
+        ):
+            return None
+        if self._pcie_twoshot_accepts(inp) or not self._pcie_dma.can_all_reduce_split(
+            inp
+        ):
+            return None
+        return self._pcie_dma.split_owned_rows(inp)
+
+    def pcie_dma_all_reduce_split(
+        self,
+        inp: torch.Tensor,
+        between,
+        *,
+        borrow_output: bool = False,
+    ) -> torch.Tensor | None:
+        """B12X DMA ring all-reduce split around ``between(out)``, the
+        caller's in-place work on its owned rows (see
+        ``PCIeDmaAllReduce.all_reduce_in_place_split``); ``None`` when the
+        ring is unavailable for ``inp`` or a graph capture is in progress
+        (the caller then reduces normally and runs its work on every row).
+        Issued on the PCIe runtime stream when the ring has one, so
+        ``between`` must launch on the current stream."""
+        if self._IS_CAPTURING or self.pcie_dma_split_owned_rows(inp) is None:
+            return None
+        assert self._pcie_dma is not None
+        stream = self._pcie_runtime_stream()
+        kwargs = {"borrow_output": True} if borrow_output else {}
+        if stream is not None:
+            with torch.cuda.stream(stream):
+                return self._pcie_dma.all_reduce_in_place_split(inp, between, **kwargs)
+        return self._pcie_dma.all_reduce_in_place_split(inp, between, **kwargs)
+
     def should_custom_reduce_scatter(self, inp: torch.Tensor) -> bool:
         if self.disabled or not current_platform.is_cuda():
             return False

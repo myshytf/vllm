@@ -706,6 +706,26 @@ class GroupCoordinator:
             )
         return self.device_communicator.all_reduce_in_place(input_)
 
+    def split_owned_rows(self, input_: torch.Tensor) -> list[tuple[int, int]] | None:
+        """Row blocks this rank holds fully reduced inside
+        ``all_reduce_in_place_split``; None when the split path is unavailable."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        return self.device_communicator.split_owned_rows(input_)
+
+    def all_reduce_in_place_split(
+        self, input_: torch.Tensor, between, *, borrow_output: bool = False
+    ) -> torch.Tensor | None:
+        """All-reduce a dead tensor with ``between(out)`` run on this rank's
+        owned rows between the reduce-scatter and all-gather phases (B12X DMA
+        ring); None when unavailable, in which case the caller reduces with
+        ``all_reduce_in_place`` and runs its work on every row."""
+        if self.world_size == 1 or self.device_communicator is None:
+            return None
+        return self.device_communicator.all_reduce_in_place_split(
+            input_, between, borrow_output=borrow_output
+        )
+
     def is_borrowed_reduction_storage(self, tensor: torch.Tensor) -> bool:
         """Whether ``tensor`` aliases communicator-owned reduction storage."""
         if self.world_size == 1 or self.device_communicator is None:
