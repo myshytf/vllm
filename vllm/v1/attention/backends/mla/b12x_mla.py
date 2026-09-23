@@ -526,26 +526,31 @@ def _packed_dense_split_policy() -> str:
     return policy
 
 
-def _packed_dense_partial_dtype() -> torch.dtype:
-    """Return the packed reader's split-partial element type from the environment."""
-    dtype_name = str(envs.VLLM_K3_PACKED_MLA_PARTIAL_DTYPE)
+def _packed_dense_partial_dtype(dtype_name: str | None = None) -> torch.dtype:
+    """Return the packed reader's split-partial element type.
+
+    ``dtype_name`` overrides ``VLLM_K3_PACKED_MLA_PARTIAL_DTYPE``.
+    """
+    source = "B12X_MLA packed partial dtype"
+    if dtype_name is None:
+        dtype_name = str(envs.VLLM_K3_PACKED_MLA_PARTIAL_DTYPE)
+        source = "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE"
     partial_dtypes = {"bf16": torch.bfloat16, "fp32": torch.float32}
     if dtype_name not in partial_dtypes:
-        raise ValueError(
-            "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE must be 'bf16' or 'fp32', got "
-            f"{dtype_name!r}."
-        )
+        raise ValueError(f"{source} must be 'bf16' or 'fp32', got {dtype_name!r}.")
     return partial_dtypes[dtype_name]
 
 
-def _packed_dense_plan_caps_kwargs(sparse_mla: Any) -> dict[str, Any]:
+def _packed_dense_plan_caps_kwargs(
+    sparse_mla: Any, partial_dtype_name: str | None = None
+) -> dict[str, Any]:
     """Return the partial-dtype capability for the packed plan.
 
     B12X versions without a ``partial_dtype`` capability keep bf16 partials;
     requesting fp32 on such a version is an error rather than a silent
     downgrade.
     """
-    partial_dtype = _packed_dense_partial_dtype()
+    partial_dtype = _packed_dense_partial_dtype(partial_dtype_name)
     caps_fields = getattr(sparse_mla.Caps, "__dataclass_fields__", {})
     if "partial_dtype" in caps_fields:
         return {"partial_dtype": partial_dtype}
@@ -571,6 +576,61 @@ def _packed_dense_run_kwargs(run_decode: Any) -> dict[str, Any]:
     return {}
 
 
+def _draft_packed_split_table() -> tuple[tuple[int, int], ...]:
+    """Parse ``VLLM_K3_DRAFT_PACKED_MLA_SPLITS`` into sorted (rows, splits)."""
+    raw = str(envs.VLLM_K3_DRAFT_PACKED_MLA_SPLITS)
+    if not raw:
+        return ()
+    pairs: dict[int, int] = {}
+    for item in raw.split(","):
+        rows_text, sep, splits_text = item.partition(":")
+        try:
+            rows, splits = int(rows_text), int(splits_text)
+        except ValueError:
+            rows = splits = 0
+        if not sep or rows <= 0 or splits <= 0 or rows in pairs:
+            raise ValueError(
+                "VLLM_K3_DRAFT_PACKED_MLA_SPLITS must be comma-separated "
+                f"'rows:splits' pairs of positive integers, got {raw!r}."
+            )
+        pairs[rows] = splits
+    return tuple(sorted(pairs.items()))
+
+
+def _draft_packed_splits(row_cap: int, table: tuple[tuple[int, int], ...]) -> int:
+    """Return the split count of the table entry covering ``row_cap`` rows."""
+    for rows, splits in table:
+        if rows >= row_cap:
+            return splits
+    return table[-1][1]
+
+
+def _packed_plan_overrides(kv_cache_spec: Any, row_cap: int) -> dict[str, Any]:
+    """Packed-plan overrides of a draft group; empty for every other group.
+
+    Draft groups (a non-causal query block per request over a window of
+    context, e.g. the Kimi-K3 DFlash2 draft) take the split count of
+    ``VLLM_K3_DRAFT_PACKED_MLA_SPLITS`` for ``row_cap`` rows and the partial
+    type of ``VLLM_K3_DRAFT_PACKED_MLA_PARTIAL_DTYPE``; target groups keep the
+    capacity-based plan.
+    """
+    if not getattr(kv_cache_spec, "non_causal_multi_token_decode", False):
+        return {}
+    overrides: dict[str, Any] = {}
+    table = _draft_packed_split_table()
+    if table:
+        overrides["max_chunks_per_row"] = _draft_packed_splits(row_cap, table)
+    partial = str(envs.VLLM_K3_DRAFT_PACKED_MLA_PARTIAL_DTYPE)
+    if partial:
+        if partial not in ("bf16", "fp32"):
+            raise ValueError(
+                "VLLM_K3_DRAFT_PACKED_MLA_PARTIAL_DTYPE must be empty, 'bf16' or "
+                f"'fp32', got {partial!r}."
+            )
+        overrides["partial_dtype_name"] = partial
+    return overrides
+
+
 def _create_packed_dense_mla_plan(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -583,11 +643,16 @@ def _create_packed_dense_mla_plan(
     uses_query_cache_seqlens: bool = False,
     dcp_size: int | None = None,
     max_cache_tokens: int | None = None,
+    max_chunks_per_row: int | None = None,
+    partial_dtype_name: str | None = None,
 ) -> Any:
     """Plan exact-dense decode through B12X's packed sparse-MLA reader.
 
     The selected-index table contains every visible token in causal order, so
     this changes only the cache representation and not the attention mask.
+    ``max_chunks_per_row`` (the launched split count) defaults to one split per
+    64-token chunk, at most 64; a smaller count gives each split a longer
+    serial chunk range.
     """
     if mode != "decode" or uses_query_cache_seqlens:
         raise ValueError("packed dense MLA uses per-query decode rows only")
@@ -618,6 +683,9 @@ def _create_packed_dense_mla_plan(
             f"{_MAX_B12X_CACHE_TOKENS} cache tokens, got {max_cache_tokens}."
         )
 
+    split_capacity = _packed_dense_split_capacity(max_cache_tokens)
+    if max_chunks_per_row is not None:
+        split_capacity = max(1, min(int(max_chunks_per_row), split_capacity))
     sparse_mla = _load_sparse_mla()
     caps = sparse_mla.Caps(
         device=device,
@@ -631,10 +699,10 @@ def _create_packed_dense_mla_plan(
         mode="decode",
         max_batch=max_batch,
         max_page_table_width=_page_table_width(max_cache_tokens, page_size),
-        max_chunks_per_row=_packed_dense_split_capacity(max_cache_tokens),
+        max_chunks_per_row=split_capacity,
         page_size=int(page_size),
         head_major_output=False,
-        **_packed_dense_plan_caps_kwargs(sparse_mla),
+        **_packed_dense_plan_caps_kwargs(sparse_mla, partial_dtype_name),
     )
     return sparse_mla.plan(caps)
 
@@ -737,6 +805,11 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
                 max_total_q=rows,
                 dcp_size=self.dcp_world_size,
                 max_cache_tokens=max_cache_tokens,
+                **(
+                    _packed_plan_overrides(kv_cache_spec, rows)
+                    if self._uses_packed_ds_mla
+                    else {}
+                ),
             )
             for rows in _dense_mla_plan_row_caps(max_dense_mla_rows)
         }
