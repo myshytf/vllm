@@ -631,6 +631,26 @@ def _packed_plan_overrides(kv_cache_spec: Any, row_cap: int) -> dict[str, Any]:
     return overrides
 
 
+def _packed_split_policy_override(kv_cache_spec: Any) -> str | None:
+    """Split policy of a draft group's packed reader; None keeps the default.
+
+    ``VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY`` applies to draft groups only
+    (``non_causal_multi_token_decode``); empty inherits
+    ``VLLM_K3_PACKED_MLA_SPLIT_POLICY``.
+    """
+    if not getattr(kv_cache_spec, "non_causal_multi_token_decode", False):
+        return None
+    policy = str(envs.VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY)
+    if not policy:
+        return None
+    if policy not in ("static", "balanced"):
+        raise ValueError(
+            "VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY must be empty, 'static' or "
+            f"'balanced', got {policy!r}."
+        )
+    return policy
+
+
 def _create_packed_dense_mla_plan(
     vllm_config: VllmConfig,
     device: torch.device,
@@ -741,6 +761,7 @@ class B12xMLAMetadata(MLACommonMetadata):
     dense_mla_query_cache_seq_lens: torch.Tensor | None = None
     dense_mla_selected_indices: torch.Tensor | None = None
     dense_mla_dcp_world_size: int = 1
+    dense_mla_split_policy: str | None = None
 
 
 class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
@@ -765,6 +786,11 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
             supports_dcp_with_varlen=True,
         )
         self._uses_packed_ds_mla = _uses_packed_ds_mla(vllm_config)
+        self._packed_split_policy = (
+            _packed_split_policy_override(kv_cache_spec)
+            if self._uses_packed_ds_mla
+            else None
+        )
         self._dcp_rank = (
             int(get_dcp_group().rank_in_group) if self.dcp_world_size > 1 else 0
         )
@@ -1079,6 +1105,7 @@ class B12xMLAMetadataBuilder(MLACommonMetadataBuilder[B12xMLAMetadata]):
         metadata.dense_mla_packed_q_local = self._dense_mla_packed_q_local
         metadata.dense_mla_padded_output = self._dense_mla_padded_output
         metadata.dense_mla_dcp_world_size = self.dcp_world_size
+        metadata.dense_mla_split_policy = getattr(self, "_packed_split_policy", None)
         decode_metadata = metadata.decode
         if decode_metadata is None or metadata.num_decodes <= 0:
             return metadata
@@ -1616,6 +1643,15 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
             packed_run = self._packed_dense_run
             if packed_run is None:
                 raise RuntimeError("B12X_MLA packed dense reader is unavailable")
+            run_kwargs = self._packed_dense_run_kwargs
+            split_policy = getattr(attn_metadata, "dense_mla_split_policy", None)
+            if split_policy is not None:
+                if "split_policy" not in run_kwargs:
+                    raise RuntimeError(
+                        "B12X sparse_mla.run_decode has no split_policy argument; "
+                        "unset VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY or update B12X."
+                    )
+                run_kwargs = {**run_kwargs, "split_policy": split_policy}
             binding = plan.bind(
                 scratch=scratch,
                 q=q,
@@ -1633,7 +1669,7 @@ class B12xMLAImpl(MLACommonImpl[B12xMLAMetadata]):
                     forced_num_splits=int(plan.caps.max_chunks_per_row),
                     return_lse=True,
                     lse_scale="natural",
-                    **self._packed_dense_run_kwargs,
+                    **run_kwargs,
                 ),
             )
         else:

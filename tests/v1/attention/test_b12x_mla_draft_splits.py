@@ -83,6 +83,31 @@ def test_unset_draft_environment_keeps_the_capacity_plan(splits_env) -> None:
     assert b12x_mla._packed_plan_overrides(_DRAFT, 8) == {}
 
 
+@pytest.mark.parametrize(
+    ("spec", "policy", "expected"),
+    [
+        (_DRAFT, "balanced", "balanced"),
+        (_DRAFT, "static", "static"),
+        (_DRAFT, "", None),
+        (_TARGET, "balanced", None),
+        (SimpleNamespace(), "balanced", None),
+    ],
+)
+def test_split_policy_override_applies_to_draft_groups_only(
+    monkeypatch: pytest.MonkeyPatch, spec, policy: str, expected
+) -> None:
+    monkeypatch.setenv("VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY", policy)
+
+    assert b12x_mla._packed_split_policy_override(spec) == expected
+
+
+def test_split_policy_override_is_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY", "dynamic")
+
+    with pytest.raises(ValueError, match="VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY"):
+        b12x_mla._packed_split_policy_override(_DRAFT)
+
+
 class _Caps:
     __dataclass_fields__ = {"partial_dtype": None}
 

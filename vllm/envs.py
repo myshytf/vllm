@@ -259,6 +259,7 @@ if TYPE_CHECKING:
     VLLM_K3_PACKED_MLA_QUERY: str = "bf16"
     VLLM_K3_DRAFT_PACKED_MLA_SPLITS: str = ""
     VLLM_K3_DRAFT_PACKED_MLA_PARTIAL_DTYPE: str = ""
+    VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY: str = ""
     VLLM_K3_PAIR_TOPK_FUSED: bool = False
     VLLM_K3_LATENT_AR_NORM_FUSED: bool = False
     VLLM_K3_UP_PROJ_ADDMM: bool = False
@@ -1963,6 +1964,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # or "fp32"); empty inherits VLLM_K3_PACKED_MLA_PARTIAL_DTYPE.
     "VLLM_K3_DRAFT_PACKED_MLA_PARTIAL_DTYPE": lambda: os.getenv(
         "VLLM_K3_DRAFT_PACKED_MLA_PARTIAL_DTYPE", ""
+    ).lower(),
+    # Split policy of the packed reader for draft groups ("static" or
+    # "balanced"); empty inherits VLLM_K3_PACKED_MLA_SPLIT_POLICY. "balanced"
+    # spreads a short row's live chunks over up to the plan's split count
+    # instead of the capacity-based ranges.
+    "VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY": lambda: os.getenv(
+        "VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY", ""
     ).lower(),
     # Query format handed to the Kimi-K3 packed (fp8_ds_mla) decode reader.
     # "packed": quantize each local query head into the reader's 656-byte

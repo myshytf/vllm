@@ -492,6 +492,45 @@ def _fake_packed_impl(*, num_heads: int = 8) -> tuple[B12xMLAImpl, _FakePackedRu
     return impl, packed_run
 
 
+def _packed_policy_call(impl, split_policy=None):
+    plan = _FakePackedPlan()
+    q = torch.randn(1, 8, 576, dtype=torch.bfloat16)
+    metadata = SimpleNamespace(
+        dense_mla_plan=plan,
+        dense_mla_scratch=torch.empty(256, dtype=torch.uint8),
+        dense_mla_selected_indices=torch.arange(32, dtype=torch.int32)[None].clone(),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        decode=SimpleNamespace(
+            block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+            seq_lens=torch.tensor([17], dtype=torch.int32),
+        ),
+    )
+    if split_policy is not None:
+        metadata.dense_mla_split_policy = split_policy
+    cache = torch.zeros(4, 16, 656, dtype=torch.uint8)
+    return impl.forward_mqa(q, cache, metadata, SimpleNamespace())
+
+
+def test_b12x_mla_packed_reader_takes_the_group_split_policy() -> None:
+    impl, packed_run = _fake_packed_impl()
+
+    _packed_policy_call(impl)
+    _packed_policy_call(impl, "static")
+
+    assert [call["split_policy"] for call in packed_run.calls] == [
+        "balanced",
+        "static",
+    ]
+
+
+def test_b12x_mla_group_split_policy_requires_reader_support() -> None:
+    impl, _ = _fake_packed_impl()
+    impl._packed_dense_run_kwargs = {}
+
+    with pytest.raises(RuntimeError, match="split_policy"):
+        _packed_policy_call(impl, "balanced")
+
+
 def test_b12x_mla_adapter_runs_packed_cache_as_exact_dense() -> None:
     impl, packed_run = _fake_packed_impl()
     plan = _FakePackedPlan()
