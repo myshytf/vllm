@@ -289,6 +289,7 @@ if TYPE_CHECKING:
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
+    VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD: int = 0
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -2031,6 +2032,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # speculator sees, so it is off by default while the effect is measured.
     "VLLM_KIMI_K3_AUX_ATTN_RES_STREAM": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_AUX_ATTN_RES_STREAM", "0"))
+    ),
+    # Kimi K3 KDA layers whose Q/K/V projection is MXFP8 and whose gate,
+    # factor and beta projections are BF16: during CUDA graph capture of at
+    # most this many rows, run Q/K/V on the auxiliary stream while the BF16
+    # branch runs on the main stream. Same kernels, inputs and reduction
+    # order (bit-identical). Zero keeps sequential dispatch.
+    "VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD": lambda: int(
+        os.getenv("VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD", "0")
     ),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).

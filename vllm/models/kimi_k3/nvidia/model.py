@@ -2006,6 +2006,7 @@ class KimiDecoderLayer(nn.Module):
                     config,
                     vllm_config,
                     prefix=f"{prefix}.self_attn",
+                    aux_stream=aux_stream,
                 )
                 self._self_attn_writes_output = False
             else:
@@ -2437,8 +2438,10 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             self.embed_tokens = PPMissingLayer()
 
         # Aux stream for overlapping the MLA g_proj output-gate GEMM with the
-        # attention front-end (DeepseekV4 convention: created at the model
-        # level and threaded into each attention layer).
+        # attention front-end and, in captured decode graphs, the KDA Q/K/V
+        # projection with the BF16 gate/factor/beta branch (DeepseekV4
+        # convention: created at the model level and threaded into each
+        # attention layer; MLA and KDA layers never run concurrently).
         aux_stream = torch.cuda.Stream()
         self._mla_prefill_projection_workspace = KimiK3PrefillProjectionWorkspace(
             num_ubatches=2 if parallel_config.enable_dbo else 1,
