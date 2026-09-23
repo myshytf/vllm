@@ -801,6 +801,13 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         assert self.model_version in (None, "deepseek_v4"), (
             f"Unsupported model version: {self.model_version}"
         )
+        if self.cache_dtype_str == "fp8_ds_mla":
+            # V3.2 / Kimi-K3 record (kv_lora_rank=512, rope=64): 512 E4M3
+            # latent values, four fp32 tile scales and 64 bf16 rope values,
+            # the same 656 bytes per token as the full-attention
+            # MLAAttentionSpec. A windowed draft group then shares the target
+            # group's page size instead of being sized as 576 uint8 elements.
+            return self.block_size * 656
         return (
             self.storage_block_size
             * self.num_kv_heads
