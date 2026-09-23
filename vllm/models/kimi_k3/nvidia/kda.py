@@ -56,7 +56,10 @@ from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.triton_utils import tl, triton
-from vllm.utils.multi_stream_utils import is_vllm_cudagraph_capture_active
+from vllm.utils.multi_stream_utils import (
+    is_vllm_cudagraph_capture_active,
+    maybe_execute_in_parallel,
+)
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 from vllm.v1.kv_cache_interface import MambaSpec
@@ -504,6 +507,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         config: KimiLinearConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
+        aux_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
@@ -544,6 +548,27 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         self.in_proj_padding = -local_output_size % 16
         self.split_mixed_precision_input = use_split_mixed_precision_input_projection(
             self.quant_config
+        )
+        # The split Q/K/V (MXFP8) and gate/factor/beta (BF16) projections read
+        # the same input and are independent until the convolution. Captured
+        # decode graphs of at most this many rows run Q/K/V on the model's
+        # auxiliary stream while the BF16 branch (and f_b when f_a is not
+        # sharded) runs on the main stream; the join precedes every consumer.
+        # Kernels, inputs and reduction order are unchanged, so the outputs
+        # are bit-identical to sequential dispatch.
+        self._split_projection_overlap_max_tokens = max(
+            0, envs.VLLM_KIMI_KDA_PROJECTION_STREAM_TOKEN_THRESHOLD
+        )
+        self._projection_aux_stream = (
+            aux_stream
+            if self.split_mixed_precision_input
+            and self._split_projection_overlap_max_tokens > 0
+            else None
+        )
+        self._projection_events = (
+            (torch.cuda.Event(), torch.cuda.Event())
+            if self._projection_aux_stream is not None
+            else None
         )
         if self.split_mixed_precision_input:
             # Q/K/V are serialized as MXFP8 while the full-rank gate, factor,
@@ -838,6 +863,59 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         torch.mm(core_attn_out, self.o_proj.weight.t(), out=output)
         return output
 
+    def _split_projection_overlap_active(self, num_tokens: int) -> bool:
+        """Whether this call overlaps the split input projections.
+
+        Only while a CUDA graph is being captured: the fork and join become
+        graph edges, and every replay reuses them. Eager calls, batches above
+        the threshold and batch-invariant mode keep sequential dispatch.
+        """
+        return (
+            self._projection_events is not None
+            and 0 < num_tokens <= self._split_projection_overlap_max_tokens
+            and not envs.VLLM_BATCH_INVARIANT
+            and torch.cuda.is_current_stream_capturing()
+        )
+
+    def _project_split_input_overlapped(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor
+    ]:
+        """Q/K/V on the auxiliary stream, the BF16 branch on the main stream.
+
+        Returns ``(mixed_qkv, g_proj_states, f_a, g1, beta)``. ``g1`` is the
+        f_b projection, computed inside the main-stream branch when f_a is
+        replicated; with a sharded f_a it is ``None`` because f_b must follow
+        the f_a gather outside the overlapped region.
+        """
+        assert self._projection_events is not None
+        gfab_split_sizes = [
+            self.local_projection_size,
+            self.local_fa_size,
+            self.local_num_heads,
+        ]
+        if self.in_proj_padding:
+            gfab_split_sizes.append(self.in_proj_padding)
+        project_f_b = not self.shard_f_a
+
+        def project_gates():
+            projected_gfab = self.in_proj_gfab(hidden_states)[0].split(
+                gfab_split_sizes, dim=-1
+            )
+            g_proj_states, f_a, beta = projected_gfab[:3]
+            g1 = self.f_b_proj(f_a)[0] if project_f_b else None
+            return g_proj_states, f_a, g1, beta
+
+        (g_proj_states, f_a, g1, beta), mixed_qkv = maybe_execute_in_parallel(
+            project_gates,
+            lambda: self.in_proj_qkv(hidden_states)[0],
+            self._projection_events[0],
+            self._projection_events[1],
+            self._projection_aux_stream,
+        )
+        return mixed_qkv, g_proj_states, f_a, g1, beta
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -845,7 +923,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
-        if self.split_mixed_precision_input:
+        g1 = None
+        if self._split_projection_overlap_active(num_tokens):
+            mixed_qkv, g_proj_states, f_a, g1, beta = (
+                self._project_split_input_overlapped(hidden_states)
+            )
+        elif self.split_mixed_precision_input:
             mixed_qkv = self.in_proj_qkv(hidden_states)[0]
             gfab_split_sizes = [
                 self.local_projection_size,
@@ -876,9 +959,10 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         _hook = getattr(self, "_l2_prefetch_hook", None)
         if _hook is not None:
             _hook(hidden_states.shape[0])
-        if self.shard_f_a:
-            f_a = gather_kimi_sharded_projection(f_a)
-        g1 = self.f_b_proj(f_a)[0]
+        if g1 is None:
+            if self.shard_f_a:
+                f_a = gather_kimi_sharded_projection(f_a)
+            g1 = self.f_b_proj(f_a)[0]
         beta = beta.unsqueeze(0)
         g1 = rearrange(g1, "n (h d) -> 1 n h d", d=self.head_dim)
         g2 = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
