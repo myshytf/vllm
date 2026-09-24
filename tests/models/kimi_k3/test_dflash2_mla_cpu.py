@@ -518,3 +518,78 @@ def test_draft_runs_its_trained_block_and_proposes_fewer_rows() -> None:
         dflash2_draft_query_rows(config, 8, full_block=True)
     config.dflash_config.pop("block_size")
     assert dflash2_draft_query_rows(config, 3, full_block=True) == 4
+
+
+class _PlainSelector:
+    """The served selector's row preparation and conditioning over plain
+    tensors (no parallel linear layers)."""
+
+    top_k = 4
+    prepare_rows = dflash2_mla.DFlash2CandidateSelector.prepare_rows
+    condition = dflash2_mla.DFlash2CandidateSelector.condition
+
+    def __init__(self, vocab: int, hidden: int, rank: int) -> None:
+        self.predecessor_codebook = torch.randn(vocab, rank)
+        self.successor_codebook = torch.randn(vocab, rank)
+        self.projection = torch.randn(hidden, rank)
+
+    def hidden_projection(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states @ self.projection
+
+
+def test_dump_keeps_unary_logits_apart_from_the_sampled_logits() -> None:
+    """The fidelity dump records the unary logits before the selector
+    conditions the sampled logits in place.
+
+    The offline comparison with the reference model needs both: the unary
+    logits are what the reference's LM head produces, the conditioned logits
+    are the distribution the proposals were drawn from.
+    """
+    from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
+        DFlash2Speculator,
+    )
+
+    torch.manual_seed(20260924)
+    vocab, hidden_size, rank, rows, n_spec = 48, 6, 5, 8, 3
+    lm_head = torch.randn(vocab, hidden_size)
+    selector = _PlainSelector(vocab, hidden_size, rank)
+    model = SimpleNamespace(
+        compute_draft_logits=lambda h: h @ lm_head.T,
+        candidate_selector=selector,
+    )
+    speculator = object.__new__(DFlash2Speculator)
+    speculator.model = model
+    speculator._dump_dir = "unused"
+    speculator._dump_stash = {}
+    speculator.sample_indices = torch.arange(1, 1 + n_spec)
+    speculator.sample_idx_mapping = torch.zeros(n_spec, dtype=torch.int64)
+    speculator.sample_pos = torch.arange(n_spec)
+    speculator.input_buffers = SimpleNamespace(
+        input_ids=torch.tensor([7] + [40] * (rows - 1))
+    )
+    speculator.draft_tokens = torch.zeros(1, n_spec, dtype=torch.int64)
+    speculator._sample_logits = lambda logits, *args: logits.argmax(dim=-1)
+
+    head_hidden = torch.randn(rows, hidden_size)
+    speculator._sample_with_selector(1, head_hidden, n_spec, rows)
+
+    sample_hidden, unary, sampled = speculator._dump_stash[1]
+    expected_unary = head_hidden[1 : 1 + n_spec] @ lm_head.T
+    torch.testing.assert_close(sample_hidden, head_hidden[1 : 1 + n_spec])
+    torch.testing.assert_close(unary, expected_unary)
+
+    projected = selector.hidden_projection(sample_hidden)
+    predecessors = [7] + speculator.draft_tokens[0, :-1].tolist()
+    for i, predecessor in enumerate(predecessors):
+        expected = add_selector_transitions(
+            expected_unary[i : i + 1].clone(),
+            expected_unary[i : i + 1].topk(selector.top_k, dim=-1).indices,
+            selector.successor_codebook[
+                expected_unary[i : i + 1].topk(selector.top_k, dim=-1).indices
+            ],
+            selector.predecessor_codebook[torch.tensor([predecessor])],
+            projected[i : i + 1],
+        )
+        torch.testing.assert_close(sampled[i : i + 1], expected)
+    assert not torch.equal(sampled, unary)
+    assert speculator.draft_tokens[0].tolist() == sampled.argmax(dim=-1).tolist()
