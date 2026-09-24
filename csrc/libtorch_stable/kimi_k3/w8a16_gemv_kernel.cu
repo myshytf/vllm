@@ -158,10 +158,15 @@ __global__ void __launch_bounds__(NW * 32)
   const int slice_k = (g_end - g_begin) * kGroupK;
 
   // Shared memory: activations [MR][slice_k] bf16, then the per-warp and
-  // per-CTA column sums.
+  // per-CTA column sums. The sums sit at the same offset in every CTA of the
+  // cluster (peers read them through DSMEM at their own offset), i.e. after
+  // the largest slice's activations rather than this CTA's: with 44 groups
+  // over 8 CTAs the slices hold 5 or 6 groups.
+  const int max_slice_k = ((p.groups + CL - 1) / CL) * kGroupK;
   __nv_bfloat16* x_s = reinterpret_cast<__nv_bfloat16*>(smem_raw);
   float* s_red = reinterpret_cast<float*>(
-      smem_raw + ((static_cast<size_t>(MR) * slice_k * 2 + 15) & ~size_t{15}));
+      smem_raw +
+      ((static_cast<size_t>(MR) * max_slice_k * 2 + 15) & ~size_t{15}));
   float* s_cta = s_red + NW * kTileN * MR;  // [kTileN][MR], read cluster-wide
 
   const int64_t row_bytes = static_cast<int64_t>(p.padded_n) * kTileK;

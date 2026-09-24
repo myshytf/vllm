@@ -240,8 +240,14 @@ def test_gemv_matches_float64(monkeypatch, rows, size_n, size_k, cluster):
     bf16 ulp of the float64 product of the exact weights, and repeated calls
     are bitwise identical."""
     from vllm.model_executor.kernels.linear.mxfp8.marlin_hybrid import (
+        _GEMV_MAX_SMEM,
         apply_w8a16_gemv,
         can_w8a16_gemv,
+        w8a16_gemv_layout,
+        w8a16_gemv_smem_bytes,
+    )
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_repacked_nk,
     )
 
     monkeypatch.setenv("VLLM_K3_W8A16_GEMV_CLUSTER", str(cluster))
@@ -257,6 +263,12 @@ def test_gemv_matches_float64(monkeypatch, rows, size_n, size_k, cluster):
     ).view(size_n, size_k)
     layer = _marlin_mxfp8_layer(weight, scales, dev)
     x = torch.randn(rows, size_k, device=dev, dtype=torch.bfloat16)
+    padded_n, padded_k = marlin_repacked_nk(layer.weight, num_bits=8)
+    if w8a16_gemv_smem_bytes(
+        rows, padded_k, *w8a16_gemv_layout(padded_n, padded_k, 0)
+    ) > (_GEMV_MAX_SMEM):
+        assert not can_w8a16_gemv(layer, x, None)
+        pytest.skip("the layout exceeds the GEMV's shared memory; Marlin serves it")
     assert can_w8a16_gemv(layer, x, None)
 
     out = apply_w8a16_gemv(layer, x)
