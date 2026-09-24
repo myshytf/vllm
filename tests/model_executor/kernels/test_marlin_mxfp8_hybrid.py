@@ -250,3 +250,17 @@ def test_gemv_layout_table_overrides_the_default(monkeypatch):
 
     assert w8a16_gemv_layout(7168, 1408, 0) == (2, 8)
     assert w8a16_gemv_layout(2112, 1536, 0) == (4, 2)
+
+
+def test_gemv_shared_memory_bound():
+    """A one-CTA K split of a 7168-wide input at 8 rows needs more shared
+    memory than a CTA may request, so the gate falls back to Marlin; two CTAs
+    per column group fit."""
+    from vllm.model_executor.kernels.linear.mxfp8.marlin_hybrid import (
+        _GEMV_MAX_SMEM,
+        w8a16_gemv_smem_bytes,
+    )
+
+    assert w8a16_gemv_smem_bytes(8, 7168, 1, 4) > _GEMV_MAX_SMEM
+    assert w8a16_gemv_smem_bytes(8, 7168, 2, 4) <= _GEMV_MAX_SMEM
+    assert w8a16_gemv_smem_bytes(4, 1408, 4, 4) == 2816 + 5 * 64 * 4 * 4

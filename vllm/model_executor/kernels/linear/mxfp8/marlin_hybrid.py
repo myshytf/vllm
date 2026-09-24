@@ -256,7 +256,27 @@ def can_w8a16_gemv(
     if selected and not any(s in prefix for s in selected):
         return False
     x2 = x.reshape(rows, x.shape[-1])
-    return x2.stride(-1) == 1 and x2.stride(0) % 8 == 0 and x2.data_ptr() % 16 == 0
+    if not (x2.stride(-1) == 1 and x2.stride(0) % 8 == 0 and x2.data_ptr() % 16 == 0):
+        return False
+    if not require_op:
+        return True
+    padded_n, padded_k = marlin_repacked_nk(layer.weight, num_bits=8)
+    cluster, warps = w8a16_gemv_layout(padded_n, padded_k, x.device.index or 0)
+    return w8a16_gemv_smem_bytes(rows, padded_k, cluster, warps) <= _GEMV_MAX_SMEM
+
+
+# Dynamic shared memory the GEMV may request per CTA (sm_120 allows 99 KiB).
+_GEMV_MAX_SMEM = 96 * 1024
+
+
+def w8a16_gemv_smem_bytes(rows: int, padded_k: int, cluster: int, warps: int) -> int:
+    """Dynamic shared memory of one ``w8a16_gemv`` CTA: the CTA's K slice of
+    the activations (bf16, rows padded to 1/2/4/8) plus the per-warp and
+    per-CTA column sums."""
+    padded_rows = 1 if rows <= 1 else 2 if rows <= 2 else 4 if rows <= 4 else 8
+    slice_groups = -(-(padded_k // 32) // cluster)
+    x_bytes = -(-(padded_rows * slice_groups * 32 * 2) // 16) * 16
+    return x_bytes + (warps + 1) * 64 * padded_rows * 4
 
 
 @functools.cache
