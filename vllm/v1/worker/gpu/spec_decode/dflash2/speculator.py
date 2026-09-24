@@ -7,16 +7,19 @@ DFlash2's grouped convolutions and candidate selector, see
 `vllm.models.kimi_k3.nvidia.dflash2_mla`). Loading, the fused latent context
 KV, the target's auxiliary-state streaming and the query layout come from the
 DSpark speculator; the proposal is DFlash's: one backbone forward over the
-anchor plus mask tokens of every request, then one sampling pass over the
-LM-head distributions of all block positions (probabilistic when the draft
-distributions are handed to the rejection sampler, greedy otherwise). DSpark's
-sequential Markov sampling and its confidence-driven draft capacity do not
-apply: the DFlash2 checkpoint has neither head.
+anchor plus mask tokens of every request. DSpark's sequential Markov sampling
+and its confidence-driven draft capacity do not apply: the DFlash2 checkpoint
+has neither head.
 
-The candidate selector is available on the model (`model.candidate_selector`)
-for the greedy lattice walk of the checkpoint's own runtime and for a
-selector-conditioned sampling variant; this speculator's proposal does not
-use it.
+With the candidate selector enabled (``VLLM_DFLASH2_SELECTOR``, the default)
+the block positions are sampled in order: each position's LM-head logits get,
+on their unary top-k candidates, the selector's transition score from the
+token sampled at the previous position (the anchor for the first), and the
+sampled token becomes the next position's predecessor. The conditioned
+logits are the proposal distribution (probabilistic when the draft
+distributions are handed to the rejection sampler, greedy otherwise). With
+the selector disabled, every block position is sampled in one parallel pass
+over its unary logits.
 
 The embedding and LM head are the target's. The checkpoint's own embedding
 table, mask-token row included, is identical to the target's, so no separate
@@ -104,10 +107,14 @@ class DFlash2Speculator(DSparkSpeculator):
         # every step, for the offline comparison against the reference model.
         self._dump_dir = os.environ.get("VLLM_DFLASH2_DUMP_DIR") or None
         self._dump_step = 0
-        # Per padded request count: the graph-owned (sample_hidden, base_logits)
-        # of the last eager run or capture at that size; a replayed graph
-        # rewrites the same storage, so the entry stays current.
-        self._dump_stash: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Per padded request count: the graph-owned (sample_hidden, unary
+        # logits, sampled logits) of the last eager run or capture at that
+        # size; a replayed graph rewrites the same storage, so the entry stays
+        # current. The unary logits are a copy taken before the selector
+        # conditions the sampled logits in place.
+        self._dump_stash: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
         if self.max_num_reqs * self.num_query_per_req > self.max_num_tokens:
             raise ValueError(
                 "max_num_batched_tokens is too small for the DFlash2 draft block "
@@ -165,9 +172,16 @@ class DFlash2Speculator(DSparkSpeculator):
         """Write one step of the first request (TP rank 0) for the offline
         comparison: the target auxiliary states of the tokens the target ran
         this step, the draft block's token ids and positions, the draft's
-        sampled hidden states and unary logits, and the proposals."""
+        hidden states of the proposal rows, their unary logits
+        (``base_logits``), the logits the proposals were sampled from
+        (``sampled_logits``: selector-conditioned) and the proposals."""
+        dump_dir = self._dump_dir
         max_steps = int(os.environ.get("VLLM_DFLASH2_DUMP_MAX_STEPS", "512"))
-        if get_tensor_model_parallel_rank() != 0 or self._dump_step >= max_steps:
+        if (
+            dump_dir is None
+            or get_tensor_model_parallel_rank() != 0
+            or self._dump_step >= max_steps
+        ):
             return
         rows = self.num_query_per_req
         # Long prefills are not dumped (their auxiliary states are hundreds of
@@ -183,6 +197,7 @@ class DFlash2Speculator(DSparkSpeculator):
         stash = self._dump_stash.get(sizes[0]) if sizes else None
         sample_hidden = stash[0] if stash is not None else None
         base_logits = stash[1] if stash is not None else None
+        sampled_logits = stash[2] if stash is not None else None
         record = {
             "step": self._dump_step,
             "num_reqs": int(input_batch.num_reqs),
@@ -208,12 +223,15 @@ class DFlash2Speculator(DSparkSpeculator):
             "base_logits": base_logits[: self.num_speculative_steps].detach().cpu()
             if base_logits is not None
             else None,
+            "sampled_logits": sampled_logits[: self.num_speculative_steps]
+            .detach()
+            .cpu()
+            if sampled_logits is not None
+            else None,
             "draft_tokens": draft_tokens[0].detach().cpu(),
         }
-        os.makedirs(self._dump_dir, exist_ok=True)
-        torch.save(
-            record, os.path.join(self._dump_dir, f"step-{self._dump_step:04d}.pt")
-        )
+        os.makedirs(dump_dir, exist_ok=True)
+        torch.save(record, os.path.join(dump_dir, f"step-{self._dump_step:04d}.pt"))
         self._dump_step += 1
 
     def _query_len_for_speculative_steps(self, num_speculative_steps: int) -> int:
@@ -282,7 +300,13 @@ class DFlash2Speculator(DSparkSpeculator):
         base_logits = self.model.compute_draft_logits(sample_hidden)
         if self._dump_dir is not None:
             # Graph-owned intermediates keep their storage while referenced.
-            self._dump_stash[num_reqs] = (sample_hidden, base_logits)
+            # The selector conditions base_logits in place below, so the unary
+            # logits are recorded from a copy.
+            self._dump_stash[num_reqs] = (
+                sample_hidden,
+                base_logits.clone(),
+                base_logits,
+            )
         selector = self.model.candidate_selector
         hidden, candidate_ids, successor_rows = selector.prepare_rows(
             sample_hidden, base_logits
