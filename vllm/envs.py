@@ -268,6 +268,12 @@ if TYPE_CHECKING:
     VLLM_K3_ATTN_RES_DECODE_SLOTS: int = 1
     VLLM_K3_ATTN_RES_DECODE_CLUSTER: int = 1
     VLLM_K3_ATTN_RES_DECODE_MAX_ROWS: int = 16
+    VLLM_K3_W8A16_GEMV_LIB: str = ""
+    VLLM_K3_W8A16_GEMV_MAX_ROWS: int = 8
+    VLLM_K3_W8A16_GEMV_LAYERS: str = "self_attn"
+    VLLM_K3_W8A16_GEMV_CLUSTER: int = 0
+    VLLM_K3_W8A16_GEMV_WARPS: int = 4
+    VLLM_K3_W8A16_GEMV_TABLE: str = ""
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
@@ -2054,6 +2060,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_K3_ATTN_RES_DECODE_MAX_ROWS": lambda: int(
         os.getenv("VLLM_K3_ATTN_RES_DECODE_MAX_ROWS", "16")
     ),
+    # Kimi-K3 decode: path of the `_C_k3decode` side extension whose
+    # `w8a16_gemv` serves MXFP8 Marlin linears for at most
+    # VLLM_K3_W8A16_GEMV_MAX_ROWS (<= 8) rows, reading the Marlin payload in
+    # place (exact products, fixed-order reductions, L2 weight prefetch before
+    # the PDL wait). Empty = Marlin.
+    "VLLM_K3_W8A16_GEMV_LIB": lambda: os.getenv("VLLM_K3_W8A16_GEMV_LIB", ""),
+    "VLLM_K3_W8A16_GEMV_MAX_ROWS": lambda: int(
+        os.getenv("VLLM_K3_W8A16_GEMV_MAX_ROWS", "8")
+    ),
+    # Comma-separated substrings of the layer prefixes `w8a16_gemv` serves
+    # (empty = every MXFP8 Marlin linear). The default keeps the shared
+    # experts, which run beside the MoE kernel on a side stream, on Marlin.
+    "VLLM_K3_W8A16_GEMV_LAYERS": lambda: os.getenv(
+        "VLLM_K3_W8A16_GEMV_LAYERS", "self_attn"
+    ),
+    # CTAs per 64-column group of `w8a16_gemv` (K split in one thread-block
+    # cluster: 1, 2, 4 or 8); 0 = the smallest giving two CTAs per SM.
+    "VLLM_K3_W8A16_GEMV_CLUSTER": lambda: int(
+        os.getenv("VLLM_K3_W8A16_GEMV_CLUSTER", "0")
+    ),
+    # Warps per CTA of `w8a16_gemv` (2, 4 or 8).
+    "VLLM_K3_W8A16_GEMV_WARPS": lambda: int(os.getenv("VLLM_K3_W8A16_GEMV_WARPS", "4")),
+    # Per-shape `w8a16_gemv` layouts measured on the serving GPU, overriding
+    # the two settings above: "NxK:CxW,..." with the Marlin-padded N and K,
+    # C CTAs per column group and W warps.
+    "VLLM_K3_W8A16_GEMV_TABLE": lambda: os.getenv("VLLM_K3_W8A16_GEMV_TABLE", ""),
     # Whether to use fused grouped_topk used for MoE expert selection.
     "VLLM_USE_FUSED_MOE_GROUPED_TOPK": lambda: bool(
         int(os.getenv("VLLM_USE_FUSED_MOE_GROUPED_TOPK", "1"))
