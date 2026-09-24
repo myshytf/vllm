@@ -8,11 +8,78 @@
 # Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
 
 
+import functools
+from collections.abc import Callable
+
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+# `_C_k3decode.attn_res_decode` supports at most this many sources
+# (AttnRes blocks plus the prefix).
+_ATTN_RES_DECODE_MAX_SOURCES = 12
+
+
+@functools.cache
+def load_attn_res_decode_op() -> Callable[..., None] | None:
+    """``_C_k3decode.attn_res_decode`` from ``VLLM_K3_ATTN_RES_DECODE_LIB``,
+    or None (the Triton kernel)."""
+    path = envs.VLLM_K3_ATTN_RES_DECODE_LIB
+    if not path:
+        return None
+    torch.ops.load_library(path)
+    return torch.ops._C_k3decode.attn_res_decode
+
+
+def _vector_rows(t: torch.Tensor) -> bool:
+    """16-byte aligned rows of 8-element vectors with a unit last stride."""
+    return (
+        t.stride(-1) == 1
+        and t.data_ptr() % 16 == 0
+        and all(stride % 8 == 0 for stride in t.stride()[:-1])
+    )
+
+
+def can_attn_res_decode(
+    prefix: torch.Tensor,
+    delta: torch.Tensor | None,
+    blocks: torch.Tensor,
+    norm_weight: torch.Tensor,
+    qk_weight: torch.Tensor,
+    output_norm_weight: torch.Tensor | None,
+    num_blocks: int,
+    output: torch.Tensor | None,
+    *,
+    require_op: bool = True,
+    device_type: str = "cuda",
+) -> bool:
+    """Whether ``attn_res_decode`` serves these operands: a decode-sized batch
+    (``VLLM_K3_ATTN_RES_DECODE_MAX_ROWS``), bf16 CUDA tensors, hidden size a
+    multiple of 8, at most 12 sources, 16-byte aligned rows."""
+    if require_op and load_attn_res_decode_op() is None:
+        return False
+    if prefix.ndim != 2 or blocks.ndim != 3:
+        return False
+    num_tokens, hidden_size = prefix.shape
+    if not 0 < num_tokens <= envs.VLLM_K3_ATTN_RES_DECODE_MAX_ROWS:
+        return False
+    if hidden_size % 8 or not 0 <= num_blocks < _ATTN_RES_DECODE_MAX_SOURCES:
+        return False
+    if blocks.shape[0] != num_tokens or blocks.shape[2] != hidden_size:
+        return False
+    if num_blocks > blocks.shape[1]:
+        return False
+    tensors = [prefix, blocks, norm_weight, qk_weight]
+    tensors += [t for t in (delta, output_norm_weight, output) if t is not None]
+    if any(t.dtype != torch.bfloat16 or t.device.type != device_type for t in tensors):
+        return False
+    for weight in (norm_weight, qk_weight, output_norm_weight):
+        if weight is not None and (weight.ndim != 1 or weight.shape[0] != hidden_size):
+            return False
+    return all(_vector_rows(t) for t in tensors)
 
 
 # Consumed by kimi_k3_triton_warmup.py during kernel_warmup().
@@ -226,6 +293,39 @@ def attn_res(
             eps,
             output_norm_eps,
         )
+    if can_attn_res_decode(
+        prefix,
+        delta,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        num_blocks,
+        output,
+    ):
+        if output is None:
+            output = prefix.new_empty(prefix.shape)
+        op = load_attn_res_decode_op()
+        assert op is not None
+        op(
+            output,
+            prefix,
+            prefix if delta is None else delta,
+            delta is not None,
+            blocks,
+            norm_weight,
+            qk_weight,
+            norm_weight if output_norm_weight is None else output_norm_weight,
+            output_norm_weight is not None,
+            num_blocks,
+            block_write_idx,
+            float(eps),
+            float(output_norm_eps),
+            envs.VLLM_K3_ATTN_RES_DECODE_SLOTS,
+            envs.VLLM_K3_ATTN_RES_DECODE_CLUSTER,
+            current_platform.is_arch_support_pdl(),
+        )
+        return output
     if output is None:
         output = prefix.new_empty(prefix.shape)
     # Tuned on GB300: source tiling helps decode, while one-source tiles scale
