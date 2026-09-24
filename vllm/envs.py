@@ -257,6 +257,9 @@ if TYPE_CHECKING:
     VLLM_K3_PACKED_MLA_SPLIT_POLICY: str = "balanced"
     VLLM_K3_PACKED_MLA_PARTIAL_DTYPE: str = "fp32"
     VLLM_K3_PACKED_MLA_QUERY: str = "bf16"
+    VLLM_K3_DRAFT_PACKED_MLA_SPLITS: str = ""
+    VLLM_K3_DRAFT_PACKED_MLA_PARTIAL_DTYPE: str = ""
+    VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY: str = ""
     VLLM_K3_PAIR_TOPK_FUSED: bool = False
     VLLM_K3_LATENT_AR_NORM_FUSED: bool = False
     VLLM_K3_UP_PROJ_ADDMM: bool = False
@@ -1947,6 +1950,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rounded once, at the output.
     "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE": lambda: os.getenv(
         "VLLM_K3_PACKED_MLA_PARTIAL_DTYPE", "fp32"
+    ).lower(),
+    # Split count of the packed decode reader for draft groups (non-causal
+    # multi-token decode, e.g. the Kimi-K3 DFlash2 draft) per plan row capacity:
+    # comma-separated "rows:splits" pairs. A plan uses the entry with the
+    # smallest rows at or above its capacity (the largest entry beyond that);
+    # the count is clamped to the plan's chunk capacity. Empty keeps the
+    # capacity-based count (one split per 64-token chunk, at most 64).
+    "VLLM_K3_DRAFT_PACKED_MLA_SPLITS": lambda: os.getenv(
+        "VLLM_K3_DRAFT_PACKED_MLA_SPLITS", ""
+    ).strip(),
+    # Split-partial element type of the packed reader for draft groups ("bf16"
+    # or "fp32"); empty inherits VLLM_K3_PACKED_MLA_PARTIAL_DTYPE.
+    "VLLM_K3_DRAFT_PACKED_MLA_PARTIAL_DTYPE": lambda: os.getenv(
+        "VLLM_K3_DRAFT_PACKED_MLA_PARTIAL_DTYPE", ""
+    ).lower(),
+    # Split policy of the packed reader for draft groups ("static" or
+    # "balanced"); empty inherits VLLM_K3_PACKED_MLA_SPLIT_POLICY. "balanced"
+    # spreads a short row's live chunks over up to the plan's split count
+    # instead of the capacity-based ranges.
+    "VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY": lambda: os.getenv(
+        "VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY", ""
     ).lower(),
     # Query format handed to the Kimi-K3 packed (fp8_ds_mla) decode reader.
     # "packed": quantize each local query head into the reader's 656-byte
