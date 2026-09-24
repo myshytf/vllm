@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -10,6 +12,9 @@ from vllm.models.kimi_k3.common.mtp import fused_mtp_input
 from vllm.models.kimi_k3.nvidia.ops import attn_res
 from vllm.models.kimi_k3.nvidia.ops.attn_res import can_attn_res_decode
 from vllm.platforms import current_platform
+
+# The ops package re-exports the `attn_res` function under the module's name.
+attn_res_mod = importlib.import_module("vllm.models.kimi_k3.nvidia.ops.attn_res")
 
 HIDDEN_SIZE = 7168
 MAX_BLOCKS = 8
@@ -376,9 +381,15 @@ def test_attn_res_decode_gate(monkeypatch, change: str | None):
     elif change == "weight":
         operands["qk_weight"] = operands["qk_weight"][:128]
 
-    accepted = can_attn_res_decode(
-        **operands, require_op=change == "library", device_type="cpu"
-    )
+    # The loader caches its result; do not leave the unset-library result
+    # behind for the GPU tests of the same session.
+    attn_res_mod.load_attn_res_decode_op.cache_clear()
+    try:
+        accepted = can_attn_res_decode(
+            **operands, require_op=change == "library", device_type="cpu"
+        )
+    finally:
+        attn_res_mod.load_attn_res_decode_op.cache_clear()
 
     assert accepted == (change is None)
 

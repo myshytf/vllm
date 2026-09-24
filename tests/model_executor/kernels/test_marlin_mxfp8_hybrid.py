@@ -159,15 +159,20 @@ def test_gemv_lane_chunks_cover_each_tile_once():
 @pytest.mark.parametrize(
     "change", [None, "library", "rows", "bias", "dtype", "layer", "misaligned"]
 )
-def test_gemv_gate(monkeypatch, change):
+def test_gemv_gate(monkeypatch, request, change):
     """Only bias-free decode batches (at most 8 bf16 rows, 16-byte aligned) of
     the selected layers reach `w8a16_gemv`, and only when its library is
     set."""
     from vllm.model_executor.kernels.linear.mxfp8.marlin_hybrid import (
         can_w8a16_gemv,
+        load_w8a16_gemv_op,
     )
 
     monkeypatch.setenv("VLLM_K3_W8A16_GEMV_LIB", "")
+    # The loader caches its result; keep the unset-library result out of the
+    # GPU tests of the same session.
+    load_w8a16_gemv_op.cache_clear()
+    request.addfinalizer(load_w8a16_gemv_op.cache_clear)
     layer = torch.nn.Module()
     layer.input_size_per_partition = 256
     layer.prefix = (
@@ -187,6 +192,40 @@ def test_gemv_gate(monkeypatch, change):
     assert accepted == (change is None)
 
 
+def _marlin_mxfp8_layer(weight, scales, device):
+    """The prepare_mxfp8_layer_for_marlin layout with the float8 steps (packing,
+    transpose, e8m0 conversion) on the CPU and only the int32 repack on the
+    GPU: the serving image's torch has no sm_120 SASS for float8 kernels."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_make_workspace_new,
+    )
+
+    size_n, size_k = weight.shape
+    marlin_q, marlin_s = _reference_repack(weight, scales, torch.bfloat16)
+    del marlin_q
+    padded_n, padded_k = marlin_padded_nk(size_n, size_k, 32)
+    qweight = pack_fp8_to_int32(weight, size_k_first=False).T.contiguous()
+    qweight = marlin_pad_qweight(qweight, size_n, size_k, padded_n, padded_k)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        ops.gptq_marlin_repack(
+            b_q_weight=qweight.to(device),
+            perm=torch.empty(0, dtype=torch.int, device=device),
+            size_k=padded_k,
+            size_n=padded_n,
+            num_bits=8,
+        ),
+        requires_grad=False,
+    )
+    layer.weight_scale = torch.nn.Parameter(marlin_s.to(device), requires_grad=False)
+    layer.workspace = marlin_make_workspace_new(device)
+    layer.output_size_per_partition = size_n
+    layer.input_size_per_partition = size_k
+    layer.prefix = "model.layers.0.self_attn.o_proj"
+    return layer
+
+
 @pytest.mark.skipif(
     not os.environ.get("VLLM_K3_W8A16_GEMV_LIB"),
     reason="VLLM_K3_W8A16_GEMV_LIB names no _C_k3decode library",
@@ -204,38 +243,27 @@ def test_gemv_matches_float64(monkeypatch, rows, size_n, size_k, cluster):
         apply_w8a16_gemv,
         can_w8a16_gemv,
     )
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
-        prepare_mxfp8_layer_for_marlin,
-    )
-    from vllm.utils.torch_utils import set_default_torch_dtype
 
     monkeypatch.setenv("VLLM_K3_W8A16_GEMV_CLUSTER", str(cluster))
     torch.manual_seed(0)
     dev = torch.device("cuda")
-    weight = (torch.randn(size_n, size_k, device=dev) / 4).to(torch.float8_e4m3fn)
-    scales = torch.randint(
-        118, 132, (size_n, size_k // 32), dtype=torch.uint8, device=dev
-    )
+    # float8 conversions run on the CPU: the serving image's torch has no
+    # sm_120 SASS for them and its driver cannot JIT the CUDA 13.3 PTX.
+    weight = (torch.randn(size_n, size_k) / 4).to(torch.float8_e4m3fn)
+    scales = torch.randint(118, 132, (size_n, size_k // 32), dtype=torch.uint8)
     exact = (
         weight.double().view(size_n, size_k // 32, 32)
         * scales.view(torch.float8_e8m0fnu).double().unsqueeze(-1)
     ).view(size_n, size_k)
-    layer = torch.nn.Module()
-    layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
-    layer.weight_scale = torch.nn.Parameter(scales.clone(), requires_grad=False)
-    layer.output_size_per_partition = size_n
-    layer.input_size_per_partition = size_k
-    layer.prefix = "model.layers.0.self_attn.o_proj"
-    with set_default_torch_dtype(torch.bfloat16):
-        prepare_mxfp8_layer_for_marlin(layer)
+    layer = _marlin_mxfp8_layer(weight, scales, dev)
     x = torch.randn(rows, size_k, device=dev, dtype=torch.bfloat16)
     assert can_w8a16_gemv(layer, x, None)
 
     out = apply_w8a16_gemv(layer, x)
     again = apply_w8a16_gemv(layer, x)
 
-    expected = x.double() @ exact.T
-    torch.testing.assert_close(out.double(), expected, atol=1e-3, rtol=2**-8)
+    expected = x.cpu().double() @ exact.T
+    torch.testing.assert_close(out.cpu().double(), expected, atol=1e-3, rtol=2**-8)
     assert torch.equal(out, again)
 
 
