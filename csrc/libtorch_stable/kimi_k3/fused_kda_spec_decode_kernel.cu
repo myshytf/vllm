@@ -15,6 +15,14 @@
  * rolling speculative window, q/k L2 norm, gate, gated delta recurrence with
  * per-token state slots, gated RMS output norm); see v3's header and
  * feedback/kda_spec_semantics.py. Numerics: fp32 throughout, accurate expf.
+ *
+ * v7 (same arithmetic as v6, bit-identical): the model's constant operands
+ * (conv weights and bias, A_log, dt_bias, output-norm weight) are read before
+ * the programmatic-dependency wait; after it, the sequence metadata and every
+ * state-slot index of the row are read in one memory latency (v6 read the
+ * initial slot after num_accepted, a second dependent latency before the state
+ * load), and beta is loaded with the metadata instead of after the staged
+ * inputs.
  */
 
 #include "../torch_utils.h"
@@ -56,6 +64,7 @@ struct SpecStrides {
   int64_t conv_col;
   int64_t state_slot;
   int64_t idx_row;
+  int64_t idx_cols;  // state-slot indices per sequence (state_indices.size(1))
 };
 
 __device__ __forceinline__ float ld_bf16(const __nv_bfloat16* p, int64_t i) {
@@ -124,6 +133,30 @@ __global__ void __cluster_dims__(1, 1, kSplit) __launch_bounds__(kThreads, 2)
   const int dim = H * kD;
   cg::cluster_group cluster = cg::this_cluster();
 
+  // Constant operands first: no preceding kernel writes them, so they load
+  // while the previous kernel finishes.
+  const int c = tid & (kD - 1);
+  const bool group_a = tid < kD;
+  const int p0 = group_a ? 0 : 2;
+  const int ch0 = p0 * dim + h * kD + c;
+  const int ch1 = 1 * dim + h * kD + c;
+  float w0[kW];
+  float w1[kW];
+  {
+    const float* wp0 = w_t + (int64_t)p0 * kW * dim + h * kD + c;
+    const float* wp1 = w_t + (int64_t)1 * kW * dim + h * kD + c;
+#pragma unroll
+    for (int j = 0; j < kW; ++j) {
+      w0[j] = __ldg(wp0 + j * dim);
+      w1[j] = group_a ? __ldg(wp1 + j * dim) : 0.0f;
+    }
+  }
+  const float b0 = bias == nullptr ? 0.0f : __ldg(bias + ch0);
+  const float b1 = (bias == nullptr || !group_a) ? 0.0f : __ldg(bias + ch1);
+  const float a = expf(__ldg(a_log + h));
+  const float db = __ldg(dt_bias + h * kD + c);
+  const float wn = (tid < kRowsPerCta) ? __ldg(norm_w + row0 + tid) : 0.0f;
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   cudaGridDependencySynchronize();
   // PTX griddepcontrol: the dependent grid may *launch* now; its own
@@ -136,8 +169,14 @@ __global__ void __cluster_dims__(1, 1, kSplit) __launch_bounds__(kThreads, 2)
   // Every CTA of the cluster reads the same sequence metadata, so the early
   // exits below are cluster-uniform (no CTA can be left waiting at a
   // cluster barrier).
+  // Sequence metadata and all state-slot indices of the row in one latency.
   const int qs = cu_seqlens[n];
   const int qe = cu_seqlens[n + 1];
+  const int accepted = num_accepted[n];
+  int slot_idx[kMaxTokens];
+#pragma unroll
+  for (int t = 0; t < kMaxTokens; ++t)
+    slot_idx[t] = t < st.idx_cols ? state_indices[n * st.idx_row + t] : 0;
   const int T = qe - qs;
   if (T <= 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -145,9 +184,12 @@ __global__ void __cluster_dims__(1, 1, kSplit) __launch_bounds__(kThreads, 2)
 #endif
     return;
   }
-  const int off = num_accepted[n] - 1;
-  const int conv_slot = state_indices[n * st.idx_row];
-  const int init_slot = state_indices[n * st.idx_row + off];
+  const int off = accepted - 1;
+  const int conv_slot = slot_idx[0];
+  int init_slot = 0;
+#pragma unroll
+  for (int t = 0; t < kMaxTokens; ++t)
+    if (t == off) init_slot = slot_idx[t];
   if (conv_slot <= 0 || init_slot <= 0 || T > kMaxTokens || off < 0) {
     if (tid < kRowsPerCta) {
       for (int t = 0; t < T; ++t) {
@@ -189,9 +231,21 @@ __global__ void __cluster_dims__(1, 1, kSplit) __launch_bounds__(kThreads, 2)
       hreg[r][3] = v4.w;
     }
   }
-  if (tid < kMaxTokens)
-    s_slot[tid] = (tid < T) ? state_indices[n * st.idx_row + tid] : 0;
-  const float wn = (tid < kRowsPerCta) ? __ldg(norm_w + row0 + tid) : 0.0f;
+  if (tid < kMaxTokens) {
+    int slot = 0;
+#pragma unroll
+    for (int t = 0; t < kMaxTokens; ++t)
+      if (t == tid && t < T) slot = slot_idx[t];
+    s_slot[tid] = slot;
+  }
+  // beta of this thread's token (the last kMaxTokens threads), loaded with
+  // the other inputs; the sigmoid is applied in the prologue as before.
+  float raw_beta_t = 0.0f;
+  if (tid >= kThreads - kMaxTokens) {
+    const int t = tid - (kThreads - kMaxTokens);
+    if (t < T)
+      raw_beta_t = ld_bf16(raw_beta, (int64_t)(qs + t) * st.beta_row + h);
+  }
 
   // ---- prologue inputs staged into shared memory by all threads at once --
   // Each 16-byte chunk is one cp.async; the whole head's inputs (T token rows
@@ -238,30 +292,12 @@ __global__ void __cluster_dims__(1, 1, kSplit) __launch_bounds__(kThreads, 2)
 
   // ---- prologue (every CTA of the cluster, redundantly): conv + gates ----
   {
-    const int c = tid & (kD - 1);
-    const bool group_a = tid < kD;
-    const int p0 = group_a ? 0 : 2;
-    const int ch0 = p0 * dim + h * kD + c;
-    const int ch1 = 1 * dim + h * kD + c;
     __nv_bfloat16* cs0 = conv_state + (int64_t)conv_slot * st.conv_slot + ch0;
     __nv_bfloat16* cs1 = conv_state + (int64_t)conv_slot * st.conv_slot + ch1;
     float hist0[kHistLen];
     float hist1[kHistLen];
     float graw[kMaxTokens];
     float g2raw[kMaxTokens];
-    const float* wp0 = w_t + (int64_t)p0 * kW * dim + h * kD + c;
-    const float* wp1 = w_t + (int64_t)1 * kW * dim + h * kD + c;
-    float w0[kW];
-    float w1[kW];
-#pragma unroll
-    for (int j = 0; j < kW; ++j) {
-      w0[j] = __ldg(wp0 + j * dim);
-      w1[j] = group_a ? __ldg(wp1 + j * dim) : 0.0f;
-    }
-    const float b0 = bias == nullptr ? 0.0f : __ldg(bias + ch0);
-    const float b1 = (bias == nullptr || !group_a) ? 0.0f : __ldg(bias + ch1);
-    const float a = expf(__ldg(a_log + h));
-    const float db = __ldg(dt_bias + h * kD + c);
     cp_async_wait_all();
     __syncthreads();
 #pragma unroll
@@ -280,9 +316,7 @@ __global__ void __cluster_dims__(1, 1, kSplit) __launch_bounds__(kThreads, 2)
     }
     if (tid >= kThreads - kMaxTokens) {
       const int t = tid - (kThreads - kMaxTokens);
-      if (t < T)
-        s_beta[t] =
-            sigmoid_acc(ld_bf16(raw_beta, (int64_t)(qs + t) * st.beta_row + h));
+      if (t < T) s_beta[t] = sigmoid_acc(raw_beta_t);
     }
 #pragma unroll
     for (int t = 0; t < kMaxTokens; ++t) {
@@ -577,6 +611,7 @@ void fused_kda_spec_decode(
       x.stride(0),           raw_g.stride(1), raw_beta.stride(1),
       output_gate.stride(0), out.stride(1),   conv_state.stride(0),
       conv_state.stride(2),  state.stride(0), state_indices.stride(0),
+      state_indices.size(1),
   };
   const bool use_lb = lower_bound.has_value();
   const float lb = use_lb ? static_cast<float>(*lower_bound) : 0.0f;

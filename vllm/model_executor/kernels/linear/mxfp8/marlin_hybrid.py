@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Marlin MXFP8 W8A16 for small M, exact BF16 GEMM for large M.
 
+With ``VLLM_K3_W8A16_GEMV_LIB`` set, decode batches of at most 8 rows of the
+selected layers use ``_C_k3decode.w8a16_gemv`` instead of Marlin: it reads the
+same Marlin payload, computes the same exact products and reduces them in a
+fixed order on the CUDA cores.
+
 Marlin's W8A16 kernel is weight-bandwidth-bound and efficient at decode
 batch sizes, but at prefill batch sizes (thousands of rows) it reaches only
 a fraction of the BF16 tensor-core throughput. This kernel keeps Marlin for
@@ -16,6 +21,7 @@ of one layer shard per call.
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable
 
 import torch
 
@@ -29,6 +35,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
 from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
     get_weight_perm,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .marlin import MarlinMxfp8LinearKernel
@@ -211,6 +218,123 @@ def reconstruct_bf16_weight(
     )
 
 
+@functools.cache
+def load_w8a16_gemv_op() -> Callable[..., None] | None:
+    """``_C_k3decode.w8a16_gemv`` from ``VLLM_K3_W8A16_GEMV_LIB``, or None
+    (Marlin)."""
+    path = envs.VLLM_K3_W8A16_GEMV_LIB
+    if not path:
+        return None
+    torch.ops.load_library(path)
+    return torch.ops._C_k3decode.w8a16_gemv
+
+
+@functools.cache
+def _multiprocessor_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def can_w8a16_gemv(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    require_op: bool = True,
+) -> bool:
+    """Whether ``w8a16_gemv`` serves this call: at most
+    ``VLLM_K3_W8A16_GEMV_MAX_ROWS`` (<= 8) bf16 rows with 16-byte aligned rows,
+    no bias, and a layer prefix selected by ``VLLM_K3_W8A16_GEMV_LAYERS``."""
+    if require_op and load_w8a16_gemv_op() is None:
+        return False
+    rows = x.numel() // x.shape[-1] if x.shape[-1] else 0
+    if bias is not None or not 0 < rows <= min(8, envs.VLLM_K3_W8A16_GEMV_MAX_ROWS):
+        return False
+    if x.dtype != torch.bfloat16 or x.shape[-1] != layer.input_size_per_partition:
+        return False
+    selected = [s for s in envs.VLLM_K3_W8A16_GEMV_LAYERS.split(",") if s]
+    prefix = getattr(layer, "prefix", "")
+    if selected and not any(s in prefix for s in selected):
+        return False
+    x2 = x.reshape(rows, x.shape[-1])
+    if not (x2.stride(-1) == 1 and x2.stride(0) % 8 == 0 and x2.data_ptr() % 16 == 0):
+        return False
+    if not require_op:
+        return True
+    padded_n, padded_k = marlin_repacked_nk(layer.weight, num_bits=8)
+    cluster, warps = w8a16_gemv_layout(padded_n, padded_k, x.device.index or 0)
+    return w8a16_gemv_smem_bytes(rows, padded_k, cluster, warps) <= _GEMV_MAX_SMEM
+
+
+# Dynamic shared memory the GEMV may request per CTA (sm_120 allows 99 KiB).
+_GEMV_MAX_SMEM = 96 * 1024
+
+
+def w8a16_gemv_smem_bytes(rows: int, padded_k: int, cluster: int, warps: int) -> int:
+    """Dynamic shared memory of one ``w8a16_gemv`` CTA: the CTA's K slice of
+    the activations (bf16, rows padded to 1/2/4/8) plus the per-warp and
+    per-CTA column sums."""
+    padded_rows = 1 if rows <= 1 else 2 if rows <= 2 else 4 if rows <= 4 else 8
+    slice_groups = -(-(padded_k // 32) // cluster)
+    x_bytes = -(-(padded_rows * slice_groups * 32 * 2) // 16) * 16
+    return x_bytes + (warps + 1) * 64 * padded_rows * 4
+
+
+@functools.cache
+def _parse_gemv_table(table: str) -> dict[tuple[int, int], tuple[int, int]]:
+    layouts = {}
+    for entry in filter(None, table.split(",")):
+        shape, layout = entry.split(":")
+        n, k = shape.split("x")
+        cluster, warps = layout.split("x")
+        layouts[(int(n), int(k))] = (int(cluster), int(warps))
+    return layouts
+
+
+def w8a16_gemv_layout(
+    padded_n: int, padded_k: int, device_index: int
+) -> tuple[int, int]:
+    """(CTAs per 64-column group, warps per CTA): the
+    ``VLLM_K3_W8A16_GEMV_TABLE`` entry of this shape, else
+    ``VLLM_K3_W8A16_GEMV_CLUSTER`` (0 = the smallest K split that gives at
+    least two CTAs per SM, at most 8) and ``VLLM_K3_W8A16_GEMV_WARPS``."""
+    table = _parse_gemv_table(envs.VLLM_K3_W8A16_GEMV_TABLE)
+    layout = table.get((padded_n, padded_k))
+    if layout is not None:
+        return layout
+    warps = envs.VLLM_K3_W8A16_GEMV_WARPS
+    if envs.VLLM_K3_W8A16_GEMV_CLUSTER:
+        return envs.VLLM_K3_W8A16_GEMV_CLUSTER, warps
+    column_groups = padded_n // 64
+    target = 2 * _multiprocessor_count(device_index)
+    for cluster in (1, 2, 4):
+        if column_groups * cluster >= target:
+            return cluster, warps
+    return 8, warps
+
+
+def apply_w8a16_gemv(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    op = load_w8a16_gemv_op()
+    assert op is not None
+    size_n = layer.output_size_per_partition
+    size_k = layer.input_size_per_partition
+    x2 = x.reshape(-1, size_k)
+    out = torch.empty(x2.shape[0], size_n, dtype=x.dtype, device=x.device)
+    padded_n, padded_k = marlin_repacked_nk(layer.weight, num_bits=8)
+    cluster, warps = w8a16_gemv_layout(padded_n, padded_k, x.device.index or 0)
+    op(
+        out,
+        x2,
+        layer.weight,
+        layer.weight_scale.view(torch.uint8),
+        size_n,
+        size_k,
+        cluster,
+        warps,
+        current_platform.is_arch_support_pdl(),
+    )
+    return out.reshape(*x.shape[:-1], size_n)
+
+
 class MarlinMxfp8HybridLinearKernel(MarlinMxfp8LinearKernel):
     """Marlin W8A16 below the threshold, exact BF16 GEMM above it."""
 
@@ -226,6 +350,8 @@ class MarlinMxfp8HybridLinearKernel(MarlinMxfp8LinearKernel):
     ) -> torch.Tensor:
         rows = x.numel() // x.shape[-1]
         if rows <= self.large_m_threshold():
+            if can_w8a16_gemv(layer, x, bias):
+                return apply_w8a16_gemv(layer, x)
             return super().apply_weights(layer, x, bias)
         size_n = layer.output_size_per_partition
         size_k = layer.input_size_per_partition

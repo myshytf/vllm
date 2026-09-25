@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib
+
 import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm import envs
 from vllm.models.kimi_k3.common.mtp import fused_mtp_input
 from vllm.models.kimi_k3.nvidia.ops import attn_res
+from vllm.models.kimi_k3.nvidia.ops.attn_res import can_attn_res_decode
 from vllm.platforms import current_platform
+
+# The ops package re-exports the `attn_res` function under the module's name.
+attn_res_mod = importlib.import_module("vllm.models.kimi_k3.nvidia.ops.attn_res")
 
 HIDDEN_SIZE = 7168
 MAX_BLOCKS = 8
@@ -297,7 +304,7 @@ def test_attn_res_reused_output_supports_cuda_graph_replay():
     original_prefix = prefix.clone()
     original_delta = delta.clone()
     graph = torch.cuda.CUDAGraph()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     with torch.cuda.graph(graph):
         actual = attn_res(
             prefix,
@@ -321,6 +328,156 @@ def test_attn_res_reused_output_supports_cuda_graph_replay():
     delta.copy_(original_delta)
     graph.replay()
     torch.testing.assert_close(actual, first, atol=0, rtol=0)
+
+
+def _decode_gate_operands(num_tokens: int) -> dict:
+    prefix = torch.randn(num_tokens, 256, dtype=torch.bfloat16)
+    return dict(
+        prefix=prefix,
+        delta=torch.randn_like(prefix),
+        blocks=torch.randn(num_tokens, 5, 256, dtype=torch.bfloat16),
+        norm_weight=torch.ones(256, dtype=torch.bfloat16),
+        qk_weight=torch.ones(256, dtype=torch.bfloat16),
+        output_norm_weight=torch.ones(256, dtype=torch.bfloat16),
+        num_blocks=3,
+        output=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        "library",
+        "rows",
+        "hidden",
+        "sources",
+        "dtype",
+        "misaligned",
+        "row_stride",
+        "weight",
+    ],
+)
+def test_attn_res_decode_gate(monkeypatch, change: str | None):
+    """Only decode-sized batches of 16-byte aligned bf16 rows with at most 12
+    sources reach the CUDA decode kernel, and only when its library is set."""
+    monkeypatch.setenv("VLLM_K3_ATTN_RES_DECODE_LIB", "")
+    monkeypatch.setenv("VLLM_K3_ATTN_RES_DECODE_MAX_ROWS", "4")
+    operands = _decode_gate_operands(8 if change == "rows" else 4)
+    if change == "hidden":
+        for name in ("prefix", "delta", "blocks"):
+            operands[name] = operands[name][..., :-4].contiguous()
+        for name in ("norm_weight", "qk_weight", "output_norm_weight"):
+            operands[name] = operands[name][:-4]
+    elif change == "sources":
+        operands["blocks"] = torch.zeros(4, 13, 256, dtype=torch.bfloat16)
+        operands["num_blocks"] = 12
+    elif change == "dtype":
+        operands["prefix"] = operands["prefix"].float()
+    elif change == "misaligned":
+        operands["prefix"] = torch.zeros(4, 257, dtype=torch.bfloat16)[:, 1:]
+    elif change == "row_stride":
+        operands["prefix"] = torch.zeros(4, 260, dtype=torch.bfloat16)[:, :256]
+    elif change == "weight":
+        operands["qk_weight"] = operands["qk_weight"][:128]
+
+    # The loader caches its result; do not leave the unset-library result
+    # behind for the GPU tests of the same session.
+    attn_res_mod.load_attn_res_decode_op.cache_clear()
+    try:
+        accepted = can_attn_res_decode(
+            **operands, require_op=change == "library", device_type="cpu"
+        )
+    finally:
+        attn_res_mod.load_attn_res_decode_op.cache_clear()
+
+    assert accepted == (change is None)
+
+
+def _float64_attn_res(
+    prefix: torch.Tensor,
+    blocks: torch.Tensor,
+    norm_weight: torch.Tensor,
+    qk_weight: torch.Tensor,
+    output_norm_weight: torch.Tensor,
+    num_blocks: int,
+) -> torch.Tensor:
+    values = torch.cat((blocks[:, :num_blocks], prefix.unsqueeze(1)), dim=1).double()
+    rms = values.square().mean(-1).add(EPS).sqrt()
+    logits = values @ (norm_weight.double() * qk_weight.double()) / rms
+    mixed = (logits.softmax(-1).unsqueeze(-1) * values).sum(1)
+    rms = mixed.square().mean(-1, keepdim=True).add(EPS).sqrt()
+    return mixed / rms * output_norm_weight.double()
+
+
+@pytest.mark.skipif(
+    not envs.VLLM_K3_ATTN_RES_DECODE_LIB,
+    reason="VLLM_K3_ATTN_RES_DECODE_LIB names no _C_k3decode library",
+)
+@pytest.mark.parametrize("num_tokens", [1, 4, 16])
+@pytest.mark.parametrize("num_blocks", [0, 1, 4, MAX_BLOCKS])
+@pytest.mark.parametrize("has_delta", [False, True])
+@pytest.mark.parametrize("cluster", [1, 4])
+def test_attn_res_decode_kernel(
+    monkeypatch, num_tokens: int, num_blocks: int, has_delta: bool, cluster: int
+):
+    """The CUDA decode kernel (one CTA or a cluster per row) updates the prefix
+    and the written block exactly like the bf16 residual add, and its output
+    stays within one bf16 ulp of a float64 evaluation, also when the output
+    overwrites ``delta``."""
+    monkeypatch.setenv("VLLM_K3_ATTN_RES_DECODE_CLUSTER", str(cluster))
+    monkeypatch.setenv("VLLM_K3_ATTN_RES_DECODE_SLOTS", "1")
+    prefix = torch.randn(num_tokens, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+    delta = torch.randn_like(prefix) if has_delta else None
+    blocks = torch.randn(
+        num_tokens, MAX_BLOCKS + 1, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
+    norm_weight = 1 + 0.1 * torch.randn(
+        HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
+    qk_weight = (
+        torch.randn(HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16) / HIDDEN_SIZE**0.5
+    )
+    output_norm_weight = 1 + 0.1 * torch.randn(
+        HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16
+    )
+    expected_prefix = prefix if delta is None else prefix + delta
+    expected = _float64_attn_res(
+        expected_prefix,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        num_blocks,
+    )
+    assert can_attn_res_decode(
+        prefix,
+        delta,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        num_blocks,
+        delta,
+    )
+
+    actual = attn_res(
+        prefix,
+        delta,
+        blocks,
+        norm_weight,
+        qk_weight,
+        output_norm_weight,
+        num_blocks,
+        num_blocks,
+        EPS,
+        EPS,
+        output=delta,
+    )
+
+    torch.testing.assert_close(prefix, expected_prefix, atol=0, rtol=0)
+    torch.testing.assert_close(blocks[:, num_blocks], expected_prefix, atol=0, rtol=0)
+    torch.testing.assert_close(actual.double(), expected, atol=1e-5, rtol=2**-7)
 
 
 @pytest.mark.parametrize("num_tokens", [0, 1, 17])
