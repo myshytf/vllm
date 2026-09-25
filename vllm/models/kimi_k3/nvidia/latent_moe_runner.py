@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner, _unpack
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.models.kimi_k3.nvidia.ops import invariant_gemm
+from vllm.models.kimi_k3.nvidia.ops.bf16_decode_gemv import bf16_gemv_mm_or_cublas
 from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.utils.torch_utils import aux_stream
@@ -247,9 +248,11 @@ class LatentMoERunner(MoERunner):
             self._capture_routed_latent(fused_latent)
 
         # Overlap the shared-expert all-reduce with the up-projection GEMM while
-        # the batch is small enough for it to pay off.
+        # the batch is small enough for it to pay off. At decode row counts the
+        # GEMM routes through the b12x small-N/tc GEMV when its opt-in is set
+        # (bf16_gemv_mm_or_cublas keeps torch.mm otherwise).
         result, shared_output = maybe_execute_in_parallel(
-            lambda: torch.mm(fused_latent, transform.up_proj.weight.t()),
+            lambda: bf16_gemv_mm_or_cublas(fused_latent, transform.up_proj.weight),
             lambda: tensor_model_parallel_all_reduce(shared_output),
             self._shared_ar_events[0],
             self._shared_ar_events[1],

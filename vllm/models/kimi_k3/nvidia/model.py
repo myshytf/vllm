@@ -122,6 +122,10 @@ from vllm.models.kimi_k3.nvidia.mla import (
     MultiHeadLatentAttention,
 )
 from vllm.models.kimi_k3.nvidia.ops import attn_res, invariant_gemm
+from vllm.models.kimi_k3.nvidia.ops.bf16_decode_gemv import (
+    bf16_gemv_mm,
+    precompile_bf16_gemv,
+)
 from vllm.models.kimi_k3.nvidia.ops.norm_window import (
     can_rms_norm_window,
     rms_norm_window,
@@ -907,6 +911,13 @@ class KimiPaddedColumnParallelLinear(ColumnParallelLinear):
             and invariant_gemm.applies_to(x, self.weight)
         ):
             return invariant_gemm.mm(x, self.weight.T), None
+        # Decode-size opt-in: route through the b12x small-N/tc GEMV (fp32
+        # accumulation, fixed-order reduction; qualification-track switch
+        # VLLM_K3_BF16_TC_GEMV, off by default). The op falls back internally
+        # for shapes it does not cover, so prefill calls stay on cuBLAS.
+        gemv = bf16_gemv_mm(x, self.weight)
+        if gemv is not None:
+            return gemv, None
         return super().forward(x)
 
     def forward(self, x: torch.Tensor):
@@ -3266,6 +3277,33 @@ class KimiLinearForCausalLM(
     def process_weights_after_loading(self) -> None:
         self.model.reserve_mla_prefill_projection_workspace()
         self.model.reserve_attn_res_workspace()
+        self._precompile_bf16_decode_gemv()
+
+    def _precompile_bf16_decode_gemv(self) -> None:
+        """Compile the decode-size bf16 GEMVs once per shape at load time.
+
+        No-op unless VLLM_K3_BF16_TC_GEMV=1: covers every MoE layer's routed
+        latent down-projection (KimiPaddedColumnParallelLinear shard, N 400
+        K 7168 at TP9) and latent up-projection (KimiRoutedOutputTransform's
+        replicated N 7168 K 3584), so the hot path never compiles under
+        CUDA-graph capture. Compilation dedups by (n, k).
+        """
+        seen: set[tuple[int, int]] = set()
+        for module in self.modules():
+            weight: torch.Tensor | None = None
+            if isinstance(module, KimiPaddedColumnParallelLinear) and not isinstance(
+                module, KimiColumnParallelGate
+            ):
+                weight = module.weight
+            elif isinstance(module, KimiRoutedOutputTransform):
+                weight = getattr(module.up_proj, "weight", None)
+            if weight is None or weight.ndim != 2:
+                continue
+            key = (weight.shape[0], weight.shape[1])
+            if key in seen:
+                continue
+            seen.add(key)
+            precompile_bf16_gemv(weight)
 
 
 def get_spec_layer_idx_from_weight_name(
