@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, NamedTuple
 
 import torch
@@ -91,6 +91,102 @@ def get_aligned_state_indices_multi_group_kernel(
             & valid_row[None, :, None]
             & valid_state_slot[None, None, :]
         ),
+    )
+
+
+@triton.jit(do_not_specialize=["num_spec_decodes", "batch_size"])
+def stage_spec_decode_metadata_multi_group_kernel(
+    aligned_state_indices_ptr,
+    query_start_loc_ptr,
+    num_accepted_tokens_ptr,
+    staged_state_ptrs_ptr,
+    staged_query_start_loc_ptrs_ptr,
+    staged_num_accepted_ptrs_ptr,
+    aligned_stride_0: tl.constexpr,
+    aligned_stride_1: tl.constexpr,
+    aligned_stride_2: tl.constexpr,
+    staged_state_stride_0: tl.constexpr,
+    staged_state_stride_1: tl.constexpr,
+    num_spec_decodes,
+    batch_size,
+    NUM_GROUPS: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+    NUM_STATE_SLOTS: tl.constexpr,
+    BLOCK_STATE_SLOTS: tl.constexpr,
+    NULL_STATE_ID: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    launch_pdl: tl.constexpr,
+):
+    """One launch of the per-group ``_stage_spec_decode_metadata_kernel`` work
+    (``vllm/models/kimi_k3/nvidia/kda_metadata.py``) for every Mamba KV-cache
+    group: group ``g``'s CUDA-graph staging buffers (base addresses in the three
+    pointer arrays) receive its aligned state indices for the first
+    ``num_spec_decodes`` rows and ``NULL_STATE_ID`` for the padding rows up to
+    ``batch_size``, and every group receives the same staged
+    ``query_start_loc`` (padding rows repeat the last real offset) and
+    ``num_accepted_tokens`` (padding rows read 1). Same stores, same values as
+    the per-group launches."""
+    if launch_pdl:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    real_request = rows < num_spec_decodes
+    staged_row = rows < batch_size
+
+    groups = tl.arange(0, BLOCK_GROUPS)
+    valid_group = groups < NUM_GROUPS
+    state_slots = tl.arange(0, BLOCK_STATE_SLOTS)
+    valid_state_slot = state_slots < NUM_STATE_SLOTS
+
+    state_indices = tl.load(
+        aligned_state_indices_ptr
+        + groups[:, None, None] * aligned_stride_0
+        + rows[None, :, None] * aligned_stride_1
+        + state_slots[None, None, :] * aligned_stride_2,
+        mask=(
+            valid_group[:, None, None]
+            & real_request[None, :, None]
+            & valid_state_slot[None, None, :]
+        ),
+        other=NULL_STATE_ID,
+    )
+    staged_state_base = tl.load(
+        staged_state_ptrs_ptr + groups, mask=valid_group, other=0
+    ).to(tl.pointer_type(tl.int32))
+    tl.store(
+        staged_state_base[:, None, None]
+        + rows[None, :, None] * staged_state_stride_0
+        + state_slots[None, None, :] * staged_state_stride_1,
+        state_indices,
+        mask=(
+            valid_group[:, None, None]
+            & staged_row[None, :, None]
+            & valid_state_slot[None, None, :]
+        ),
+    )
+
+    query_row = tl.minimum(rows, num_spec_decodes)
+    query_start_loc = tl.load(query_start_loc_ptr + query_row, mask=rows <= batch_size)
+    staged_qsl_base = tl.load(
+        staged_query_start_loc_ptrs_ptr + groups, mask=valid_group, other=0
+    ).to(tl.pointer_type(tl.int32))
+    tl.store(
+        staged_qsl_base[:, None] + rows[None, :],
+        tl.broadcast_to(query_start_loc[None, :], (BLOCK_GROUPS, BLOCK_ROWS)),
+        mask=valid_group[:, None] & (rows <= batch_size)[None, :],
+    )
+
+    num_accepted_tokens = tl.load(
+        num_accepted_tokens_ptr + rows, mask=real_request, other=1
+    )
+    staged_acc_base = tl.load(
+        staged_num_accepted_ptrs_ptr + groups, mask=valid_group, other=0
+    ).to(tl.pointer_type(tl.int32))
+    tl.store(
+        staged_acc_base[:, None] + rows[None, :],
+        tl.broadcast_to(num_accepted_tokens[None, :], (BLOCK_GROUPS, BLOCK_ROWS)),
+        mask=valid_group[:, None] & staged_row[None, :],
     )
 
 
@@ -1140,6 +1236,20 @@ class MambaSpecDecodeGPUContext:
     # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks].
     aligned_state_indices: torch.Tensor | None = None
 
+    # Batched spec-decode metadata staging (Kimi-K3 KDA builders): base
+    # addresses of every group's CUDA-graph staging buffers
+    # (``spec_state_indices_tensor``, ``spec_query_start_loc``,
+    # ``num_accepted_tokens``), registered once by
+    # ``register_spec_decode_staging``; the buffers are persistent, so the
+    # addresses are stable for the engine's lifetime.
+    staged_spec_state_ptrs: torch.Tensor | None = None
+    staged_spec_query_start_loc_ptrs: torch.Tensor | None = None
+    staged_spec_num_accepted_ptrs: torch.Tensor | None = None
+    staged_spec_state_strides: tuple[int, int] = (0, 0)
+    staged_spec_num_state_slots: int = 0
+    staged_spec_max_batch: int = 0
+    staged_spec_registered_ids: tuple[int, ...] = ()
+
     # Per-request staging buffers (CPU+GPU mirrors). The runner stages
     # values into the CPU view in ``_prepare_inputs`` and the fused kernel
     # reads the GPU side. These only exist when the postprocess kernel is
@@ -1558,6 +1668,134 @@ class MambaSpecDecodeGPUContext:
             num_warps=1,
         )
         return self.aligned_state_indices[:, :num_reqs]
+
+    def register_spec_decode_staging(self, builders: Sequence[tuple[int, Any]]) -> bool:
+        """Record the CUDA-graph staging buffers of the Mamba metadata builders
+        for ``stage_spec_decode_metadata_all_groups``.
+
+        ``builders`` pairs each builder with its index into the context's group
+        order (``mamba_group_ids``); every group must be present exactly once and
+        every builder must expose the GDN-style buffers
+        ``spec_state_indices_tensor`` [max_bs, num_state_slots],
+        ``spec_query_start_loc`` [max_bs + 1] and ``num_accepted_tokens``
+        [max_bs] with identical shapes and strides. Returns False (and leaves the
+        registration empty) when the set does not qualify; idempotent for the
+        same builders.
+        """
+        ids = tuple(id(b) for _, b in sorted(builders, key=lambda t: t[0]))
+        if ids and ids == self.staged_spec_registered_ids:
+            return True
+        self.staged_spec_registered_ids = ()
+        self.staged_spec_state_ptrs = None
+        self.staged_spec_query_start_loc_ptrs = None
+        self.staged_spec_num_accepted_ptrs = None
+        if len(builders) != self.num_groups or sorted(g for g, _ in builders) != list(
+            range(self.num_groups)
+        ):
+            return False
+        ordered = [b for _, b in sorted(builders, key=lambda t: t[0])]
+        shapes = set()
+        strides = set()
+        for b in ordered:
+            state = getattr(b, "spec_state_indices_tensor", None)
+            qsl = getattr(b, "spec_query_start_loc", None)
+            acc = getattr(b, "num_accepted_tokens", None)
+            if not (
+                isinstance(state, torch.Tensor)
+                and isinstance(qsl, torch.Tensor)
+                and isinstance(acc, torch.Tensor)
+            ):
+                return False
+            if not (state.is_cuda and qsl.is_cuda and acc.is_cuda):
+                return False
+            if state.dtype != torch.int32 or qsl.dtype != torch.int32:
+                return False
+            if acc.dtype != torch.int32 or state.ndim != 2:
+                return False
+            if not (qsl.is_contiguous() and acc.is_contiguous()):
+                return False
+            if qsl.shape[0] != state.shape[0] + 1 or acc.shape[0] != state.shape[0]:
+                return False
+            shapes.add(tuple(state.shape))
+            strides.add(tuple(state.stride()))
+        if len(shapes) != 1 or len(strides) != 1:
+            return False
+        ((max_bs, num_state_slots),) = shapes
+        if self.aligned_state_indices is None:
+            return False
+        if num_state_slots > self.aligned_state_indices.shape[2]:
+            return False
+        device = self.aligned_state_indices.device
+        self.staged_spec_state_ptrs = torch.tensor(
+            [b.spec_state_indices_tensor.data_ptr() for b in ordered],
+            dtype=torch.int64,
+            device=device,
+        )
+        self.staged_spec_query_start_loc_ptrs = torch.tensor(
+            [b.spec_query_start_loc.data_ptr() for b in ordered],
+            dtype=torch.int64,
+            device=device,
+        )
+        self.staged_spec_num_accepted_ptrs = torch.tensor(
+            [b.num_accepted_tokens.data_ptr() for b in ordered],
+            dtype=torch.int64,
+            device=device,
+        )
+        (self.staged_spec_state_strides,) = strides
+        self.staged_spec_num_state_slots = int(num_state_slots)
+        self.staged_spec_max_batch = int(max_bs)
+        self.staged_spec_registered_ids = ids
+        return True
+
+    def stage_spec_decode_metadata_all_groups(
+        self,
+        query_start_loc: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        *,
+        num_spec_decodes: int,
+        batch_size: int,
+        launch_pdl: bool = False,
+    ) -> None:
+        """Stage the spec-decode metadata of every registered group in one
+        launch (see ``stage_spec_decode_metadata_multi_group_kernel``). Must run
+        after ``compute_aligned_state_indices`` of the same step; requires a
+        successful ``register_spec_decode_staging``."""
+        assert self.staged_spec_state_ptrs is not None
+        assert self.staged_spec_query_start_loc_ptrs is not None
+        assert self.staged_spec_num_accepted_ptrs is not None
+        assert self.aligned_state_indices is not None
+        assert 0 < num_spec_decodes <= batch_size <= self.staged_spec_max_batch
+        assert query_start_loc.is_cuda and num_accepted_tokens.is_cuda
+        assert query_start_loc.shape[0] >= num_spec_decodes + 1
+        assert num_accepted_tokens.shape[0] >= num_spec_decodes
+        assert query_start_loc.is_contiguous() and num_accepted_tokens.is_contiguous()
+        from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+
+        block_rows = 32
+        grid = (triton.cdiv(batch_size + 1, block_rows),)
+        stage_spec_decode_metadata_multi_group_kernel[grid](
+            self.aligned_state_indices,
+            query_start_loc,
+            num_accepted_tokens,
+            self.staged_spec_state_ptrs,
+            self.staged_spec_query_start_loc_ptrs,
+            self.staged_spec_num_accepted_ptrs,
+            self.aligned_state_indices.stride(0),
+            self.aligned_state_indices.stride(1),
+            self.aligned_state_indices.stride(2),
+            self.staged_spec_state_strides[0],
+            self.staged_spec_state_strides[1],
+            num_spec_decodes,
+            batch_size,
+            NUM_GROUPS=self.num_groups,
+            BLOCK_GROUPS=triton.next_power_of_2(self.num_groups),
+            NUM_STATE_SLOTS=self.staged_spec_num_state_slots,
+            BLOCK_STATE_SLOTS=triton.next_power_of_2(self.staged_spec_num_state_slots),
+            NULL_STATE_ID=NULL_BLOCK_ID,
+            BLOCK_ROWS=block_rows,
+            num_warps=1,
+            launch_pdl=launch_pdl,
+        )
 
     def run_fused_postprocess(
         self,

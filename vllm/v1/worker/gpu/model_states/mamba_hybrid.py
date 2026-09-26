@@ -585,6 +585,16 @@ class MambaHybridModelState(DefaultModelState):
                 )
                 for group_idx, builder in aligned_index_builders:
                     builder.mamba_aligned_state_indices = all_group_indices[group_idx]
+                self._stage_spec_decode_metadata_all_groups(
+                    ctx,
+                    aligned_index_builders,
+                    query_start_loc_cpu,
+                    input_batch.query_start_loc,
+                    num_accepted_tokens,
+                    num_decode_draft_tokens_cpu,
+                    num_reqs,
+                    for_capture,
+                )
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             num_accepted_tokens=num_accepted_tokens,
@@ -610,6 +620,90 @@ class MambaHybridModelState(DefaultModelState):
             rswa_prefix_lens=input_batch.prompt_lens,
             is_prefilling=is_prefilling,
         )
+
+    @staticmethod
+    def pure_spec_decode_full_graph_batch(
+        query_start_loc_cpu: torch.Tensor,
+        num_decode_draft_tokens_cpu: torch.Tensor,
+        num_reqs: int,
+        decode_cudagraph_max_bs: int,
+    ) -> tuple[int, int, int] | None:
+        """The (num_spec_decodes, num_spec_decode_tokens, batch_size) of a batch
+        that the GDN/KDA metadata builders stage into their CUDA-graph buffers:
+        every row with scheduled tokens is a spec-decode row (draft count >= 0),
+        at least one draft token is scheduled, and the request and token counts
+        fit the builders' ``decode_cudagraph_max_bs``. None otherwise. Mirrors
+        the split in ``KimiK3KDAMetadataBuilder.build``.
+        """
+        if query_start_loc_cpu.shape[0] != num_reqs + 1:
+            return None
+        if num_decode_draft_tokens_cpu.shape[0] < num_reqs:
+            return None
+        drafts = num_decode_draft_tokens_cpu[:num_reqs].numpy()
+        spec_rows = drafts >= 0
+        num_spec_decodes = int(spec_rows.sum())
+        if num_spec_decodes == 0 or int(drafts[spec_rows].sum()) == 0:
+            return None
+        query_lens = np.diff(query_start_loc_cpu.numpy())
+        if int(((~spec_rows) & (query_lens > 0)).sum()) != 0:
+            return None
+        num_spec_decode_tokens = int(query_start_loc_cpu[-1].item())
+        if (
+            num_spec_decodes > decode_cudagraph_max_bs
+            or num_spec_decode_tokens > decode_cudagraph_max_bs
+        ):
+            return None
+        return num_spec_decodes, num_spec_decode_tokens, num_reqs
+
+    def _stage_spec_decode_metadata_all_groups(
+        self,
+        ctx: MambaSpecDecodeGPUContext,
+        aligned_index_builders: list[tuple[int, Any]],
+        query_start_loc_cpu: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        num_accepted_tokens: torch.Tensor | None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None,
+        num_reqs: int,
+        for_capture: bool,
+    ) -> None:
+        """Stage every Mamba group's spec-decode CUDA-graph metadata in one
+        launch (``MambaSpecDecodeGPUContext.stage_spec_decode_metadata_all_groups``)
+        and tell the builders (``mamba_prestaged_spec_decode``) so their ``build``
+        returns the staged views instead of launching once per group. Falls back
+        to the builders' own staging (attribute None) for mixed batches, graph
+        capture, and builder sets that do not qualify."""
+        prestaged: tuple[int, int, int] | None = None
+        if (
+            not for_capture
+            and num_accepted_tokens is not None
+            and num_decode_draft_tokens_cpu is not None
+            and aligned_index_builders
+            and all(
+                getattr(b, "use_full_cuda_graph", False)
+                for _, b in aligned_index_builders
+            )
+        ):
+            max_bs = min(
+                int(b.decode_cudagraph_max_bs) for _, b in aligned_index_builders
+            )
+            prestaged = self.pure_spec_decode_full_graph_batch(
+                query_start_loc_cpu, num_decode_draft_tokens_cpu, num_reqs, max_bs
+            )
+            if prestaged is not None and not ctx.register_spec_decode_staging(
+                aligned_index_builders
+            ):
+                prestaged = None
+        if prestaged is not None:
+            num_spec_decodes, _, batch_size = prestaged
+            ctx.stage_spec_decode_metadata_all_groups(
+                query_start_loc,
+                num_accepted_tokens,
+                num_spec_decodes=num_spec_decodes,
+                batch_size=batch_size,
+            )
+        for _, builder in aligned_index_builders:
+            if hasattr(builder, "mamba_prestaged_spec_decode"):
+                builder.mamba_prestaged_spec_decode = prestaged
 
     def postprocess_state(
         self,

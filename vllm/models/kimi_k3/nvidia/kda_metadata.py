@@ -247,6 +247,52 @@ class KDACheckpointMetadata:
 
 class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
     mamba_aligned_state_indices: torch.Tensor | None = None
+    # Set per step by the hybrid model state's ``prepare_attn`` when it staged
+    # this builder's spec-decode CUDA-graph buffers (``spec_state_indices_tensor``,
+    # ``spec_query_start_loc``, ``num_accepted_tokens``) for every Mamba group in
+    # one launch: (num_spec_decodes, num_spec_decode_tokens, batch_size) of a
+    # pure spec-decode batch that qualifies for the FULL-graph staging path.
+    # ``build`` then returns the staged views without launching or recomputing
+    # the CPU-side split; None means "stage yourself".
+    mamba_prestaged_spec_decode: tuple[int, int, int] | None = None
+
+    def _build_prestaged_spec_decode(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_spec_decodes: int,
+        num_spec_decode_tokens: int,
+        batch_size: int,
+    ) -> KimiK3KDAMetadata:
+        """Metadata of a pure spec-decode batch whose CUDA-graph buffers were
+        already staged (see ``mamba_prestaged_spec_decode``): the same object the
+        general path returns for ``num_prefills == num_decodes == 0`` under
+        ``use_full_cuda_graph``, minus the staging launch."""
+        m = common_attn_metadata
+        assert m.num_reqs == batch_size
+        assert 0 < num_spec_decodes <= batch_size <= self.decode_cudagraph_max_bs
+        assert num_spec_decode_tokens <= self.decode_cudagraph_max_bs
+        return KimiK3KDAMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=num_spec_decodes,
+            num_spec_decode_tokens=num_spec_decode_tokens,
+            num_actual_tokens=m.num_actual_tokens,
+            has_initial_state=None,
+            spec_query_start_loc=self.spec_query_start_loc[: batch_size + 1],
+            non_spec_query_start_loc=None,
+            spec_state_indices_tensor=self.spec_state_indices_tensor[:batch_size],
+            non_spec_state_indices_tensor=None,
+            spec_sequence_masks=None,
+            spec_token_indx=None,
+            non_spec_token_indx=None,
+            num_accepted_tokens=self.num_accepted_tokens[:batch_size],
+            nums_dict=None,
+            batch_ptr=None,
+            token_chunk_offset_ptr=None,
+            checkpoint=None,
+        )
 
     def build(  # type: ignore[override]
         self,
@@ -257,6 +303,17 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
         fast_build: bool = False,
     ) -> KimiK3KDAMetadata:
         m = common_attn_metadata
+        prestaged = self.mamba_prestaged_spec_decode
+        if prestaged is not None and self.use_full_cuda_graph:
+            num_spec_decodes, num_spec_decode_tokens, batch_size = prestaged
+            if (
+                m.num_reqs == batch_size
+                and num_decode_draft_tokens_cpu is not None
+                and num_accepted_tokens is not None
+            ):
+                return self._build_prestaged_spec_decode(
+                    m, num_spec_decodes, num_spec_decode_tokens, batch_size
+                )
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
         assert isinstance(self.kv_cache_spec, MambaSpec)
