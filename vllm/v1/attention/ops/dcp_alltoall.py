@@ -54,7 +54,11 @@ _B12X_DCP_WORLD_SIZES = (2, 4, 8, 9, 16)
 _KIMI_LATENT_WIDTH = 3584
 _KIMI_ROUTER_WIDTH = 896
 _KIMI_ROUTER_TOPK = 16
-_KIMI_PAIRED_MAX_BATCH_SIZE = 8
+# Sized to the decode batch above which the paired projection gather falls
+# back to PyNCCL; ``VLLM_K3_PAIRED_MAX_BATCH`` extends it (32 covers four
+# requests at seven speculative tokens). Staging grows linearly, a few
+# hundred KiB per rank at 32 rows.
+_KIMI_PAIRED_MAX_BATCH_SIZE = envs.VLLM_K3_PAIRED_MAX_BATCH
 _KIMI_PROJECTION_SHARD_ALIGNMENT = 8
 
 
