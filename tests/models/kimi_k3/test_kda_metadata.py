@@ -47,6 +47,11 @@ PRUNED_METADATA_FIELDS = {
 def _assert_matches_shared_gdn(reference, actual: KimiK3KDAMetadata):
     for field in fields(KimiK3KDAMetadata):
         actual_value = getattr(actual, field.name)
+        if not hasattr(reference, field.name):
+            # Kimi-K3-only fields (the prefill checkpoint) have no shared-GDN
+            # counterpart and must stay unset on the batches compared here.
+            assert actual_value is None, field.name
+            continue
         expected_value = getattr(reference, field.name)
         if field.name in PRUNED_METADATA_FIELDS:
             assert actual_value is None
