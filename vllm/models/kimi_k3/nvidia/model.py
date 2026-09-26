@@ -132,6 +132,7 @@ from vllm.models.kimi_k3.nvidia.tp_projection import (
     gather_kimi_sharded_projection,
     gather_kimi_sharded_projection_pair,
     kimi_decode_shard_pack_enabled,
+    kimi_paired_projection_max_tokens,
     kimi_projection_gather_mode,
     kimi_reduction_is_borrowed,
     kimi_ring_static_io_enabled,
@@ -1795,7 +1796,7 @@ class KimiMoE(nn.Module):
             return hidden_states, router_output, topk_ids
         num_tokens = hidden_states.shape[0]
         if (
-            0 < num_tokens <= 8
+            0 < num_tokens <= kimi_paired_projection_max_tokens()
             and not self.use_mega_moe
             and isinstance(self.gate, KimiColumnParallelGate)
             and isinstance(down_proj, KimiPaddedColumnParallelLinear)

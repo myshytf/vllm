@@ -261,6 +261,7 @@ if TYPE_CHECKING:
     VLLM_K3_DRAFT_PACKED_MLA_PARTIAL_DTYPE: str = ""
     VLLM_K3_DRAFT_PACKED_MLA_SPLIT_POLICY: str = ""
     VLLM_K3_PAIR_TOPK_FUSED: bool = False
+    VLLM_K3_PAIRED_MAX_BATCH: int = 8
     VLLM_K3_LATENT_AR_NORM_FUSED: bool = False
     VLLM_K3_UP_PROJ_ADDMM: bool = False
     VLLM_K3_LATENT_NORM_WINDOW_LIB: str = ""
@@ -2009,6 +2010,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_K3_PAIR_TOPK_FUSED": lambda: bool(
         int(os.getenv("VLLM_K3_PAIR_TOPK_FUSED", "0"))
     ),
+    # Maximum rows per paired projection gather before the operation falls
+    # back to PyNCCL. Default 8 (the served decode envelope peak); the
+    # row-sweep windows raise it to cover deeper/wider decode batches.
+    "VLLM_K3_PAIRED_MAX_BATCH": lambda: int(os.getenv("VLLM_K3_PAIRED_MAX_BATCH", "8")),
     # Kimi-K3 decode: all-reduce the routed latent, RMS-normalize it and
     # write this rank's up-projection input shard in one B12X two-shot
     # launch (replaces the separate RMSNorm kernel and the shard copy). The

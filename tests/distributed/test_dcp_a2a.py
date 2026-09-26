@@ -1683,7 +1683,7 @@ def test_pair_gather_fallback_preserves_tensor_order(monkeypatch):
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8, 16])
-@pytest.mark.parametrize("batch", [1, 8])
+@pytest.mark.parametrize("batch", [1, 8, 32])
 @pytest.mark.skipif(torch.accelerator.device_count() < 1, reason="CUDA is required.")
 def test_b12x_kimi_pair_topk_supports_projection_world_sizes(
     monkeypatch: pytest.MonkeyPatch,
@@ -1693,6 +1693,11 @@ def test_b12x_kimi_pair_topk_supports_projection_world_sizes(
     from vllm.v1.attention.ops import dcp_alltoall
 
     monkeypatch.setenv("VLLM_USE_B12X_DCP_A2A", "1")
+    monkeypatch.setattr(
+        dcp_alltoall,
+        "_KIMI_PAIRED_MAX_BATCH_SIZE",
+        dcp_alltoall._KIMI_PAIRED_MAX_BATCH_SIZE if batch <= 8 else batch,
+    )
     local_down = torch.zeros(
         batch, 3584 // world_size, dtype=torch.bfloat16, device="cuda"
     )
@@ -1804,7 +1809,7 @@ def test_b12x_kimi_pair_topk_supports_projection_world_sizes(
         "total_heads": world_size,
         "head_dim": combined_row_bytes,
         "query_head_dim": combined_row_bytes,
-        "max_batch_size": 1 if batch == 1 else 8,
+        "max_batch_size": 1 if batch == 1 else dcp_alltoall._KIMI_PAIRED_MAX_BATCH_SIZE,
     }
 
 
@@ -1824,7 +1829,7 @@ def test_b12x_kimi_pair_topk_rejects_non_contract_inputs(monkeypatch):
     bias = torch.zeros(896, dtype=torch.float32, device="cuda")
 
     invalid_inputs = (
-        (down.expand(9, -1), router.expand(9, -1), bias),
+        (down.repeat(33, 1), router.repeat(33, 1), bias),
         (down.expand(2, -1), router, bias),
         (down[:, :-1].contiguous(), router, bias),
         (down, router[:, :-1].contiguous(), bias),
@@ -2545,8 +2550,12 @@ def _distributed_b12x_packed_query_gather_worker(env: dict[str, str]) -> None:
             generator = torch.Generator(device=device)
             generator.manual_seed(20000 * step + rank)
             return torch.randint(
-                0, 256, (batch, h_per_rank, record_bytes), device=device,
-                dtype=torch.uint8, generator=generator,
+                0,
+                256,
+                (batch, h_per_rank, record_bytes),
+                device=device,
+                dtype=torch.uint8,
+                generator=generator,
             )
 
         def expected(records: torch.Tensor) -> torch.Tensor:
