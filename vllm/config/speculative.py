@@ -242,6 +242,13 @@ class SpeculativeConfig:
     disables acceptance-length adaptation. ``num_speculative_tokens`` is the
     initial value and upper bound."""
 
+    adaptive_speculative_tokens_choices: list[int] | None = None
+    """Depths the acceptance-length adaptation may select (subset of
+    ``1..num_speculative_tokens``). The controller picks the largest choice not
+    above its target, and the worker captures uniform-decode CUDA graphs only
+    for these depths, so a deployment can restrict adaptation to verify-batch
+    shapes it has qualified (e.g. ``[3, 5]``). ``None`` allows every depth."""
+
     # params generated in the post-init stage
     draft_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the draft model initialized internal."""
@@ -947,6 +954,26 @@ class SpeculativeConfig:
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
 
+        if self.adaptive_speculative_tokens_choices is not None:
+            if self.adaptive_speculative_tokens_window is None:
+                raise ValueError(
+                    "adaptive_speculative_tokens_choices requires "
+                    "adaptive_speculative_tokens_window."
+                )
+            choices = sorted(
+                set(int(c) for c in self.adaptive_speculative_tokens_choices)
+            )
+            if (
+                not choices
+                or choices[0] < 1
+                or choices[-1] > self.num_speculative_tokens
+            ):
+                raise ValueError(
+                    "adaptive_speculative_tokens_choices must be a non-empty subset of "
+                    f"1..{self.num_speculative_tokens}, got "
+                    f"{self.adaptive_speculative_tokens_choices}."
+                )
+            self.adaptive_speculative_tokens_choices = choices
         if self.adaptive_speculative_tokens_window is not None:
             unsupported_methods = {
                 "ngram",

@@ -343,3 +343,56 @@ def test_runner_v2_allows_acceptance_length_adaptation(monkeypatch):
         "dynamic speculative decoding" in item
         for item in config._get_v2_model_runner_unsupported_features()
     )
+
+
+def test_controller_choices_snap_down_and_step_up_through_allowed_depths():
+    controller = AcceptanceLengthController(
+        max_num_spec_tokens=5, observation_window=1, choices=[3, 5]
+    )
+    assert controller.num_spec_tokens == 5
+    # mean accepted 2.3 -> target floor(3.8) = 3 -> allowed 3 (immediate
+    # decrease)
+    update = controller.observe_batch(
+        num_drafts=10, num_draft_tokens=50, num_accepted_tokens=23
+    )
+    assert update is not None and update.num_spec_tokens == 3
+    # mean accepted 1.0 -> target 2 -> no allowed depth <= 2 -> smallest
+    # choice 3
+    update = controller.observe_batch(
+        num_drafts=10, num_draft_tokens=30, num_accepted_tokens=10
+    )
+    assert update is not None and update.num_spec_tokens == 3
+    # mean accepted 2.9 -> target 4 -> allowed 3 (4 is not a choice):
+    # stays 3
+    update = controller.observe_batch(
+        num_drafts=10, num_draft_tokens=30, num_accepted_tokens=29
+    )
+    assert update is not None and update.num_spec_tokens == 3
+    # mean accepted 3.0 (all accepted at depth 3) -> target 4 -> allowed 3:
+    # still 3; only a target of 5 raises to the next choice
+    update = controller.observe_batch(
+        num_drafts=10, num_draft_tokens=30, num_accepted_tokens=30
+    )
+    assert update is not None and update.num_spec_tokens == 3
+    controller.choices = [3, 4, 5]
+    update = controller.observe_batch(
+        num_drafts=10, num_draft_tokens=30, num_accepted_tokens=30
+    )
+    assert (
+        update is not None and update.num_spec_tokens == 4
+    )  # gradual step up through the choices
+
+
+def test_controller_rejects_bad_choices():
+    with pytest.raises(ValueError):
+        AcceptanceLengthController(
+            max_num_spec_tokens=5, observation_window=1, choices=[0, 3]
+        )
+    with pytest.raises(ValueError):
+        AcceptanceLengthController(
+            max_num_spec_tokens=5, observation_window=1, choices=[6]
+        )
+    with pytest.raises(ValueError):
+        AcceptanceLengthController(
+            max_num_spec_tokens=5, observation_window=1, choices=[]
+        )
