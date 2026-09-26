@@ -26,8 +26,18 @@ from vllm.v1.attention.ops.dcp_alltoall import (
     dcp_b12x_all_gather_pair,
 )
 
-_KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS = 8
 _KIMI_INPLACE_REDUCTION_MIN_TOKENS = 1024
+
+
+def kimi_paired_projection_max_tokens() -> int:
+    """Decode rows the B12X paired projection gather serves per step.
+
+    ``VLLM_K3_PAIRED_MAX_BATCH`` (default 8, the served four-request by
+    three-speculative-token envelope); wider batches take the collective
+    gathers and the vLLM router. Shared with ``dcp_alltoall``'s paired-gather
+    pool cap so the model, the transport gate and the pool agree.
+    """
+    return int(envs.VLLM_K3_PAIRED_MAX_BATCH)
 
 
 @lru_cache(maxsize=1)
@@ -426,7 +436,7 @@ def gather_kimi_sharded_projection_pair(
     if (
         local_first.ndim == local_second.ndim == 2
         and local_first.shape[0] == local_second.shape[0]
-        and 0 < local_first.shape[0] <= _KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS
+        and 0 < local_first.shape[0] <= kimi_paired_projection_max_tokens()
         and local_first.is_cuda
         and local_second.is_cuda
         and local_first.is_contiguous()
@@ -438,7 +448,7 @@ def gather_kimi_sharded_projection_pair(
                 local_first,
                 local_second,
                 projection_group,
-                max_batch_size=_KIMI_B12X_PAIRED_PROJECTION_MAX_TOKENS,
+                max_batch_size=kimi_paired_projection_max_tokens(),
                 first_columns=first_columns,
                 second_columns=second_columns,
             )

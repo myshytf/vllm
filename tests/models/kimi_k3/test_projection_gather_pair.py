@@ -157,6 +157,68 @@ def test_prefill_gather_falls_back_to_nccl_when_the_ring_declines(
     assert torch.equal(router, torch.cat([first] * WORLD, dim=-1)[:, :896])
 
 
+def test_decode_pair_gather_follows_the_paired_batch_cap(monkeypatch):
+    """``VLLM_K3_PAIRED_MAX_BATCH`` decides which decode rows the B12X paired
+    gather serves: the default eight sends sixteen rows to the collective
+    gathers; 32 admits them with the pool sized to the cap; 33 rows fall
+    back. The B12X branch needs CUDA inputs; on CPU only the fallback and the
+    knob itself are checked."""
+    monkeypatch.setattr(
+        tp_projection, "get_tensor_model_parallel_world_size", lambda: WORLD
+    )
+    monkeypatch.setattr(
+        tp_projection,
+        "_get_kimi_projection_group",
+        lambda: SimpleNamespace(world_size=WORLD),
+    )
+    b12x_calls: list[int] = []
+
+    def fake_b12x(
+        first, second, group, *, max_batch_size, first_columns, second_columns
+    ):
+        b12x_calls.append(max_batch_size)
+        return (
+            torch.cat([first] * WORLD, dim=-1)[:, :first_columns],
+            torch.cat([second] * WORLD, dim=-1)[:, :second_columns],
+        )
+
+    monkeypatch.setattr(tp_projection, "dcp_b12x_all_gather_pair", fake_b12x)
+    collective_calls: list[int] = []
+
+    def fake_gather(t):
+        collective_calls.append(int(t.shape[0]))
+        return torch.cat([t] * WORLD, dim=-1)
+
+    monkeypatch.setattr(tp_projection, "gather_kimi_sharded_projection", fake_gather)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def gather(rows: int):
+        first = torch.randn(rows, 400, device=device).to(torch.bfloat16)
+        second = torch.randn(rows, 104, device=device)
+        latent, router = tp_projection.gather_kimi_sharded_projection_pair(
+            first, second, 3584, 896
+        )
+        assert latent.shape == (rows, 3584) and router.shape == (rows, 896)
+
+    monkeypatch.setenv("VLLM_K3_PAIRED_MAX_BATCH", "8")
+    assert tp_projection.kimi_paired_projection_max_tokens() == 8
+    gather(16)
+    assert b12x_calls == [] and collective_calls == [16, 16]
+
+    monkeypatch.setenv("VLLM_K3_PAIRED_MAX_BATCH", "32")
+    assert tp_projection.kimi_paired_projection_max_tokens() == 32
+    collective_calls.clear()
+    gather(16)
+    if device == "cuda":
+        assert b12x_calls == [32] and collective_calls == []
+    else:
+        assert b12x_calls == [] and collective_calls == [16, 16]
+    collective_calls.clear()
+    gather(33)
+    assert b12x_calls == ([32] if device == "cuda" else [])
+    assert collective_calls == [33, 33]
+
+
 def test_custom_all_reduce_pair_declines_without_ring_or_during_capture():
     ca = CustomAllreduce.__new__(CustomAllreduce)
     ca.disabled = False
