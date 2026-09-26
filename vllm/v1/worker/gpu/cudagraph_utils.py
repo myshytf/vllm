@@ -248,17 +248,18 @@ class CudaGraphManager:
             speculative_config
             and speculative_config.uses_acceptance_length_adaptation()
         ):
-            # Acceptance-length adaptation selects any depth in [1, K] at
-            # runtime; capture a uniform-decode graph per depth so a reduced
-            # depth verifies fewer tokens instead of replaying padded
-            # max-depth graphs.
+            # Acceptance-length adaptation selects a depth at runtime; capture
+            # a uniform-decode graph per selectable depth so a reduced depth
+            # verifies fewer tokens instead of replaying padded max-depth
+            # graphs. adaptive_speculative_tokens_choices restricts the depths
+            # (and hence the captured verify shapes) to a qualified set.
             num_new_sampled_tokens_per_step = (
                 self.decode_query_len - self.vllm_config.num_speculative_tokens
             )
-            decode_query_lens = [
-                n + num_new_sampled_tokens_per_step
-                for n in range(1, self.vllm_config.num_speculative_tokens + 1)
-            ]
+            depths = speculative_config.adaptive_speculative_tokens_choices or list(
+                range(1, self.vllm_config.num_speculative_tokens + 1)
+            )
+            decode_query_lens = [n + num_new_sampled_tokens_per_step for n in depths]
         elif (
             speculative_config
             and speculative_config.use_dspark()

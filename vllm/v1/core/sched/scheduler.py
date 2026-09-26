@@ -308,6 +308,7 @@ class Scheduler(SchedulerInterface):
                 self.acceptance_length_controller = AcceptanceLengthController(
                     max_num_spec_tokens=self.num_spec_tokens,
                     observation_window=observation_window,
+                    choices=speculative_config.adaptive_speculative_tokens_choices,
                 )
             self.use_eagle = speculative_config.use_eagle()
 
